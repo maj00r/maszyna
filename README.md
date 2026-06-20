@@ -87,7 +87,7 @@ MaSzyna compiles and runs natively on **Linux** and **Windows**. Other platforms
 **3) Graphics API**
 
 -   **OpenGL 3.0** or newer
-- **DirectX 12** via NVRHI (optional, Windows only, for Better Renderer)
+- **Vulkan 1.3** via NVRHI (optional, for the Better Renderer; cross-platform)
 
 
 ### CMake flags
@@ -97,9 +97,13 @@ MaSzyna compiles and runs natively on **Linux** and **Windows**. Other platforms
 | `-DCMAKE_BUILD_TYPE=Debug` | Debug build |
 | `-DCMAKE_BUILD_TYPE=Release` | Release build |
 | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` | Release build with debug symbols |
-| `-DWITH_BETTER_RENDERER=ON/OFF` | Enable/disable NVRHI-based renderer |
+| `-DWITH_BETTER_RENDERER=ON/OFF` | Enable/disable the Vulkan (NVRHI) renderer |
 
-> **Linux note:** `WITH_BETTER_RENDERER` uses DirectX 12 through NVRHI and is **not supported on Linux**.
+> **Note:** `WITH_BETTER_RENDERER` is a Vulkan renderer (via NVRHI) on every
+> platform, including Windows. It requires a Vulkan 1.3 capable driver at runtime
+> and the Vulkan SDK / loader at build time. On Windows the Vulkan headers and
+> loader are installed by `setup.bat` through vcpkg. Select it at runtime with
+> `gfxrenderer vulkan` in the configuration.
 
 
 
@@ -207,7 +211,7 @@ If detection still fails, padding the file (with comments) up to ~1 MB may hel
     
 -   **X11/Wayland linking order** – Linking order of X11 and related libs can matter.
     
--   **NVRHI on Linux** – The NVRHI/"Better Renderer" path targets DirectX 12 and is currently unsupported on Linux.
+-   **Vulkan driver required** – The NVRHI/"Better Renderer" path is Vulkan-based on all platforms and needs a Vulkan 1.3 capable driver at runtime.
     
 
 
