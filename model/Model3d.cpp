@@ -1913,7 +1913,7 @@ void TSubModel::deserialize(std::istream &s)
 
 	// extra data block
 	diffuseMultiplier = sn_utils::ld_float32(s);
-	// only multiply diffuse on experimental renderer
+	// only multiply diffuse on the Vulkan (NVRHI) renderer
 	if (!Global.NvRenderer)
 		f4Diffuse /= diffuseMultiplier <= 0.0 ? 1.0 : diffuseMultiplier;
 

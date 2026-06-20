@@ -1365,7 +1365,7 @@ int eu07_application::init_gfx()
 		// default render path
 		GfxRenderer = gfx_renderer_factory::get_instance()->create("modern");
 	}
-	else if (Global.GfxRenderer == "experimental")
+	else if (Global.GfxRenderer == "vulkan")
 	{
 		GfxRenderer = gfx_renderer_factory::get_instance()->create(Global.GfxRenderer);
 	}

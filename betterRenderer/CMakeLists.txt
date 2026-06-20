@@ -1,14 +1,10 @@
 
 set(LIBMANUL_NAME "betterRenderer")
 
+# The renderer targets Vulkan on every platform now. The Direct3D 12 backend
+# has been retired in favour of a single, unified Vulkan path (incl. Windows).
 set(LIBMANUL_WITH_DX12 OFF)
-set(LIBMANUL_WITH_VULKAN OFF)
-
-if (WIN32)
-    set(LIBMANUL_WITH_DX12 ON)
-elseif (UNIX)
-    set(LIBMANUL_WITH_VULKAN ON)
-endif ()
+set(LIBMANUL_WITH_VULKAN ON)
 
 if (LIBMANUL_WITH_VULKAN)
     find_package(Vulkan 1.3.230 REQUIRED)
@@ -89,12 +85,8 @@ target_compile_definitions(${LIBMANUL_NAME} PRIVATE
 target_include_directories(${LIBMANUL_NAME} PRIVATE
         ${libserialport_INCLUDE_DIR} ${LUAJIT_INCLUDE_DIR})
 
-if (LIBMANUL_WITH_DX12)
-    target_link_libraries(${LIBMANUL_NAME} nvrhi_d3d12 dxgi.lib)
-    target_compile_definitions(${LIBMANUL_NAME} PUBLIC "LIBMANUL_WITH_D3D12=1" "GLFW_EXPOSE_NATIVE_WIN32")
-else ()
-    target_compile_definitions(${LIBMANUL_NAME} PUBLIC "LIBMANUL_WITH_D3D12=0")
-endif ()
+# The Direct3D 12 backend has been retired; the renderer is Vulkan-only.
+target_compile_definitions(${LIBMANUL_NAME} PUBLIC "LIBMANUL_WITH_D3D12=0")
 
 if (LIBMANUL_WITH_VULKAN)
     target_link_libraries(${LIBMANUL_NAME} nvrhi_vk Vulkan::Headers)

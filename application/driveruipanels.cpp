@@ -1457,9 +1457,9 @@ debug_panel::update_section_renderer( std::vector<text_line> &Output ) {
 	        {
 		        textline += "Shaders";
 	        }
-            else if (Global.GfxRenderer == "experimental")
+            else if (Global.GfxRenderer == "vulkan")
             {
-		        textline += "NVRHI on ";
+		        textline += "Vulkan";
             }
 	        else
 	        {

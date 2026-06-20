@@ -312,10 +312,14 @@ bool global_settings::ConfigParseGraphics(cParser& Parser, const std::string& to
         if (GfxRenderer == "full")
             GfxRenderer = "default";
 
+        // "experimental" is kept as a backward-compatible alias for the
+        // Vulkan renderer (formerly the experimental NVRHI backend).
         if (GfxRenderer == "experimental")
+            GfxRenderer = "vulkan";
+
+        if (GfxRenderer == "vulkan")
         {
             NvRenderer = true;
-            GfxRenderer = "experimental";
         }
 
         BasicRenderer = (GfxRenderer == "simple");
