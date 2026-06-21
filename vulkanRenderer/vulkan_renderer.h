@@ -73,6 +73,35 @@ class vulkan_geometrybank : public gfx::geometry_bank {
   std::vector<gpu_chunk> m_gpu;  // indexed by chunk-1
 };
 
+// Lightweight ITexture returned by vulkan_renderer::Texture(). Only the name
+// and dimensions matter to the engine (e.g. material_manager::create reads the
+// name; an empty name makes it discard the material). Actual sampling goes
+// through the descriptor sets, not this object.
+class vulkan_itexture : public ITexture {
+ public:
+  std::string m_name;
+  int m_width = 1;
+  int m_height = 1;
+  bool m_alpha = true;
+  std::size_t m_id = 0;
+
+  bool create(bool = false) override { return true; }
+  int get_width() const override { return m_width; }
+  int get_height() const override { return m_height; }
+  std::size_t get_id() const override { return m_id; }
+  void release() override {}
+  void make_stub() override {}
+  std::string_view get_traits() const override { return {}; }
+  std::string_view get_name() const override { return m_name; }
+  std::string_view get_type() const override { return {}; }
+  bool is_stub() const override { return false; }
+  bool get_has_alpha() const override { return m_alpha; }
+  bool get_is_ready() const override { return true; }
+  void set_components_hint(int) override {}
+  void make_from_memory(std::size_t, std::size_t, const uint8_t *) override {}
+  void update_from_memory(std::size_t, std::size_t, const uint8_t *) override {}
+};
+
 class vulkan_renderer : public gfx_renderer {
  public:
   vulkan_renderer() = default;
@@ -158,9 +187,17 @@ class vulkan_renderer : public gfx_renderer {
   void Bind_Texture(std::size_t const Unit,
                     texture_handle const Texture) override {}
   ITexture &Texture(texture_handle const Texture) override {
+    if (Texture != null_handle &&
+        static_cast<std::size_t>(Texture) <= m_itextures.size()) {
+      return m_itextures[Texture - 1];
+    }
     return *ITexture::null_texture();
   }
   ITexture const &Texture(texture_handle const Texture) const override {
+    if (Texture != null_handle &&
+        static_cast<std::size_t>(Texture) <= m_itextures.size()) {
+      return m_itextures[Texture - 1];
+    }
     return *ITexture::null_texture();
   }
 
@@ -295,6 +332,9 @@ class vulkan_renderer : public gfx_renderer {
     VkDescriptorSet descriptor = VK_NULL_HANDLE;
   };
   std::vector<gpu_texture> m_textures;
+  // Parallel to m_textures (deque keeps element addresses stable across growth,
+  // so Texture() can return references safely). Holds the ITexture views.
+  std::deque<vulkan_itexture> m_itextures;
   std::unordered_map<std::string, texture_handle> m_texture_map;
   // Returns the descriptor set for a material's diffuse texture, or the white
   // default if there is none.

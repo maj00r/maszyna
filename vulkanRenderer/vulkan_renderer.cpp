@@ -21,6 +21,7 @@
 #include "stb/stb_image.h"  // declarations; implemented in engine's stb_image.c
 
 #include "application/application.h"
+#include "model/AnimModel.h"  // TAnimModel
 #include "model/Model3d.h"
 #include "model/Texture.h"  // texture_manager::find_on_disk
 #include "scene/scene.h"
@@ -1346,6 +1347,13 @@ texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
           write.pImageInfo = &info;
           vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
           m_textures.push_back(tex);
+          vulkan_itexture view;
+          view.m_name = Filename;
+          view.m_width = static_cast<int>(img.width);
+          view.m_height = static_cast<int>(img.height);
+          view.m_alpha = (img.format != VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
+          view.m_id = m_textures.size();
+          m_itextures.push_back(view);
           handle = static_cast<texture_handle>(m_textures.size());  // 1-based
         }
       }
@@ -1553,6 +1561,30 @@ bool vulkan_renderer::Render() {
                        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
   };
 
+  // Render one placed scenery model (TAnimModel): translate by its world
+  // position relative to the camera, then apply its Y/X/Z rotation (degrees).
+  auto render_instance = [&](TAnimModel *inst) {
+    if (inst == nullptr || inst->pModel == nullptr ||
+        inst->pModel->Root == nullptr)
+      return;
+    const glm::dvec3 pos = inst->location() - campos;
+    const glm::vec3 ang = inst->vAngle;
+    glm::mat4 model = glm::translate(glm::mat4(1.f), glm::vec3(pos));
+    if (ang.y != 0.f)
+      model = glm::rotate(model, glm::radians(ang.y), glm::vec3(0, 1, 0));
+    if (ang.x != 0.f)
+      model = glm::rotate(model, glm::radians(ang.x), glm::vec3(1, 0, 0));
+    if (ang.z != 0.f)
+      model = glm::rotate(model, glm::radians(ang.z), glm::vec3(0, 0, 1));
+    TSubModel::fSquareDist = static_cast<float>(
+        glm::length2(glm::vec3(pos)) / static_cast<double>(Global.ZoomFactor));
+    const material_data *md = inst->Material();
+    const material_handle *skins =
+        (md != nullptr) ? md->replacable_skins : nullptr;
+    render_submodel(inst->pModel->Root, model, rot, proj, skins,
+                    frame.command_buffer);
+  };
+
   // Building track geometry needs the default rail profiles loaded; ensure
   // they exist (idempotent) before any create_geometry() touches them.
   TTrack::fetch_default_profiles();
@@ -1588,16 +1620,24 @@ bool vulkan_renderer::Render() {
           }
         }
         for (auto &cell : section->m_cells) {
-          if (!cell.m_active || cell.m_shapesopaque.empty()) continue;
-          push_group_mvp(cell.m_area.center);
-          for (auto const &shape : cell.m_shapesopaque) {
-            VkDescriptorSet d =
-                material_texture_descriptor(shape.data().material);
-            vkCmdBindDescriptorSets(frame.command_buffer,
-                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    m_pipeline_layout, 0, 1, &d, 0, nullptr);
-            m_geometry.draw(shape.data().geometry);
+          if (!cell.m_active) continue;
+          // Non-instanced opaque shapes (relative to the cell centre).
+          if (!cell.m_shapesopaque.empty()) {
+            push_group_mvp(cell.m_area.center);
+            for (auto const &shape : cell.m_shapesopaque) {
+              VkDescriptorSet d =
+                  material_texture_descriptor(shape.data().material);
+              vkCmdBindDescriptorSets(frame.command_buffer,
+                                      VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      m_pipeline_layout, 0, 1, &d, 0, nullptr);
+              m_geometry.draw(shape.data().geometry);
+            }
           }
+          // Placed scenery models (semaphores, poles, crossings, signs...).
+          for (auto const &bucket : cell.m_instancebuckets_opaque) {
+            for (auto *inst : bucket.second) render_instance(inst);
+          }
+          for (auto *inst : cell.m_instancesopaque) render_instance(inst);
         }
       }
     }
