@@ -132,6 +132,8 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!pick_physical_device()) return false;
   if (!create_device()) return false;
   if (!create_swapchain()) return false;
+  if (!create_command_pool()) return false;
+  if (!create_default_texture()) return false;  // also creates the set layout
   if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                              m_pipeline_triangles))
     return false;
@@ -189,6 +191,30 @@ void vulkan_renderer::Shutdown() {
     if (m_pipeline_layout) {
       vkDestroyPipelineLayout(m_device, m_pipeline_layout, nullptr);
       m_pipeline_layout = VK_NULL_HANDLE;
+    }
+    if (m_descriptor_pool) {
+      vkDestroyDescriptorPool(m_device, m_descriptor_pool, nullptr);
+      m_descriptor_pool = VK_NULL_HANDLE;
+    }
+    if (m_texture_set_layout) {
+      vkDestroyDescriptorSetLayout(m_device, m_texture_set_layout, nullptr);
+      m_texture_set_layout = VK_NULL_HANDLE;
+    }
+    if (m_sampler) {
+      vkDestroySampler(m_device, m_sampler, nullptr);
+      m_sampler = VK_NULL_HANDLE;
+    }
+    if (m_white_view) {
+      vkDestroyImageView(m_device, m_white_view, nullptr);
+      m_white_view = VK_NULL_HANDLE;
+    }
+    if (m_white_image) {
+      vkDestroyImage(m_device, m_white_image, nullptr);
+      m_white_image = VK_NULL_HANDLE;
+    }
+    if (m_white_memory) {
+      vkFreeMemory(m_device, m_white_memory, nullptr);
+      m_white_memory = VK_NULL_HANDLE;
     }
 
     destroy_swapchain();
@@ -638,6 +664,8 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   if (m_pipeline_layout == VK_NULL_HANDLE) {
     VkPipelineLayoutCreateInfo layout_ci{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_ci.setLayoutCount = 1;
+    layout_ci.pSetLayouts = &m_texture_set_layout;
     layout_ci.pushConstantRangeCount = 1;
     layout_ci.pPushConstantRanges = &pc_range;
     if (vkCreatePipelineLayout(m_device, &layout_ci, nullptr,
@@ -898,12 +926,177 @@ void vulkan_renderer::recreate_swapchain() {
 // Per-frame resources
 // ---------------------------------------------------------------------------
 
-bool vulkan_renderer::create_frame_resources() {
+bool vulkan_renderer::create_default_texture() {
+  // Shared sampler.
+  {
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = VK_LOD_CLAMP_NONE;
+    sci.maxAnisotropy = 1.f;
+    VK_CHECK(vkCreateSampler(m_device, &sci, nullptr, &m_sampler));
+  }
+
+  // Descriptor set layout (set 0 = combined image sampler, fragment stage).
+  {
+    VkDescriptorSetLayoutBinding b{};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo ci{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = 1;
+    ci.pBindings = &b;
+    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &ci, nullptr,
+                                         &m_texture_set_layout));
+  }
+
+  // Descriptor pool sized for many textures (per-material sets land in step B).
+  {
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096};
+    VkDescriptorPoolCreateInfo ci{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    ci.maxSets = 4096;
+    ci.poolSizeCount = 1;
+    ci.pPoolSizes = &ps;
+    VK_CHECK(vkCreateDescriptorPool(m_device, &ci, nullptr, &m_descriptor_pool));
+  }
+
+  // 1x1 white image, uploaded via a staging buffer.
+  const uint8_t white[4] = {255, 255, 255, 255};
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = sizeof(white);
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(m_device, &bi, nullptr, &staging));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(m_device, staging, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(
+        m_physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &staging_mem));
+    vkBindBufferMemory(m_device, staging, staging_mem, 0);
+    void *mapped = nullptr;
+    vkMapMemory(m_device, staging_mem, 0, sizeof(white), 0, &mapped);
+    std::memcpy(mapped, white, sizeof(white));
+    vkUnmapMemory(m_device, staging_mem);
+  }
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+  ici.extent = {1, 1, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VK_CHECK(vkCreateImage(m_device, &ici, nullptr, &m_white_image));
+  {
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(m_device, m_white_image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(m_physical_device, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &m_white_memory));
+    vkBindImageMemory(m_device, m_white_image, m_white_memory, 0);
+  }
+
+  // One-time upload.
+  VkCommandBufferAllocateInfo cbai{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = m_command_pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(m_device, &cbai, &cmd);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bi);
+
+  VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_dst.srcAccessMask = 0;
+  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.image = m_white_image;
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                       1, &to_dst);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {1, 1, 1};
+  vkCmdCopyBufferToImage(cmd, staging, m_white_image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  VkImageMemoryBarrier to_read = to_dst;
+  to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &to_read);
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(m_graphics_queue, 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(m_graphics_queue);
+  vkFreeCommandBuffers(m_device, m_command_pool, 1, &cmd);
+  vkDestroyBuffer(m_device, staging, nullptr);
+  vkFreeMemory(m_device, staging_mem, nullptr);
+
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = m_white_image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &m_white_view));
+
+  VkDescriptorSetAllocateInfo dsai{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dsai.descriptorPool = m_descriptor_pool;
+  dsai.descriptorSetCount = 1;
+  dsai.pSetLayouts = &m_texture_set_layout;
+  VK_CHECK(vkAllocateDescriptorSets(m_device, &dsai, &m_white_descriptor));
+  VkDescriptorImageInfo info{};
+  info.sampler = m_sampler;
+  info.imageView = m_white_view;
+  info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = m_white_descriptor;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  write.pImageInfo = &info;
+  vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+  return true;
+}
+
+bool vulkan_renderer::create_command_pool() {
   VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   pci.queueFamilyIndex = m_graphics_family;
   VK_CHECK(vkCreateCommandPool(m_device, &pci, nullptr, &m_command_pool));
+  return true;
+}
 
+bool vulkan_renderer::create_frame_resources() {
   m_frames.resize(kMaxFramesInFlight);
   for (auto &f : m_frames) {
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -1084,6 +1277,13 @@ bool vulkan_renderer::Render() {
   // The geometry bank binds the right pipeline per chunk (triangles/strips);
   // both share the layout, so the per-group MVP push below stays valid.
   m_geo_ctx.current_cmd = frame.command_buffer;
+
+  // Bind the default (white) texture for set 0; persists across the pipeline
+  // binds the bank does, since both pipelines share this layout. Per-material
+  // textures will rebind this set per draw in step B.
+  vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          m_pipeline_layout, 0, 1, &m_white_descriptor, 0,
+                          nullptr);
 
   auto push_group_mvp = [&](glm::dvec3 const &center) {
     const glm::mat4 model =

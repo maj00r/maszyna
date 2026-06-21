@@ -208,6 +208,8 @@ class vulkan_renderer : public gfx_renderer {
   bool create_image_views();
   bool create_depth_resources();
   void destroy_depth_resources();
+  bool create_command_pool();
+  bool create_default_texture();
   bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_test_geometry();
   // Recursively draw a model's submodel tree (camera-relative). parent is the
@@ -254,6 +256,17 @@ class vulkan_renderer : public gfx_renderer {
   VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
   VkPipeline m_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline m_pipeline_strips = VK_NULL_HANDLE;
+
+  // Texturing: a shared sampler + descriptor set layout (set 0 = combined
+  // image sampler) and a default 1x1 white texture bound when a draw has no
+  // material texture. Real per-material textures plug into the same path.
+  VkSampler m_sampler = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_texture_set_layout = VK_NULL_HANDLE;
+  VkDescriptorPool m_descriptor_pool = VK_NULL_HANDLE;
+  VkImage m_white_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_white_memory = VK_NULL_HANDLE;
+  VkImageView m_white_view = VK_NULL_HANDLE;
+  VkDescriptorSet m_white_descriptor = VK_NULL_HANDLE;
 
   // Shared state handed to every geometry bank (device + per-frame cmd buffer).
   vulkan_geometry_context m_geo_ctx;
