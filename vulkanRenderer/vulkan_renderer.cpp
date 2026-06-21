@@ -640,6 +640,15 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
   VkPipelineColorBlendAttachmentState blend_attachment{};
+  // Standard alpha blending. Opaque texels (alpha 1) blend to themselves, so
+  // this is a no-op for them; translucent texels (glass, shadow decals) blend.
+  blend_attachment.blendEnable = VK_TRUE;
+  blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+  blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+  blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
   blend_attachment.colorWriteMask =
       VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -661,11 +670,12 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   depth_stencil.depthWriteEnable = VK_TRUE;
   depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-  // mat4 MVP push constant for the vertex stage.
+  // Vertex push constant: mat4 MVP (offset 0) + directional sun
+  // (dir/color/ambient, offset 64) + misc (opacity, offset 112) = 128 bytes.
   VkPushConstantRange pc_range{};
   pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pc_range.offset = 0;
-  pc_range.size = sizeof(float) * 16;
+  pc_range.size = sizeof(float) * 32;
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
     VkPipelineLayoutCreateInfo layout_ci{
@@ -1364,6 +1374,23 @@ texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
   return handle;
 }
 
+void vulkan_renderer::bind_material(material_handle material,
+                                    VkCommandBuffer cmd) {
+  VkDescriptorSet d = material_texture_descriptor(material);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          m_pipeline_layout, 0, 1, &d, 0, nullptr);
+  // Opacity: <1 only for materials flagged translucent (glass), so opaque
+  // materials are unaffected.
+  float opacity = 1.f;
+  if (material != null_handle) {
+    const opengl_material &mat = m_material_manager.material(material);
+    if (mat.is_translucent()) opacity = mat.get_or_guess_opacity();
+  }
+  const glm::vec4 misc(opacity, 0.f, 0.f, 0.f);
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 28, sizeof(misc), &misc);
+}
+
 VkDescriptorSet vulkan_renderer::material_texture_descriptor(
     material_handle material) const {
   if (material != null_handle) {
@@ -1402,9 +1429,7 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
       } else if (sm->m_material < 0 && skins != nullptr) {
         mh = skins[-sm->m_material];
       }
-      VkDescriptorSet d = material_texture_descriptor(mh);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              m_pipeline_layout, 0, 1, &d, 0, nullptr);
+      bind_material(mh, cmd);
       m_geometry.draw(sm->m_geometry.handle);
     }
     if (sm->Child != nullptr)
@@ -1553,6 +1578,20 @@ bool vulkan_renderer::Render() {
                           m_pipeline_layout, 0, 1, &m_white_descriptor, 0,
                           nullptr);
 
+  // Push the directional sun once for the frame (offset 64; persists across
+  // the per-draw MVP pushes at offset 0 since the layout is shared).
+  struct {
+    glm::vec4 sun_dir;
+    glm::vec4 sun_color;
+    glm::vec4 ambient;
+  } light;
+  light.sun_dir = glm::vec4(Global.DayLight.direction, 0.f);
+  light.sun_color = Global.DayLight.diffuse;
+  light.ambient = Global.DayLight.ambient;
+  vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
+                     sizeof(light), &light);
+
   auto push_group_mvp = [&](glm::dvec3 const &center) {
     const glm::mat4 model =
         glm::translate(glm::mat4(1.f), glm::vec3(center - campos));
@@ -1562,10 +1601,7 @@ bool vulkan_renderer::Render() {
   };
 
   auto bind_mat = [&](material_handle material) {
-    VkDescriptorSet d = material_texture_descriptor(material);
-    vkCmdBindDescriptorSets(frame.command_buffer,
-                            VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout,
-                            0, 1, &d, 0, nullptr);
+    bind_material(material, frame.command_buffer);
   };
 
   // Render one placed scenery model (TAnimModel): translate by its world

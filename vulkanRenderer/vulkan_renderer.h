@@ -339,6 +339,9 @@ class vulkan_renderer : public gfx_renderer {
   // Returns the descriptor set for a material's diffuse texture, or the white
   // default if there is none.
   VkDescriptorSet material_texture_descriptor(material_handle material) const;
+  // Binds a material's texture (set 0) and pushes its opacity for the frame's
+  // draw that follows.
+  void bind_material(material_handle material, VkCommandBuffer cmd);
   std::string m_info_times;
   std::string m_info_stats;
   float m_framerate = 60.f;
