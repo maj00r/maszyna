@@ -32,8 +32,8 @@ function(embed_spirv_shader SRC VN)
     set(SHADER_HEADERS "${SHADER_HEADERS};${out}" PARENT_SCOPE)
 endfunction()
 
-embed_spirv_shader("shaders/triangle.vert" triangle_vert_spv)
-embed_spirv_shader("shaders/triangle.frag" triangle_frag_spv)
+embed_spirv_shader("shaders/world.vert" world_vert_spv)
+embed_spirv_shader("shaders/world.frag" world_frag_spv)
 embed_spirv_shader("shaders/imgui.vert" imgui_vert_spv)
 embed_spirv_shader("shaders/imgui.frag" imgui_frag_spv)
 

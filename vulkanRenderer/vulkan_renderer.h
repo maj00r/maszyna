@@ -26,21 +26,50 @@
 struct GLFWwindow;
 class vulkan_imgui_renderer;
 
-// Placeholder geometry bank (no GPU upload yet) so geometry handles stay valid.
+// Shared, renderer-owned state the geometry banks need: the device (for buffer
+// allocation in create_) and the command buffer currently being recorded (for
+// draw_). The renderer sets current_cmd while recording the scene pass.
+struct vulkan_geometry_context {
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  VkCommandBuffer current_cmd = VK_NULL_HANDLE;
+  // Pipelines the bank binds per chunk depending on primitive type (both share
+  // the renderer's pipeline layout, so the pushed MVP stays valid).
+  VkPipeline pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline pipeline_strips = VK_NULL_HANDLE;
+};
+
+// GPU-backed geometry bank: uploads each chunk's basic_vertex/index data to
+// VkBuffers in create_, and records bind+draw into the current command buffer
+// in draw_.
 class vulkan_geometrybank : public gfx::geometry_bank {
  public:
-  vulkan_geometrybank() = default;
-  ~vulkan_geometrybank() override = default;
+  explicit vulkan_geometrybank(const vulkan_geometry_context *ctx)
+      : m_ctx(ctx) {}
+  ~vulkan_geometrybank() override;
 
  private:
-  void create_(gfx::geometry_handle const &Geometry) override {}
-  void replace_(gfx::geometry_handle const &Geometry) override {}
+  void create_(gfx::geometry_handle const &Geometry) override;
+  void replace_(gfx::geometry_handle const &Geometry) override;
   std::size_t draw_(gfx::geometry_handle const &Geometry,
                     gfx::stream_units const &Units,
-                    unsigned int const Streams) override {
-    return 0;
-  }
+                    unsigned int const Streams) override;
   void release_() override {}
+
+  void upload(gfx::geometry_handle const &Geometry);
+
+  struct gpu_chunk {
+    VkBuffer vbuf = VK_NULL_HANDLE;
+    VkDeviceMemory vmem = VK_NULL_HANDLE;
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    VkDeviceMemory imem = VK_NULL_HANDLE;
+    uint32_t vertex_count = 0;
+    uint32_t index_count = 0;
+    unsigned int type = 0;
+  };
+
+  const vulkan_geometry_context *m_ctx = nullptr;
+  std::vector<gpu_chunk> m_gpu;  // indexed by chunk-1
 };
 
 class vulkan_renderer : public gfx_renderer {
@@ -60,7 +89,8 @@ class vulkan_renderer : public gfx_renderer {
 
   // --- geometry -----------------------------------------------------------
   gfx::geometrybank_handle Create_Bank() override {
-    return m_geometry.register_bank(std::make_unique<vulkan_geometrybank>());
+    return m_geometry.register_bank(
+        std::make_unique<vulkan_geometrybank>(&m_geo_ctx));
   }
   gfx::geometry_handle Insert(gfx::index_array &Indices,
                               gfx::vertex_array &Vertices,
@@ -175,7 +205,10 @@ class vulkan_renderer : public gfx_renderer {
   bool create_swapchain();
   void destroy_swapchain();
   bool create_image_views();
-  bool create_pipeline();
+  bool create_depth_resources();
+  void destroy_depth_resources();
+  bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  bool create_test_geometry();
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -206,8 +239,24 @@ class vulkan_renderer : public gfx_renderer {
   std::vector<VkImage> m_swapchain_images;
   std::vector<VkImageView> m_swapchain_image_views;
 
+  // Depth buffer (recreated with the swap chain).
+  VkFormat m_depth_format = VK_FORMAT_D32_SFLOAT;
+  VkImage m_depth_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_depth_memory = VK_NULL_HANDLE;
+  VkImageView m_depth_view = VK_NULL_HANDLE;
+
   VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
-  VkPipeline m_pipeline = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_strips = VK_NULL_HANDLE;
+
+  // Shared state handed to every geometry bank (device + per-frame cmd buffer).
+  vulkan_geometry_context m_geo_ctx;
+
+  // Temporary world-anchored test cube, now routed through a real GPU geometry
+  // bank to validate that path. Replaced by scene traversal next.
+  gfx::geometry_handle m_test_geometry{};
+  glm::dvec3 m_world_anchor{0.0};
+  bool m_anchor_set = false;
 
   VkCommandPool m_command_pool = VK_NULL_HANDLE;
   std::vector<frame_sync> m_frames;

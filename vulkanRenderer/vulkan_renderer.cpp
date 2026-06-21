@@ -13,16 +13,25 @@
 #include "vulkan_imgui.h"
 
 #include <algorithm>
+#include <cstring>
 #include <set>
 
 #include "application/application.h"
+#include "scene/scene.h"
 #include "utilities/Globals.h"
 #include "utilities/Logs.h"
+#include "world/Track.h"
+
+// Defined in the engine (simulation/simulation.cpp); forward-declared here to
+// avoid pulling simulation.h's heavy transitive includes into this TU.
+namespace simulation {
+extern scene::basic_region *Region;
+}
 
 // SPIR-V embedded by the build (glslangValidator --vn). Each header defines a
 // `const uint32_t <name>[]` array.
-#include "triangle_vert_spv.h"
-#include "triangle_frag_spv.h"
+#include "world_vert_spv.h"
+#include "world_frag_spv.h"
 
 namespace {
 
@@ -61,6 +70,19 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     log_info(std::string("[validation] ") + data->pMessage);
   }
   return VK_FALSE;
+}
+
+uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
+                          VkMemoryPropertyFlags props) {
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+  for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+    if ((type_bits & (1u << i)) &&
+        (mp.memoryTypes[i].propertyFlags & props) == props) {
+      return i;
+    }
+  }
+  return UINT32_MAX;
 }
 
 }  // namespace
@@ -107,7 +129,17 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!pick_physical_device()) return false;
   if (!create_device()) return false;
   if (!create_swapchain()) return false;
-  if (!create_pipeline()) return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                             m_pipeline_triangles))
+    return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+                             m_pipeline_strips))
+    return false;
+  m_geo_ctx.physical_device = m_physical_device;
+  m_geo_ctx.device = m_device;
+  m_geo_ctx.pipeline_triangles = m_pipeline_triangles;
+  m_geo_ctx.pipeline_strips = m_pipeline_strips;
+  if (!create_test_geometry()) return false;
   if (!create_frame_resources()) return false;
 
   // Hand the ImGui backend everything it needs to build its font texture and
@@ -143,9 +175,13 @@ void vulkan_renderer::Shutdown() {
       m_command_pool = VK_NULL_HANDLE;
     }
 
-    if (m_pipeline) {
-      vkDestroyPipeline(m_device, m_pipeline, nullptr);
-      m_pipeline = VK_NULL_HANDLE;
+    if (m_pipeline_triangles) {
+      vkDestroyPipeline(m_device, m_pipeline_triangles, nullptr);
+      m_pipeline_triangles = VK_NULL_HANDLE;
+    }
+    if (m_pipeline_strips) {
+      vkDestroyPipeline(m_device, m_pipeline_strips, nullptr);
+      m_pipeline_strips = VK_NULL_HANDLE;
     }
     if (m_pipeline_layout) {
       vkDestroyPipelineLayout(m_device, m_pipeline_layout, nullptr);
@@ -156,6 +192,9 @@ void vulkan_renderer::Shutdown() {
 
     vkDestroyDevice(m_device, nullptr);
     m_device = VK_NULL_HANDLE;
+    // Geometry banks outlive Shutdown (destroyed with m_geometry); null the
+    // shared device so their destructors skip freeing on a dead device.
+    m_geo_ctx.device = VK_NULL_HANDLE;
   }
 
   if (m_surface) {
@@ -456,7 +495,8 @@ bool vulkan_renderer::create_swapchain() {
            "x" + std::to_string(m_swapchain_extent.height) + ", " +
            std::to_string(actual) + " images.");
 
-  return create_image_views();
+  if (!create_image_views()) return false;
+  return create_depth_resources();
 }
 
 bool vulkan_renderer::create_image_views() {
@@ -479,6 +519,8 @@ bool vulkan_renderer::create_image_views() {
 }
 
 void vulkan_renderer::destroy_swapchain() {
+  destroy_depth_resources();
+
   for (VkImageView view : m_swapchain_image_views) {
     if (view) vkDestroyImageView(m_device, view, nullptr);
   }
@@ -504,11 +546,12 @@ VkShaderModule vulkan_renderer::create_shader_module(const uint32_t *code,
   return module;
 }
 
-bool vulkan_renderer::create_pipeline() {
+bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
+                                            VkPipeline &out) {
   VkShaderModule vert =
-      create_shader_module(triangle_vert_spv, sizeof(triangle_vert_spv));
+      create_shader_module(world_vert_spv, sizeof(world_vert_spv));
   VkShaderModule frag =
-      create_shader_module(triangle_frag_spv, sizeof(triangle_frag_spv));
+      create_shader_module(world_frag_spv, sizeof(world_frag_spv));
   if (!vert || !frag) return false;
 
   VkPipelineShaderStageCreateInfo stages[2] = {
@@ -521,12 +564,29 @@ bool vulkan_renderer::create_pipeline() {
   stages[1].module = frag;
   stages[1].pName = "main";
 
+  VkVertexInputBindingDescription vtx_binding{};
+  vtx_binding.binding = 0;
+  vtx_binding.stride = sizeof(gfx::basic_vertex);
+  vtx_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription vtx_attrs[4]{};
+  vtx_attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                  offsetof(gfx::basic_vertex, position)};
+  vtx_attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                  offsetof(gfx::basic_vertex, normal)};
+  vtx_attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,
+                  offsetof(gfx::basic_vertex, texture)};
+  vtx_attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                  offsetof(gfx::basic_vertex, tangent)};
   VkPipelineVertexInputStateCreateInfo vertex_input{
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vertex_input.vertexBindingDescriptionCount = 1;
+  vertex_input.pVertexBindingDescriptions = &vtx_binding;
+  vertex_input.vertexAttributeDescriptionCount = 4;
+  vertex_input.pVertexAttributeDescriptions = vtx_attrs;
 
   VkPipelineInputAssemblyStateCreateInfo input_assembly{
       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-  input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  input_assembly.topology = topology;
 
   VkPipelineViewportStateCreateInfo viewport_state{
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -560,20 +620,37 @@ bool vulkan_renderer::create_pipeline() {
   dynamic_state.dynamicStateCount = 2;
   dynamic_state.pDynamicStates = dynamic_states;
 
-  VkPipelineLayoutCreateInfo layout_ci{
-      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-  if (vkCreatePipelineLayout(m_device, &layout_ci, nullptr,
-                             &m_pipeline_layout) != VK_SUCCESS) {
-    log_error("vkCreatePipelineLayout failed.");
-    return false;
+  VkPipelineDepthStencilStateCreateInfo depth_stencil{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth_stencil.depthTestEnable = VK_TRUE;
+  depth_stencil.depthWriteEnable = VK_TRUE;
+  depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+  // mat4 MVP push constant for the vertex stage.
+  VkPushConstantRange pc_range{};
+  pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  pc_range.offset = 0;
+  pc_range.size = sizeof(float) * 16;
+
+  if (m_pipeline_layout == VK_NULL_HANDLE) {
+    VkPipelineLayoutCreateInfo layout_ci{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_ci.pushConstantRangeCount = 1;
+    layout_ci.pPushConstantRanges = &pc_range;
+    if (vkCreatePipelineLayout(m_device, &layout_ci, nullptr,
+                               &m_pipeline_layout) != VK_SUCCESS) {
+      log_error("vkCreatePipelineLayout failed.");
+      return false;
+    }
   }
 
-  // Dynamic rendering: declare the color attachment format instead of a
-  // VkRenderPass.
+  // Dynamic rendering: declare the color + depth attachment formats instead of
+  // a VkRenderPass.
   VkPipelineRenderingCreateInfo rendering_ci{
       VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
   rendering_ci.colorAttachmentCount = 1;
   rendering_ci.pColorAttachmentFormats = &m_swapchain_format;
+  rendering_ci.depthAttachmentFormat = m_depth_format;
 
   VkGraphicsPipelineCreateInfo pipeline_ci{
       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -586,12 +663,13 @@ bool vulkan_renderer::create_pipeline() {
   pipeline_ci.pRasterizationState = &raster;
   pipeline_ci.pMultisampleState = &multisample;
   pipeline_ci.pColorBlendState = &color_blend;
+  pipeline_ci.pDepthStencilState = &depth_stencil;
   pipeline_ci.pDynamicState = &dynamic_state;
   pipeline_ci.layout = m_pipeline_layout;
   pipeline_ci.renderPass = VK_NULL_HANDLE;
 
   VkResult res = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1,
-                                           &pipeline_ci, nullptr, &m_pipeline);
+                                           &pipeline_ci, nullptr, &out);
 
   vkDestroyShaderModule(m_device, vert, nullptr);
   vkDestroyShaderModule(m_device, frag, nullptr);
@@ -602,6 +680,199 @@ bool vulkan_renderer::create_pipeline() {
     return false;
   }
   return true;
+}
+
+bool vulkan_renderer::create_depth_resources() {
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = m_depth_format;
+  ici.extent = {m_swapchain_extent.width, m_swapchain_extent.height, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VK_CHECK(vkCreateImage(m_device, &ici, nullptr, &m_depth_image));
+
+  VkMemoryRequirements req;
+  vkGetImageMemoryRequirements(m_device, m_depth_image, &req);
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.allocationSize = req.size;
+  ai.memoryTypeIndex = find_memory_type(m_physical_device, req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &m_depth_memory));
+  vkBindImageMemory(m_device, m_depth_image, m_depth_memory, 0);
+
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = m_depth_image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = m_depth_format;
+  vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+  VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &m_depth_view));
+  return true;
+}
+
+void vulkan_renderer::destroy_depth_resources() {
+  if (m_depth_view) {
+    vkDestroyImageView(m_device, m_depth_view, nullptr);
+    m_depth_view = VK_NULL_HANDLE;
+  }
+  if (m_depth_image) {
+    vkDestroyImage(m_device, m_depth_image, nullptr);
+    m_depth_image = VK_NULL_HANDLE;
+  }
+  if (m_depth_memory) {
+    vkFreeMemory(m_device, m_depth_memory, nullptr);
+    m_depth_memory = VK_NULL_HANDLE;
+  }
+}
+
+bool vulkan_renderer::create_test_geometry() {
+  // Build a unit cube as gfx::basic_vertex and push it through the real
+  // geometry-bank path (Create_Bank + Insert), so draw time exercises the GPU
+  // bank used by scene geometry.
+  const float s = 1.0f;
+  const glm::vec3 c[8] = {{-s, -s, -s}, {s, -s, -s}, {s, s, -s}, {-s, s, -s},
+                          {-s, -s, s},  {s, -s, s},  {s, s, s},  {-s, s, s}};
+  struct face {
+    int a, b, c, d;
+    glm::vec3 normal;
+  };
+  const face faces[6] = {
+      {0, 1, 2, 3, {0.f, 0.f, -1.f}}, {5, 4, 7, 6, {0.f, 0.f, 1.f}},
+      {4, 0, 3, 7, {-1.f, 0.f, 0.f}}, {1, 5, 6, 2, {1.f, 0.f, 0.f}},
+      {3, 2, 6, 7, {0.f, 1.f, 0.f}},  {4, 5, 1, 0, {0.f, -1.f, 0.f}}};
+
+  gfx::vertex_array verts;
+  verts.reserve(36);
+  auto push = [&](int idx, const glm::vec3 &n) {
+    verts.emplace_back(c[idx], n, glm::vec2(0.f));
+  };
+  for (const auto &f : faces) {
+    push(f.a, f.normal);
+    push(f.b, f.normal);
+    push(f.c, f.normal);
+    push(f.a, f.normal);
+    push(f.c, f.normal);
+    push(f.d, f.normal);
+  }
+  gfx::userdata_array userdata(verts.size());
+
+  const gfx::geometrybank_handle bank = Create_Bank();
+  m_test_geometry = Insert(verts, userdata, bank, GL_TRIANGLES);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// GPU geometry bank
+// ---------------------------------------------------------------------------
+
+vulkan_geometrybank::~vulkan_geometrybank() {
+  if (m_ctx == nullptr || m_ctx->device == VK_NULL_HANDLE) return;
+  for (auto &g : m_gpu) {
+    if (g.vbuf) vkDestroyBuffer(m_ctx->device, g.vbuf, nullptr);
+    if (g.vmem) vkFreeMemory(m_ctx->device, g.vmem, nullptr);
+    if (g.ibuf) vkDestroyBuffer(m_ctx->device, g.ibuf, nullptr);
+    if (g.imem) vkFreeMemory(m_ctx->device, g.imem, nullptr);
+  }
+}
+
+namespace {
+bool make_device_buffer(const vulkan_geometry_context &ctx, const void *data,
+                        VkDeviceSize size, VkBufferUsageFlags usage,
+                        VkBuffer &buf, VkDeviceMemory &mem) {
+  if (size == 0) return true;
+  VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bi.size = size;
+  bi.usage = usage;
+  bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(ctx.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(ctx.device, buf, &req);
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.allocationSize = req.size;
+  ai.memoryTypeIndex = find_memory_type(ctx.physical_device, req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (ai.memoryTypeIndex == UINT32_MAX) return false;
+  if (vkAllocateMemory(ctx.device, &ai, nullptr, &mem) != VK_SUCCESS)
+    return false;
+  vkBindBufferMemory(ctx.device, buf, mem, 0);
+  void *mapped = nullptr;
+  vkMapMemory(ctx.device, mem, 0, size, 0, &mapped);
+  std::memcpy(mapped, data, static_cast<size_t>(size));
+  vkUnmapMemory(ctx.device, mem);
+  return true;
+}
+}  // namespace
+
+void vulkan_geometrybank::upload(gfx::geometry_handle const &Geometry) {
+  if (m_ctx == nullptr || m_ctx->device == VK_NULL_HANDLE) return;
+  const uint32_t index = Geometry.chunk - 1;
+  if (index >= m_gpu.size()) m_gpu.resize(index + 1);
+  gpu_chunk &g = m_gpu[index];
+
+  // Free any previous buffers (replace case).
+  if (g.vbuf) vkDestroyBuffer(m_ctx->device, g.vbuf, nullptr);
+  if (g.vmem) vkFreeMemory(m_ctx->device, g.vmem, nullptr);
+  if (g.ibuf) vkDestroyBuffer(m_ctx->device, g.ibuf, nullptr);
+  if (g.imem) vkFreeMemory(m_ctx->device, g.imem, nullptr);
+  g = {};
+
+  auto const &c = chunk(Geometry);
+  g.type = c.type;
+  g.vertex_count = static_cast<uint32_t>(c.vertices.size());
+  g.index_count = static_cast<uint32_t>(c.indices.size());
+
+  make_device_buffer(*m_ctx, c.vertices.data(),
+                     c.vertices.size() * sizeof(gfx::basic_vertex),
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g.vbuf, g.vmem);
+  if (!c.indices.empty()) {
+    make_device_buffer(*m_ctx, c.indices.data(),
+                       c.indices.size() * sizeof(gfx::basic_index),
+                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT, g.ibuf, g.imem);
+  }
+}
+
+void vulkan_geometrybank::create_(gfx::geometry_handle const &Geometry) {
+  upload(Geometry);
+}
+
+void vulkan_geometrybank::replace_(gfx::geometry_handle const &Geometry) {
+  upload(Geometry);
+}
+
+std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
+                                       gfx::stream_units const & /*Units*/,
+                                       unsigned int const /*Streams*/) {
+  if (m_ctx == nullptr || m_ctx->current_cmd == VK_NULL_HANDLE) return 0;
+  const uint32_t index = Geometry.chunk - 1;
+  if (index >= m_gpu.size()) return 0;
+  const gpu_chunk &g = m_gpu[index];
+  if (g.vbuf == VK_NULL_HANDLE) return 0;
+
+  // Pick the pipeline matching the chunk's primitive type (triangle fans and
+  // other types are skipped for now).
+  VkPipeline pipe = VK_NULL_HANDLE;
+  if (g.type == GL_TRIANGLES) {
+    pipe = m_ctx->pipeline_triangles;
+  } else if (g.type == GL_TRIANGLE_STRIP) {
+    pipe = m_ctx->pipeline_strips;
+  }
+  if (pipe == VK_NULL_HANDLE) return 0;
+  vkCmdBindPipeline(m_ctx->current_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+
+  VkDeviceSize offset = 0;
+  vkCmdBindVertexBuffers(m_ctx->current_cmd, 0, 1, &g.vbuf, &offset);
+  if (g.index_count > 0) {
+    vkCmdBindIndexBuffer(m_ctx->current_cmd, g.ibuf, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(m_ctx->current_cmd, g.index_count, 1, 0, 0, 0);
+    return g.index_count / 3;
+  }
+  vkCmdDraw(m_ctx->current_cmd, g.vertex_count, 1, 0, 0);
+  return g.vertex_count / 3;
 }
 
 void vulkan_renderer::recreate_swapchain() {
@@ -715,6 +986,20 @@ bool vulkan_renderer::Render() {
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
                        nullptr, 0, nullptr, 1, &to_color);
 
+  // UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL for the depth buffer.
+  VkImageMemoryBarrier to_depth{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_depth.srcAccessMask = 0;
+  to_depth.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_depth.image = m_depth_image;
+  to_depth.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr,
+                       0, nullptr, 1, &to_depth);
+
   VkRenderingAttachmentInfo color_attachment{
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   color_attachment.imageView = view;
@@ -723,12 +1008,21 @@ bool vulkan_renderer::Render() {
   color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color_attachment.clearValue.color = {{0.06f, 0.10f, 0.18f, 1.0f}};
 
+  VkRenderingAttachmentInfo depth_attachment{
+      VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  depth_attachment.imageView = m_depth_view;
+  depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth_attachment.clearValue.depthStencil = {1.0f, 0};
+
   VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
   rendering_info.renderArea.offset = {0, 0};
   rendering_info.renderArea.extent = m_swapchain_extent;
   rendering_info.layerCount = 1;
   rendering_info.colorAttachmentCount = 1;
   rendering_info.pColorAttachments = &color_attachment;
+  rendering_info.pDepthAttachment = &depth_attachment;
 
   vkCmdBeginRendering(frame.command_buffer, &rendering_info);
 
@@ -746,9 +1040,72 @@ bool vulkan_renderer::Render() {
   scissor.extent = m_swapchain_extent;
   vkCmdSetScissor(frame.command_buffer, 0, 1, &scissor);
 
-  vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    m_pipeline);
-  vkCmdDraw(frame.command_buffer, 3, 1, 0, 0);
+  // Camera-relative scene rendering: rotation-only view, and each section/cell
+  // group is translated by (group_center - camera_pos). Geometry is stored
+  // relative to its section/cell centre, matching the engine's scheme.
+  glm::dmat4 view_d(1.0);
+  Global.pCamera.SetMatrix(view_d);
+  const glm::mat4 rot = glm::mat4(glm::mat3(view_d));
+  glm::mat4 proj = glm::perspectiveFovRH_ZO(
+      glm::radians(static_cast<float>(Global.FieldOfView)),
+      static_cast<float>(m_swapchain_extent.width),
+      static_cast<float>(m_swapchain_extent.height), 0.1f, 5000.f);
+  proj[1][1] *= -1.f;  // flip Y for Vulkan clip space
+  const glm::dvec3 campos = Global.pCamera.Pos;
+
+  // The geometry bank binds the right pipeline per chunk (triangles/strips);
+  // both share the layout, so the per-group MVP push below stays valid.
+  m_geo_ctx.current_cmd = frame.command_buffer;
+
+  auto push_group_mvp = [&](glm::dvec3 const &center) {
+    const glm::mat4 model =
+        glm::translate(glm::mat4(1.f), glm::vec3(center - campos));
+    const glm::mat4 mvp = proj * rot * model;
+    vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
+  };
+
+  // Building track geometry needs the default rail profiles loaded; ensure
+  // they exist (idempotent) before any create_geometry() touches them.
+  TTrack::fetch_default_profiles();
+
+  // Walk the region sections around the camera and draw their opaque scenery.
+  // No frustum culling yet; a fixed range keeps the section count bounded.
+  if (scene::basic_region *region = simulation::Region) {
+    const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
+    const int half =
+        static_cast<int>(std::ceil(2000.0 / scene::EU07_SECTIONSIZE));
+    const int cx = static_cast<int>(
+        std::floor(campos.x / scene::EU07_SECTIONSIZE + side / 2));
+    const int cz = static_cast<int>(
+        std::floor(campos.z / scene::EU07_SECTIONSIZE + side / 2));
+    for (int z = cz - half; z <= cz + half; ++z) {
+      if (z < 0 || z >= side) continue;
+      for (int x = cx - half; x <= cx + half; ++x) {
+        if (x < 0 || x >= side) continue;
+        scene::basic_section *section =
+            region->get_section(static_cast<size_t>(z) * side + x);
+        if (section == nullptr) continue;
+        section->create_geometry();
+
+        if (!section->m_shapes.empty()) {
+          push_group_mvp(section->m_area.center);
+          for (auto const &shape : section->m_shapes) {
+            m_geometry.draw(shape.data().geometry);
+          }
+        }
+        for (auto &cell : section->m_cells) {
+          if (!cell.m_active || cell.m_shapesopaque.empty()) continue;
+          push_group_mvp(cell.m_area.center);
+          for (auto const &shape : cell.m_shapesopaque) {
+            m_geometry.draw(shape.data().geometry);
+          }
+        }
+      }
+    }
+  }
+
+  m_geo_ctx.current_cmd = VK_NULL_HANDLE;
 
   // Draw the UI into the same pass: render_ui() -> ImGui::Render() -> the
   // ImGui backend records its draw data into this command buffer.
