@@ -17,16 +17,19 @@
 #include <set>
 
 #include "application/application.h"
+#include "model/Model3d.h"
 #include "scene/scene.h"
 #include "utilities/Globals.h"
 #include "utilities/Logs.h"
+#include "vehicle/Train.h"
 #include "world/Track.h"
 
-// Defined in the engine (simulation/simulation.cpp); forward-declared here to
-// avoid pulling simulation.h's heavy transitive includes into this TU.
+// Defined in the engine; forward-declared here to avoid pulling simulation.h's
+// heavy transitive includes into this TU.
 namespace simulation {
 extern scene::basic_region *Region;
-}
+extern TTrain *Train;
+}  // namespace simulation
 
 // SPIR-V embedded by the build (glslangValidator --vn). Each header defines a
 // `const uint32_t <name>[]` array.
@@ -925,6 +928,31 @@ bool vulkan_renderer::create_frame_resources() {
 // Frame loop
 // ---------------------------------------------------------------------------
 
+void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
+                                      const glm::mat4 &rot,
+                                      const glm::mat4 &proj,
+                                      VkCommandBuffer cmd) {
+  if (sm == nullptr) return;
+
+  if (sm->iVisible && TSubModel::fSquareDist >= sm->fSquareMinDist &&
+      TSubModel::fSquareDist < sm->fSquareMaxDist) {
+    glm::mat4 local = parent;
+    if ((sm->iFlags & 0xC000) && sm->fMatrix != nullptr) {
+      local = parent * glm::make_mat4(sm->fMatrix->readArray());
+    }
+    // Mesh submodels (eType < TP_ROTATOR) carry drawable geometry. Animations
+    // and alpha sorting are ignored for now.
+    if (sm->eType < TP_ROTATOR) {
+      const glm::mat4 mvp = proj * rot * local;
+      vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                         sizeof(mvp), &mvp);
+      m_geometry.draw(sm->m_geometry.handle);
+    }
+    if (sm->Child != nullptr) render_submodel(sm->Child, local, rot, proj, cmd);
+  }
+  if (sm->Next != nullptr) render_submodel(sm->Next, parent, rot, proj, cmd);
+}
+
 bool vulkan_renderer::Render() {
   // The application opened an ImGui frame in begin_ui_frame(); the engine
   // relies on the renderer driving render_ui() (which calls ImGui::Render())
@@ -1102,6 +1130,21 @@ bool vulkan_renderer::Render() {
           }
         }
       }
+    }
+  }
+
+  // Player vehicle: render its main model so the locomotive shows.
+  if (simulation::Train != nullptr) {
+    TDynamicObject *veh = simulation::Train->Dynamic();
+    if (veh != nullptr && veh->mdModel != nullptr &&
+        veh->mdModel->Root != nullptr) {
+      TSubModel::fSquareDist = 0.f;
+      veh->ABuLittleUpdate(0.0);
+      const glm::mat4 vehicle_model =
+          glm::translate(glm::mat4(1.f), glm::vec3(veh->vPosition - campos)) *
+          glm::mat4(veh->mMatrix);
+      render_submodel(veh->mdModel->Root, vehicle_model, rot, proj,
+                      frame.command_buffer);
     }
   }
 

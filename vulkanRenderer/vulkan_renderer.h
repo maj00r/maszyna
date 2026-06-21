@@ -25,6 +25,7 @@
 
 struct GLFWwindow;
 class vulkan_imgui_renderer;
+class TSubModel;
 
 // Shared, renderer-owned state the geometry banks need: the device (for buffer
 // allocation in create_) and the command buffer currently being recorded (for
@@ -209,6 +210,11 @@ class vulkan_renderer : public gfx_renderer {
   void destroy_depth_resources();
   bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_test_geometry();
+  // Recursively draw a model's submodel tree (camera-relative). parent is the
+  // accumulated model matrix; rot/proj are the camera rotation and projection.
+  void render_submodel(TSubModel *sm, const glm::mat4 &parent,
+                       const glm::mat4 &rot, const glm::mat4 &proj,
+                       VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
