@@ -1561,6 +1561,13 @@ bool vulkan_renderer::Render() {
                        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
   };
 
+  auto bind_mat = [&](material_handle material) {
+    VkDescriptorSet d = material_texture_descriptor(material);
+    vkCmdBindDescriptorSets(frame.command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout,
+                            0, 1, &d, 0, nullptr);
+  };
+
   // Render one placed scenery model (TAnimModel): translate by its world
   // position relative to the camera, then apply its Y/X/Z rotation (degrees).
   auto render_instance = [&](TAnimModel *inst) {
@@ -1621,16 +1628,27 @@ bool vulkan_renderer::Render() {
         }
         for (auto &cell : section->m_cells) {
           if (!cell.m_active) continue;
-          // Non-instanced opaque shapes (relative to the cell centre).
-          if (!cell.m_shapesopaque.empty()) {
-            push_group_mvp(cell.m_area.center);
-            for (auto const &shape : cell.m_shapesopaque) {
-              VkDescriptorSet d =
-                  material_texture_descriptor(shape.data().material);
-              vkCmdBindDescriptorSets(frame.command_buffer,
-                                      VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                      m_pipeline_layout, 0, 1, &d, 0, nullptr);
-              m_geometry.draw(shape.data().geometry);
+          // Shapes and tracks are stored relative to the cell centre.
+          push_group_mvp(cell.m_area.center);
+          for (auto const &shape : cell.m_shapesopaque) {
+            bind_mat(shape.data().material);
+            m_geometry.draw(shape.data().geometry);
+          }
+          // Tracks/roads: material1 -> rails, material2 -> trackbed/verge.
+          for (auto *track : cell.m_paths) {
+            if (track == nullptr || !track->m_visible) continue;
+            if (track->m_material1 != null_handle) {
+              bind_mat(track->m_material1);
+              for (auto const &g : track->Geometry1) m_geometry.draw(g);
+            }
+            if (track->m_material2 != null_handle) {
+              bind_mat(track->m_material2);
+              for (auto const &g : track->Geometry2) m_geometry.draw(g);
+            }
+            if (track->SwitchExtension &&
+                track->SwitchExtension->m_material3 != null_handle) {
+              bind_mat(track->SwitchExtension->m_material3);
+              m_geometry.draw(track->SwitchExtension->Geometry3);
             }
           }
           // Placed scenery models (semaphores, poles, crossings, signs...).
@@ -1643,21 +1661,50 @@ bool vulkan_renderer::Render() {
     }
   }
 
-  // Player vehicle: render its main model so the locomotive shows.
-  if (simulation::Train != nullptr) {
-    TDynamicObject *veh = simulation::Train->Dynamic();
-    if (veh != nullptr && veh->mdModel != nullptr &&
-        veh->mdModel->Root != nullptr) {
-      TSubModel::fSquareDist = 0.f;
-      veh->ABuLittleUpdate(0.0);
-      const glm::mat4 vehicle_model =
-          glm::translate(glm::mat4(1.f), glm::vec3(veh->vPosition - campos)) *
-          glm::mat4(veh->mMatrix);
-      const material_data *md = veh->Material();
-      const material_handle *skins =
-          (md != nullptr) ? md->replacable_skins : nullptr;
-      render_submodel(veh->mdModel->Root, vehicle_model, rot, proj, skins,
+  // Render a whole vehicle: body + low-poly interior + load (+ cab for the
+  // occupied one). Models are in vehicle-local space placed by mMatrix.
+  auto render_vehicle = [&](TDynamicObject *veh, bool with_cab) {
+    if (veh == nullptr) return;
+    veh->ABuLittleUpdate(0.0);
+    TSubModel::fSquareDist = static_cast<float>(
+        glm::length2(glm::vec3(veh->vPosition - campos)) /
+        static_cast<double>(Global.ZoomFactor));
+    const glm::mat4 vm =
+        glm::translate(glm::mat4(1.f), glm::vec3(veh->vPosition - campos)) *
+        glm::mat4(veh->mMatrix);
+    const material_data *md = veh->Material();
+    const material_handle *skins =
+        (md != nullptr) ? md->replacable_skins : nullptr;
+    if (veh->mdLowPolyInt && veh->mdLowPolyInt->Root)
+      render_submodel(veh->mdLowPolyInt->Root, vm, rot, proj, skins,
                       frame.command_buffer);
+    if (veh->mdModel && veh->mdModel->Root)
+      render_submodel(veh->mdModel->Root, vm, rot, proj, skins,
+                      frame.command_buffer);
+    if (veh->mdLoad && veh->mdLoad->Root) {
+      const glm::mat4 lm =
+          glm::translate(vm, glm::vec3(0.f, veh->LoadOffset, 0.f));
+      render_submodel(veh->mdLoad->Root, lm, rot, proj, skins,
+                      frame.command_buffer);
+    }
+    if (with_cab && veh->mdKabina && veh->mdKabina->Root)
+      render_submodel(veh->mdKabina->Root, vm, rot, proj, skins,
+                      frame.command_buffer);
+  };
+
+  // Render the player's whole consist (walk the coupling chain both ways).
+  if (simulation::Train != nullptr) {
+    TDynamicObject *player = simulation::Train->Dynamic();
+    if (player != nullptr) {
+      std::set<TDynamicObject *> consist;
+      consist.insert(player);
+      for (TDynamicObject *v = player->NextConnected();
+           v != nullptr && consist.insert(v).second; v = v->NextConnected()) {
+      }
+      for (TDynamicObject *v = player->PrevConnected();
+           v != nullptr && consist.insert(v).second; v = v->PrevConnected()) {
+      }
+      for (TDynamicObject *v : consist) render_vehicle(v, v == player);
     }
   }
 
