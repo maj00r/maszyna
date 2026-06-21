@@ -16,8 +16,13 @@
 #include <cstring>
 #include <set>
 
+#include <fstream>
+
+#include "stb/stb_image.h"  // declarations; implemented in engine's stb_image.c
+
 #include "application/application.h"
 #include "model/Model3d.h"
+#include "model/Texture.h"  // texture_manager::find_on_disk
 #include "scene/scene.h"
 #include "utilities/Globals.h"
 #include "utilities/Logs.h"
@@ -1121,9 +1126,252 @@ bool vulkan_renderer::create_frame_resources() {
 // Frame loop
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Textures
+// ---------------------------------------------------------------------------
+
+namespace {
+struct decoded_image {
+  std::vector<uint8_t> pixels;  // raw or BC-compressed mip-0 data
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+};
+
+// Minimal DDS reader: DXT1/3/5 mip 0 -> BC block data (Vulkan samples BC
+// natively, no decode). Other DDS variants are rejected (caller falls back).
+bool decode_dds(const std::string &path, decoded_image &out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+  if (b.size() < 128 || std::memcmp(b.data(), "DDS ", 4) != 0) return false;
+  auto rd32 = [&](size_t off) {
+    uint32_t v;
+    std::memcpy(&v, b.data() + off, 4);
+    return v;
+  };
+  const uint32_t height = rd32(12);
+  const uint32_t width = rd32(16);
+  char fourcc[5] = {0};
+  std::memcpy(fourcc, b.data() + 84, 4);
+  uint32_t blockbytes = 0;
+  if (std::strcmp(fourcc, "DXT1") == 0) {
+    out.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    blockbytes = 8;
+  } else if (std::strcmp(fourcc, "DXT3") == 0) {
+    out.format = VK_FORMAT_BC2_UNORM_BLOCK;
+    blockbytes = 16;
+  } else if (std::strcmp(fourcc, "DXT5") == 0) {
+    out.format = VK_FORMAT_BC3_UNORM_BLOCK;
+    blockbytes = 16;
+  } else {
+    return false;
+  }
+  const uint32_t bw = std::max(1u, (width + 3) / 4);
+  const uint32_t bh = std::max(1u, (height + 3) / 4);
+  const size_t mip0 = static_cast<size_t>(bw) * bh * blockbytes;
+  if (b.size() < 128 + mip0) return false;
+  out.width = width;
+  out.height = height;
+  out.pixels.assign(b.begin() + 128, b.begin() + 128 + mip0);
+  return true;
+}
+
+bool decode_stb(const std::string &path, decoded_image &out) {
+  int x = 0, y = 0, n = 0;
+  stbi_set_flip_vertically_on_load(0);
+  uint8_t *img = stbi_load(path.c_str(), &x, &y, &n, 4);
+  if (img == nullptr) return false;
+  out.width = static_cast<uint32_t>(x);
+  out.height = static_cast<uint32_t>(y);
+  out.format = VK_FORMAT_R8G8B8A8_UNORM;
+  out.pixels.assign(img, img + static_cast<size_t>(x) * y * 4);
+  stbi_image_free(img);
+  return true;
+}
+
+bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
+                        VkQueue queue, const decoded_image &src, VkImage &image,
+                        VkDeviceMemory &mem, VkImageView &view) {
+  if (src.pixels.empty() || src.width == 0 || src.height == 0) return false;
+
+  // Staging buffer.
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = src.pixels.size();
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(dev, &bi, nullptr, &staging));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, staging, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(
+        pd, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(dev, &ai, nullptr, &staging_mem));
+    vkBindBufferMemory(dev, staging, staging_mem, 0);
+    void *mapped = nullptr;
+    vkMapMemory(dev, staging_mem, 0, src.pixels.size(), 0, &mapped);
+    std::memcpy(mapped, src.pixels.data(), src.pixels.size());
+    vkUnmapMemory(dev, staging_mem);
+  }
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = src.format;
+  ici.extent = {src.width, src.height, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VK_CHECK(vkCreateImage(dev, &ici, nullptr, &image));
+  {
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(dev, image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(pd, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(dev, &ai, nullptr, &mem));
+    vkBindImageMemory(dev, image, mem, 0);
+  }
+
+  VkCommandBufferAllocateInfo cbai{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(dev, &cbai, &cmd);
+  VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bbi);
+
+  VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_dst.image = image;
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                       1, &to_dst);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {src.width, src.height, 1};
+  vkCmdCopyBufferToImage(cmd, staging, image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  VkImageMemoryBarrier to_read = to_dst;
+  to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &to_read);
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(queue);
+  vkFreeCommandBuffers(dev, pool, 1, &cmd);
+  vkDestroyBuffer(dev, staging, nullptr);
+  vkFreeMemory(dev, staging_mem, nullptr);
+
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = src.format;
+  vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VK_CHECK(vkCreateImageView(dev, &vci, nullptr, &view));
+  return true;
+}
+}  // namespace
+
+texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
+                                              bool const /*Loadnow*/,
+                                              GLint /*format_hint*/) {
+  if (Filename.empty()) return null_handle;
+  if (auto it = m_texture_map.find(Filename); it != m_texture_map.end()) {
+    return it->second;
+  }
+
+  texture_handle handle = null_handle;
+  const auto located = texture_manager::find_on_disk(Filename);
+  if (located.first.empty()) {
+    WriteLog("vk-tex: not found on disk: " + Filename);
+  }
+  if (!located.first.empty()) {
+    const std::string path = located.first + located.second;
+    decoded_image img;
+    bool ok = false;
+    if (located.second == ".dds") {
+      ok = decode_dds(path, img);
+    } else {
+      ok = decode_stb(path, img);
+    }
+    if (!ok) {
+      WriteLog("vk-tex: decode failed (" + located.second + "): " + path);
+    }
+    if (ok) {
+      gpu_texture tex;
+      if (make_texture_image(m_physical_device, m_device, m_command_pool,
+                             m_graphics_queue, img, tex.image, tex.memory,
+                             tex.view)) {
+        VkDescriptorSetAllocateInfo dsai{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = m_descriptor_pool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &m_texture_set_layout;
+        if (vkAllocateDescriptorSets(m_device, &dsai, &tex.descriptor) ==
+            VK_SUCCESS) {
+          VkDescriptorImageInfo info{};
+          info.sampler = m_sampler;
+          info.imageView = tex.view;
+          info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+          write.dstSet = tex.descriptor;
+          write.descriptorCount = 1;
+          write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+          write.pImageInfo = &info;
+          vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+          m_textures.push_back(tex);
+          handle = static_cast<texture_handle>(m_textures.size());  // 1-based
+        }
+      }
+    }
+  }
+
+  m_texture_map[Filename] = handle;
+  return handle;
+}
+
+VkDescriptorSet vulkan_renderer::material_texture_descriptor(
+    material_handle material) const {
+  if (material != null_handle) {
+    const texture_handle t = m_material_manager.material(material).GetTexture(0);
+    if (t != null_handle && static_cast<size_t>(t) <= m_textures.size()) {
+      const VkDescriptorSet d = m_textures[t - 1].descriptor;
+      if (d != VK_NULL_HANDLE) return d;
+    }
+  }
+  return m_white_descriptor;
+}
+
 void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &rot,
                                       const glm::mat4 &proj,
+                                      const material_handle *skins,
                                       VkCommandBuffer cmd) {
   if (sm == nullptr) return;
 
@@ -1139,11 +1387,23 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
       const glm::mat4 mvp = proj * rot * local;
       vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                          sizeof(mvp), &mvp);
+      // m_material: >0 direct handle, 0 none, <0 replacable skin index.
+      material_handle mh = null_handle;
+      if (sm->m_material > 0) {
+        mh = sm->m_material;
+      } else if (sm->m_material < 0 && skins != nullptr) {
+        mh = skins[-sm->m_material];
+      }
+      VkDescriptorSet d = material_texture_descriptor(mh);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              m_pipeline_layout, 0, 1, &d, 0, nullptr);
       m_geometry.draw(sm->m_geometry.handle);
     }
-    if (sm->Child != nullptr) render_submodel(sm->Child, local, rot, proj, cmd);
+    if (sm->Child != nullptr)
+      render_submodel(sm->Child, local, rot, proj, skins, cmd);
   }
-  if (sm->Next != nullptr) render_submodel(sm->Next, parent, rot, proj, cmd);
+  if (sm->Next != nullptr)
+    render_submodel(sm->Next, parent, rot, proj, skins, cmd);
 }
 
 bool vulkan_renderer::Render() {
@@ -1319,6 +1579,11 @@ bool vulkan_renderer::Render() {
         if (!section->m_shapes.empty()) {
           push_group_mvp(section->m_area.center);
           for (auto const &shape : section->m_shapes) {
+            VkDescriptorSet d =
+                material_texture_descriptor(shape.data().material);
+            vkCmdBindDescriptorSets(frame.command_buffer,
+                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    m_pipeline_layout, 0, 1, &d, 0, nullptr);
             m_geometry.draw(shape.data().geometry);
           }
         }
@@ -1326,6 +1591,11 @@ bool vulkan_renderer::Render() {
           if (!cell.m_active || cell.m_shapesopaque.empty()) continue;
           push_group_mvp(cell.m_area.center);
           for (auto const &shape : cell.m_shapesopaque) {
+            VkDescriptorSet d =
+                material_texture_descriptor(shape.data().material);
+            vkCmdBindDescriptorSets(frame.command_buffer,
+                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    m_pipeline_layout, 0, 1, &d, 0, nullptr);
             m_geometry.draw(shape.data().geometry);
           }
         }
@@ -1343,7 +1613,10 @@ bool vulkan_renderer::Render() {
       const glm::mat4 vehicle_model =
           glm::translate(glm::mat4(1.f), glm::vec3(veh->vPosition - campos)) *
           glm::mat4(veh->mMatrix);
-      render_submodel(veh->mdModel->Root, vehicle_model, rot, proj,
+      const material_data *md = veh->Material();
+      const material_handle *skins =
+          (md != nullptr) ? md->replacable_skins : nullptr;
+      render_submodel(veh->mdModel->Root, vehicle_model, rot, proj, skins,
                       frame.command_buffer);
     }
   }

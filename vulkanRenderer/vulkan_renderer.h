@@ -132,23 +132,17 @@ class vulkan_renderer : public gfx_renderer {
   }
 
   // --- materials ----------------------------------------------------------
+  // Use the engine's material manager: it parses .mat files and fills texture
+  // handles via Fetch_Texture below. Its GL-only validation is skipped because
+  // Global.GfxRenderer == "vulkan".
   material_handle Fetch_Material(std::string const &Filename,
                                  bool const Loadnow = true) override {
-    m_materials.push_back(std::make_shared<opengl_material>());
-    m_materials.back()->name = Filename;
-    return m_materials.size();
+    return m_material_manager.create(Filename, Loadnow);
   }
   void Bind_Material(material_handle const Material, TSubModel const *sm = nullptr,
                      lighting_data const *lighting = nullptr) override {}
-  // Handle 0 (null_handle) and out-of-range handles must not throw: many call
-  // sites do Material(h)->method() without checking h first. Hand back a safe
-  // default material instead of indexing past the end.
   IMaterial const *Material(material_handle const Material) const override {
-    if (Material == null_handle ||
-        static_cast<std::size_t>(Material) > m_materials.size()) {
-      return &m_default_material;
-    }
-    return m_materials[Material - 1].get();
+    return &m_material_manager.material(Material);
   }
 
   // --- shaders ------------------------------------------------------------
@@ -159,14 +153,10 @@ class vulkan_renderer : public gfx_renderer {
   // --- textures -----------------------------------------------------------
   texture_handle Fetch_Texture(std::string const &Filename,
                                bool const Loadnow = true,
-                               GLint format_hint = GL_SRGB_ALPHA) override {
-    return 0;
-  }
+                               GLint format_hint = GL_SRGB_ALPHA) override;
   void Bind_Texture(texture_handle const Texture) override {}
   void Bind_Texture(std::size_t const Unit,
                     texture_handle const Texture) override {}
-  // Until the sampling pipeline exists, hand back the shared no-op texture so
-  // scene loading can query dimensions/state without crashing.
   ITexture &Texture(texture_handle const Texture) override {
     return *ITexture::null_texture();
   }
@@ -213,10 +203,12 @@ class vulkan_renderer : public gfx_renderer {
   bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_test_geometry();
   // Recursively draw a model's submodel tree (camera-relative). parent is the
-  // accumulated model matrix; rot/proj are the camera rotation and projection.
+  // accumulated model matrix; rot/proj are the camera rotation and projection;
+  // skins points to the model's replacable-skin handles (or null) for
+  // submodels with m_material < 0.
   void render_submodel(TSubModel *sm, const glm::mat4 &parent,
                        const glm::mat4 &rot, const glm::mat4 &proj,
-                       VkCommandBuffer cmd);
+                       const material_handle *skins, VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -292,8 +284,21 @@ class vulkan_renderer : public gfx_renderer {
   std::unique_ptr<vulkan_imgui_renderer> m_imgui;
 
   gfx::geometrybank_manager m_geometry;
-  std::vector<std::shared_ptr<opengl_material>> m_materials;
-  opengl_material m_default_material;  // returned for null/invalid handles
+  material_manager m_material_manager;
+
+  // GPU textures indexed by (handle - 1); handle 0 (null) maps to the white
+  // default. Loaded on demand by Fetch_Texture, deduped by filename.
+  struct gpu_texture {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor = VK_NULL_HANDLE;
+  };
+  std::vector<gpu_texture> m_textures;
+  std::unordered_map<std::string, texture_handle> m_texture_map;
+  // Returns the descriptor set for a material's diffuse texture, or the white
+  // default if there is none.
+  VkDescriptorSet material_texture_descriptor(material_handle material) const;
   std::string m_info_times;
   std::string m_info_stats;
   float m_framerate = 60.f;
