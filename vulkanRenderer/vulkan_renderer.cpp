@@ -41,6 +41,8 @@ extern TTrain *Train;
 // `const uint32_t <name>[]` array.
 #include "world_vert_spv.h"
 #include "world_frag_spv.h"
+#include "pick_vert_spv.h"
+#include "pick_frag_spv.h"
 
 namespace {
 
@@ -146,10 +148,35 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
                              m_pipeline_strips))
     return false;
+  if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                            m_pick_pipeline_triangles))
+    return false;
+  if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+                            m_pick_pipeline_strips))
+    return false;
   m_geo_ctx.physical_device = m_physical_device;
   m_geo_ctx.device = m_device;
   m_geo_ctx.pipeline_triangles = m_pipeline_triangles;
   m_geo_ctx.pipeline_strips = m_pipeline_strips;
+  m_geo_ctx.pick_pipeline_triangles = m_pick_pipeline_triangles;
+  m_geo_ctx.pick_pipeline_strips = m_pick_pipeline_strips;
+  {
+    // 1-pixel readback buffer for control picking.
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = 4;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(m_device, &bi, nullptr, &m_pick_readback));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(m_device, m_pick_readback, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(
+        m_physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &m_pick_readback_memory));
+    vkBindBufferMemory(m_device, m_pick_readback, m_pick_readback_memory, 0);
+  }
   if (!create_test_geometry()) return false;
   if (!create_frame_resources()) return false;
 
@@ -198,6 +225,20 @@ void vulkan_renderer::Shutdown() {
       vkDestroyPipelineLayout(m_device, m_pipeline_layout, nullptr);
       m_pipeline_layout = VK_NULL_HANDLE;
     }
+    if (m_pick_pipeline_triangles)
+      vkDestroyPipeline(m_device, m_pick_pipeline_triangles, nullptr);
+    if (m_pick_pipeline_strips)
+      vkDestroyPipeline(m_device, m_pick_pipeline_strips, nullptr);
+    if (m_pick_layout)
+      vkDestroyPipelineLayout(m_device, m_pick_layout, nullptr);
+    if (m_pick_readback) vkDestroyBuffer(m_device, m_pick_readback, nullptr);
+    if (m_pick_readback_memory)
+      vkFreeMemory(m_device, m_pick_readback_memory, nullptr);
+    m_pick_pipeline_triangles = VK_NULL_HANDLE;
+    m_pick_pipeline_strips = VK_NULL_HANDLE;
+    m_pick_layout = VK_NULL_HANDLE;
+    m_pick_readback = VK_NULL_HANDLE;
+    m_pick_readback_memory = VK_NULL_HANDLE;
     if (m_descriptor_pool) {
       vkDestroyDescriptorPool(m_device, m_descriptor_pool, nullptr);
       m_descriptor_pool = VK_NULL_HANDLE;
@@ -531,7 +572,8 @@ bool vulkan_renderer::create_swapchain() {
            std::to_string(actual) + " images.");
 
   if (!create_image_views()) return false;
-  return create_depth_resources();
+  if (!create_depth_resources()) return false;
+  return create_pick_resources();
 }
 
 bool vulkan_renderer::create_image_views() {
@@ -555,6 +597,7 @@ bool vulkan_renderer::create_image_views() {
 
 void vulkan_renderer::destroy_swapchain() {
   destroy_depth_resources();
+  destroy_pick_resources();
 
   for (VkImageView view : m_swapchain_image_views) {
     if (view) vkDestroyImageView(m_device, view, nullptr);
@@ -901,12 +944,14 @@ std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
   if (g.vbuf == VK_NULL_HANDLE) return 0;
 
   // Pick the pipeline matching the chunk's primitive type (triangle fans and
-  // other types are skipped for now).
+  // other types are skipped for now). In pick mode use the ID-colour pipelines.
   VkPipeline pipe = VK_NULL_HANDLE;
   if (g.type == GL_TRIANGLES) {
-    pipe = m_ctx->pipeline_triangles;
+    pipe = m_ctx->pick_mode ? m_ctx->pick_pipeline_triangles
+                            : m_ctx->pipeline_triangles;
   } else if (g.type == GL_TRIANGLE_STRIP) {
-    pipe = m_ctx->pipeline_strips;
+    pipe = m_ctx->pick_mode ? m_ctx->pick_pipeline_strips
+                            : m_ctx->pipeline_strips;
   }
   if (pipe == VK_NULL_HANDLE) return 0;
   vkCmdBindPipeline(m_ctx->current_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1403,6 +1448,373 @@ VkDescriptorSet vulkan_renderer::material_texture_descriptor(
   return m_white_descriptor;
 }
 
+// ---------------------------------------------------------------------------
+// Control picking
+// ---------------------------------------------------------------------------
+
+bool vulkan_renderer::create_pick_pipeline(VkPrimitiveTopology topology,
+                                           VkPipeline &out) {
+  VkShaderModule vert =
+      create_shader_module(pick_vert_spv, sizeof(pick_vert_spv));
+  VkShaderModule frag =
+      create_shader_module(pick_frag_spv, sizeof(pick_frag_spv));
+  if (!vert || !frag) return false;
+
+  VkPipelineShaderStageCreateInfo stages[2] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vert;
+  stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = frag;
+  stages[1].pName = "main";
+
+  VkVertexInputBindingDescription vtx_binding{};
+  vtx_binding.stride = sizeof(gfx::basic_vertex);
+  vtx_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription vtx_attrs[4]{};
+  vtx_attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                  offsetof(gfx::basic_vertex, position)};
+  vtx_attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                  offsetof(gfx::basic_vertex, normal)};
+  vtx_attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,
+                  offsetof(gfx::basic_vertex, texture)};
+  vtx_attrs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                  offsetof(gfx::basic_vertex, tangent)};
+  VkPipelineVertexInputStateCreateInfo vertex_input{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vertex_input.vertexBindingDescriptionCount = 1;
+  vertex_input.pVertexBindingDescriptions = &vtx_binding;
+  vertex_input.vertexAttributeDescriptionCount = 4;
+  vertex_input.pVertexAttributeDescriptions = vtx_attrs;
+
+  VkPipelineInputAssemblyStateCreateInfo input_assembly{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  input_assembly.topology = topology;
+
+  VkPipelineViewportStateCreateInfo viewport_state{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport_state.viewportCount = 1;
+  viewport_state.scissorCount = 1;
+
+  VkPipelineRasterizationStateCreateInfo raster{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo multisample{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState blend{};
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo color_blend{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  color_blend.attachmentCount = 1;
+  color_blend.pAttachments = &blend;
+
+  VkPipelineDepthStencilStateCreateInfo depth_stencil{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth_stencil.depthTestEnable = VK_TRUE;
+  depth_stencil.depthWriteEnable = VK_TRUE;
+  depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+  VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic_state{
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic_state.dynamicStateCount = 2;
+  dynamic_state.pDynamicStates = dyn;
+
+  if (m_pick_layout == VK_NULL_HANDLE) {
+    VkPushConstantRange pc_range{};
+    pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pc_range.offset = 0;
+    pc_range.size = sizeof(float) * 20;  // mat4 + vec4
+    VkPipelineLayoutCreateInfo lci{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &pc_range;
+    VK_CHECK(vkCreatePipelineLayout(m_device, &lci, nullptr, &m_pick_layout));
+  }
+
+  VkPipelineRenderingCreateInfo rendering_ci{
+      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering_ci.colorAttachmentCount = 1;
+  rendering_ci.pColorAttachmentFormats = &m_pick_format;
+  rendering_ci.depthAttachmentFormat = m_depth_format;
+
+  VkGraphicsPipelineCreateInfo pci{
+      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  pci.pNext = &rendering_ci;
+  pci.stageCount = 2;
+  pci.pStages = stages;
+  pci.pVertexInputState = &vertex_input;
+  pci.pInputAssemblyState = &input_assembly;
+  pci.pViewportState = &viewport_state;
+  pci.pRasterizationState = &raster;
+  pci.pMultisampleState = &multisample;
+  pci.pColorBlendState = &color_blend;
+  pci.pDepthStencilState = &depth_stencil;
+  pci.pDynamicState = &dynamic_state;
+  pci.layout = m_pick_layout;
+  pci.renderPass = VK_NULL_HANDLE;
+
+  VkResult res = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pci,
+                                           nullptr, &out);
+  vkDestroyShaderModule(m_device, vert, nullptr);
+  vkDestroyShaderModule(m_device, frag, nullptr);
+  if (res != VK_SUCCESS) {
+    log_error("pick pipeline creation failed.");
+    return false;
+  }
+  return true;
+}
+
+bool vulkan_renderer::create_pick_resources() {
+  auto make_image = [&](VkFormat format, VkImageUsageFlags usage,
+                        VkImageAspectFlags aspect, VkImage &image,
+                        VkDeviceMemory &mem, VkImageView &view) -> bool {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {m_swapchain_extent.width, m_swapchain_extent.height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(m_device, &ici, nullptr, &image));
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(m_device, image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(m_physical_device, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &mem));
+    vkBindImageMemory(m_device, image, mem, 0);
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = format;
+    vci.subresourceRange = {aspect, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &view));
+    return true;
+  };
+  if (!make_image(m_pick_format,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT, m_pick_color_image,
+                  m_pick_color_memory, m_pick_color_view))
+    return false;
+  if (!make_image(m_depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                  VK_IMAGE_ASPECT_DEPTH_BIT, m_pick_depth_image,
+                  m_pick_depth_memory, m_pick_depth_view))
+    return false;
+  return true;
+}
+
+void vulkan_renderer::destroy_pick_resources() {
+  if (m_pick_color_view) vkDestroyImageView(m_device, m_pick_color_view, nullptr);
+  if (m_pick_color_image) vkDestroyImage(m_device, m_pick_color_image, nullptr);
+  if (m_pick_color_memory) vkFreeMemory(m_device, m_pick_color_memory, nullptr);
+  if (m_pick_depth_view) vkDestroyImageView(m_device, m_pick_depth_view, nullptr);
+  if (m_pick_depth_image) vkDestroyImage(m_device, m_pick_depth_image, nullptr);
+  if (m_pick_depth_memory) vkFreeMemory(m_device, m_pick_depth_memory, nullptr);
+  m_pick_color_view = VK_NULL_HANDLE;
+  m_pick_color_image = VK_NULL_HANDLE;
+  m_pick_color_memory = VK_NULL_HANDLE;
+  m_pick_depth_view = VK_NULL_HANDLE;
+  m_pick_depth_image = VK_NULL_HANDLE;
+  m_pick_depth_memory = VK_NULL_HANDLE;
+}
+
+void vulkan_renderer::pick_submodel(TSubModel *sm, const glm::mat4 &parent,
+                                    const glm::mat4 &rot, const glm::mat4 &proj,
+                                    VkCommandBuffer cmd, uint32_t &index) {
+  if (sm == nullptr) return;
+  if (sm->iVisible && TSubModel::fSquareDist >= sm->fSquareMinDist &&
+      TSubModel::fSquareDist < sm->fSquareMaxDist) {
+    glm::mat4 local = parent;
+    if (sm->iFlags & 0xC000) {
+      if (sm->fMatrix != nullptr)
+        local = parent * glm::make_mat4(sm->fMatrix->readArray());
+      if (sm->b_aAnim != TAnimType::at_None) sm->RaAnimation(local, sm->b_aAnim);
+    }
+    if (sm->eType < TP_ROTATOR) {
+      ++index;
+      m_pick_submodels.push_back(sm);
+      struct {
+        glm::mat4 mvp;
+        glm::vec4 color;
+      } pc;
+      pc.mvp = proj * rot * local;
+      pc.color = glm::vec4(((index >> 16) & 0xff) / 255.f,
+                           ((index >> 8) & 0xff) / 255.f,
+                           (index & 0xff) / 255.f, 1.f);
+      vkCmdPushConstants(cmd, m_pick_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                         sizeof(pc), &pc);
+      m_geometry.draw(sm->m_geometry.handle);
+    }
+    if (sm->Child != nullptr)
+      pick_submodel(sm->Child, local, rot, proj, cmd, index);
+  }
+  if (sm->Next != nullptr) pick_submodel(sm->Next, parent, rot, proj, cmd, index);
+}
+
+void vulkan_renderer::Update_Pick_Control() {
+  if (m_pick_callbacks.empty()) return;  // pick only when something requested it
+  if (m_swapchain == VK_NULL_HANDLE || m_pick_color_image == VK_NULL_HANDLE ||
+      simulation::Train == nullptr) {
+    m_pick_callbacks.clear();
+    return;
+  }
+  TDynamicObject *player = simulation::Train->Dynamic();
+  if (player == nullptr || player->mdKabina == nullptr ||
+      player->mdKabina->Root == nullptr) {
+    m_pick_callbacks.clear();
+    return;
+  }
+
+  m_pick_submodels.clear();
+
+  VkCommandBufferAllocateInfo cbai{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = m_command_pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(m_device, &cbai, &cmd);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bi);
+
+  auto barrier = [&](VkImage img, VkImageAspectFlags aspect, VkImageLayout from,
+                     VkImageLayout to, VkAccessFlags src, VkAccessFlags dst,
+                     VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = src;
+    b.dstAccessMask = dst;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+  };
+
+  barrier(m_pick_color_image, VK_IMAGE_ASPECT_COLOR_BIT,
+          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
+          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+  barrier(m_pick_depth_image, VK_IMAGE_ASPECT_DEPTH_BIT,
+          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0,
+          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+
+  VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  color.imageView = m_pick_color_view;
+  color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  color.clearValue.color = {{0.f, 0.f, 0.f, 0.f}};
+  VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  depth.imageView = m_pick_depth_view;
+  depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.clearValue.depthStencil = {1.0f, 0};
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea.extent = m_swapchain_extent;
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &color;
+  ri.pDepthAttachment = &depth;
+  vkCmdBeginRendering(cmd, &ri);
+
+  VkViewport vp{0.f,
+                0.f,
+                static_cast<float>(m_swapchain_extent.width),
+                static_cast<float>(m_swapchain_extent.height),
+                0.f,
+                1.f};
+  vkCmdSetViewport(cmd, 0, 1, &vp);
+  VkRect2D sc{{0, 0}, m_swapchain_extent};
+  vkCmdSetScissor(cmd, 0, 1, &sc);
+
+  glm::dmat4 view_d(1.0);
+  Global.pCamera.SetMatrix(view_d);
+  const glm::mat4 rot = glm::mat4(glm::mat3(view_d));
+  glm::mat4 proj = glm::perspectiveFovRH_ZO(
+      glm::radians(static_cast<float>(Global.FieldOfView)),
+      static_cast<float>(m_swapchain_extent.width),
+      static_cast<float>(m_swapchain_extent.height), 0.1f, 5000.f);
+  proj[1][1] *= -1.f;
+  const glm::mat4 vm =
+      glm::translate(glm::mat4(1.f), glm::vec3(player->vPosition - Global.pCamera.Pos)) *
+      glm::mat4(player->mMatrix);
+
+  m_geo_ctx.current_cmd = cmd;
+  m_geo_ctx.pick_mode = true;
+  TSubModel::fSquareDist = 0.f;
+  uint32_t index = 0;
+  pick_submodel(player->mdKabina->Root, vm, rot, proj, cmd, index);
+  m_geo_ctx.pick_mode = false;
+  m_geo_ctx.current_cmd = VK_NULL_HANDLE;
+
+  vkCmdEndRendering(cmd);
+
+  barrier(m_pick_color_image, VK_IMAGE_ASPECT_COLOR_BIT,
+          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+  glm::ivec2 cursor = glm::ivec2(Global.cursor_pos);
+  cursor = glm::clamp(
+      cursor, glm::ivec2(0),
+      glm::ivec2(static_cast<int>(m_swapchain_extent.width) - 1,
+                 static_cast<int>(m_swapchain_extent.height) - 1));
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {cursor.x, cursor.y, 0};
+  region.imageExtent = {1, 1, 1};
+  vkCmdCopyImageToBuffer(cmd, m_pick_color_image,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_pick_readback,
+                         1, &region);
+
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(m_graphics_queue, 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(m_graphics_queue);
+  vkFreeCommandBuffers(m_device, m_command_pool, 1, &cmd);
+
+  uint8_t px[4] = {0, 0, 0, 0};
+  void *mapped = nullptr;
+  vkMapMemory(m_device, m_pick_readback_memory, 0, 4, 0, &mapped);
+  std::memcpy(px, mapped, 4);
+  vkUnmapMemory(m_device, m_pick_readback_memory);
+
+  const uint32_t picked = px[2] + (px[1] * 256u) + (px[0] * 256u * 256u);
+  m_pick_control = (picked > 0 && picked <= m_pick_submodels.size())
+                       ? m_pick_submodels[picked - 1]
+                       : nullptr;
+
+  for (auto &cb : m_pick_callbacks) cb(m_pick_control, glm::vec2(0.f));
+  m_pick_callbacks.clear();
+}
+
 void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &rot,
                                       const glm::mat4 &proj,
@@ -1413,11 +1825,12 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
   if (sm->iVisible && TSubModel::fSquareDist >= sm->fSquareMinDist &&
       TSubModel::fSquareDist < sm->fSquareMaxDist) {
     glm::mat4 local = parent;
-    if ((sm->iFlags & 0xC000) && sm->fMatrix != nullptr) {
-      local = parent * glm::make_mat4(sm->fMatrix->readArray());
+    if (sm->iFlags & 0xC000) {
+      if (sm->fMatrix != nullptr)
+        local = parent * glm::make_mat4(sm->fMatrix->readArray());
+      // Submodel animation (gauges, levers, switches, wheels, clocks...).
+      if (sm->b_aAnim != TAnimType::at_None) sm->RaAnimation(local, sm->b_aAnim);
     }
-    // Mesh submodels (eType < TP_ROTATOR) carry drawable geometry. Animations
-    // and alpha sorting are ignored for now.
     if (sm->eType < TP_ROTATOR) {
       const glm::mat4 mvp = proj * rot * local;
       vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
@@ -1440,6 +1853,9 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
 }
 
 bool vulkan_renderer::Render() {
+  // Resolve any queued control-pick request (on mouse click) before the frame.
+  Update_Pick_Control();
+
   // The application opened an ImGui frame in begin_ui_frame(); the engine
   // relies on the renderer driving render_ui() (which calls ImGui::Render())
   // exactly once per frame, or the next ImGui::NewFrame() asserts. On the
@@ -1619,6 +2035,7 @@ bool vulkan_renderer::Render() {
       model = glm::rotate(model, glm::radians(ang.x), glm::vec3(1, 0, 0));
     if (ang.z != 0.f)
       model = glm::rotate(model, glm::radians(ang.z), glm::vec3(0, 0, 1));
+    TSubModel::iInstance = reinterpret_cast<std::uintptr_t>(inst);
     TSubModel::fSquareDist = static_cast<float>(
         glm::length2(glm::vec3(pos)) / static_cast<double>(Global.ZoomFactor));
     const material_data *md = inst->Material();
@@ -1702,6 +2119,7 @@ bool vulkan_renderer::Render() {
   auto render_vehicle = [&](TDynamicObject *veh, bool with_cab) {
     if (veh == nullptr) return;
     veh->ABuLittleUpdate(0.0);
+    TSubModel::iInstance = reinterpret_cast<std::uintptr_t>(veh);
     TSubModel::fSquareDist = static_cast<float>(
         glm::length2(glm::vec3(veh->vPosition - campos)) /
         static_cast<double>(Global.ZoomFactor));

@@ -38,6 +38,10 @@ struct vulkan_geometry_context {
   // the renderer's pipeline layout, so the pushed MVP stays valid).
   VkPipeline pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline pipeline_strips = VK_NULL_HANDLE;
+  // Pick pipelines (flat ID colour), bound instead when pick_mode is set.
+  VkPipeline pick_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline pick_pipeline_strips = VK_NULL_HANDLE;
+  bool pick_mode = false;
 };
 
 // GPU-backed geometry bank: uploads each chunk's basic_vertex/index data to
@@ -204,16 +208,18 @@ class vulkan_renderer : public gfx_renderer {
   // --- picking / camera ---------------------------------------------------
   void Pick_Control_Callback(
       std::function<void(TSubModel const *, const glm::vec2)> Callback)
-      override {}
+      override {
+    m_pick_callbacks.push_back(std::move(Callback));
+  }
   void Pick_Node_Callback(
       std::function<void(scene::basic_node *)> Callback) override {}
-  TSubModel const *Pick_Control() const override { return nullptr; }
+  TSubModel const *Pick_Control() const override { return m_pick_control; }
   scene::basic_node const *Pick_Node() const override { return nullptr; }
   glm::dvec3 Mouse_Position() const override { return glm::dvec3(); }
 
   // --- maintenance --------------------------------------------------------
   void Update(double const Deltatime) override;
-  void Update_Pick_Control() override {}
+  void Update_Pick_Control() override;
   void Update_Pick_Node() override {}
   glm::dvec3 Update_Mouse_Position() override { return glm::dvec3(); }
   bool Debug_Ui_State(std::optional<bool>) override { return false; }
@@ -238,6 +244,12 @@ class vulkan_renderer : public gfx_renderer {
   bool create_command_pool();
   bool create_default_texture();
   bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  bool create_pick_resources();
+  void destroy_pick_resources();
+  void pick_submodel(TSubModel *sm, const glm::mat4 &parent,
+                     const glm::mat4 &rot, const glm::mat4 &proj,
+                     VkCommandBuffer cmd, uint32_t &index);
   bool create_test_geometry();
   // Recursively draw a model's submodel tree (camera-relative). parent is the
   // accumulated model matrix; rot/proj are the camera rotation and projection;
@@ -296,6 +308,26 @@ class vulkan_renderer : public gfx_renderer {
   VkDeviceMemory m_white_memory = VK_NULL_HANDLE;
   VkImageView m_white_view = VK_NULL_HANDLE;
   VkDescriptorSet m_white_descriptor = VK_NULL_HANDLE;
+
+  // Control picking: an offscreen ID target (recreated with the swap chain),
+  // pick pipelines (flat colour), a 1-pixel readback buffer, the queued
+  // pick callbacks, the last picked control, and the per-pick submodel table.
+  VkPipelineLayout m_pick_layout = VK_NULL_HANDLE;
+  VkPipeline m_pick_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline m_pick_pipeline_strips = VK_NULL_HANDLE;
+  VkFormat m_pick_format = VK_FORMAT_R8G8B8A8_UNORM;
+  VkImage m_pick_color_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_pick_color_memory = VK_NULL_HANDLE;
+  VkImageView m_pick_color_view = VK_NULL_HANDLE;
+  VkImage m_pick_depth_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_pick_depth_memory = VK_NULL_HANDLE;
+  VkImageView m_pick_depth_view = VK_NULL_HANDLE;
+  VkBuffer m_pick_readback = VK_NULL_HANDLE;
+  VkDeviceMemory m_pick_readback_memory = VK_NULL_HANDLE;
+  std::vector<std::function<void(TSubModel const *, const glm::vec2)>>
+      m_pick_callbacks;
+  TSubModel const *m_pick_control = nullptr;
+  std::vector<TSubModel const *> m_pick_submodels;
 
   // Shared state handed to every geometry bank (device + per-frame cmd buffer).
   vulkan_geometry_context m_geo_ctx;
