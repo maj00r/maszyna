@@ -142,11 +142,23 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_swapchain()) return false;
   if (!create_command_pool()) return false;
   if (!create_default_texture()) return false;  // also creates the set layout
-  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true,
                              m_pipeline_triangles))
     return false;
-  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, true,
                              m_pipeline_strips))
+    return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, true,
+                             m_pipeline_fans))
+    return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false,
+                             m_pipeline_triangles_blend))
+    return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, false,
+                             m_pipeline_strips_blend))
+    return false;
+  if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, false,
+                             m_pipeline_fans_blend))
     return false;
   if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                             m_pick_pipeline_triangles))
@@ -154,12 +166,20 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
                             m_pick_pipeline_strips))
     return false;
+  if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+                            m_pick_pipeline_fans))
+    return false;
   m_geo_ctx.physical_device = m_physical_device;
   m_geo_ctx.device = m_device;
   m_geo_ctx.pipeline_triangles = m_pipeline_triangles;
   m_geo_ctx.pipeline_strips = m_pipeline_strips;
+  m_geo_ctx.pipeline_fans = m_pipeline_fans;
+  m_geo_ctx.translucent_triangles = m_pipeline_triangles_blend;
+  m_geo_ctx.translucent_strips = m_pipeline_strips_blend;
+  m_geo_ctx.translucent_fans = m_pipeline_fans_blend;
   m_geo_ctx.pick_pipeline_triangles = m_pick_pipeline_triangles;
   m_geo_ctx.pick_pipeline_strips = m_pick_pipeline_strips;
+  m_geo_ctx.pick_pipeline_fans = m_pick_pipeline_fans;
   {
     // 1-pixel readback buffer for control picking.
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -221,6 +241,22 @@ void vulkan_renderer::Shutdown() {
       vkDestroyPipeline(m_device, m_pipeline_strips, nullptr);
       m_pipeline_strips = VK_NULL_HANDLE;
     }
+    if (m_pipeline_triangles_blend) {
+      vkDestroyPipeline(m_device, m_pipeline_triangles_blend, nullptr);
+      m_pipeline_triangles_blend = VK_NULL_HANDLE;
+    }
+    if (m_pipeline_strips_blend) {
+      vkDestroyPipeline(m_device, m_pipeline_strips_blend, nullptr);
+      m_pipeline_strips_blend = VK_NULL_HANDLE;
+    }
+    if (m_pipeline_fans) {
+      vkDestroyPipeline(m_device, m_pipeline_fans, nullptr);
+      m_pipeline_fans = VK_NULL_HANDLE;
+    }
+    if (m_pipeline_fans_blend) {
+      vkDestroyPipeline(m_device, m_pipeline_fans_blend, nullptr);
+      m_pipeline_fans_blend = VK_NULL_HANDLE;
+    }
     if (m_pipeline_layout) {
       vkDestroyPipelineLayout(m_device, m_pipeline_layout, nullptr);
       m_pipeline_layout = VK_NULL_HANDLE;
@@ -229,6 +265,8 @@ void vulkan_renderer::Shutdown() {
       vkDestroyPipeline(m_device, m_pick_pipeline_triangles, nullptr);
     if (m_pick_pipeline_strips)
       vkDestroyPipeline(m_device, m_pick_pipeline_strips, nullptr);
+    if (m_pick_pipeline_fans)
+      vkDestroyPipeline(m_device, m_pick_pipeline_fans, nullptr);
     if (m_pick_layout)
       vkDestroyPipelineLayout(m_device, m_pick_layout, nullptr);
     if (m_pick_readback) vkDestroyBuffer(m_device, m_pick_readback, nullptr);
@@ -236,6 +274,7 @@ void vulkan_renderer::Shutdown() {
       vkFreeMemory(m_device, m_pick_readback_memory, nullptr);
     m_pick_pipeline_triangles = VK_NULL_HANDLE;
     m_pick_pipeline_strips = VK_NULL_HANDLE;
+    m_pick_pipeline_fans = VK_NULL_HANDLE;
     m_pick_layout = VK_NULL_HANDLE;
     m_pick_readback = VK_NULL_HANDLE;
     m_pick_readback_memory = VK_NULL_HANDLE;
@@ -625,7 +664,7 @@ VkShaderModule vulkan_renderer::create_shader_module(const uint32_t *code,
 }
 
 bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
-                                            VkPipeline &out) {
+                                            bool depth_write, VkPipeline &out) {
   VkShaderModule vert =
       create_shader_module(world_vert_spv, sizeof(world_vert_spv));
   VkShaderModule frag =
@@ -710,7 +749,7 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   VkPipelineDepthStencilStateCreateInfo depth_stencil{
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
   depth_stencil.depthTestEnable = VK_TRUE;
-  depth_stencil.depthWriteEnable = VK_TRUE;
+  depth_stencil.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
   depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
   // Vertex push constant: mat4 MVP (offset 0) + directional sun
@@ -947,11 +986,17 @@ std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
   // other types are skipped for now). In pick mode use the ID-colour pipelines.
   VkPipeline pipe = VK_NULL_HANDLE;
   if (g.type == GL_TRIANGLES) {
-    pipe = m_ctx->pick_mode ? m_ctx->pick_pipeline_triangles
-                            : m_ctx->pipeline_triangles;
+    pipe = m_ctx->pick_mode          ? m_ctx->pick_pipeline_triangles
+           : m_ctx->translucent_mode ? m_ctx->translucent_triangles
+                                     : m_ctx->pipeline_triangles;
   } else if (g.type == GL_TRIANGLE_STRIP) {
-    pipe = m_ctx->pick_mode ? m_ctx->pick_pipeline_strips
-                            : m_ctx->pipeline_strips;
+    pipe = m_ctx->pick_mode          ? m_ctx->pick_pipeline_strips
+           : m_ctx->translucent_mode ? m_ctx->translucent_strips
+                                     : m_ctx->pipeline_strips;
+  } else if (g.type == GL_TRIANGLE_FAN) {
+    pipe = m_ctx->pick_mode          ? m_ctx->pick_pipeline_fans
+           : m_ctx->translucent_mode ? m_ctx->translucent_fans
+                                     : m_ctx->pipeline_fans;
   }
   if (pipe == VK_NULL_HANDLE) return 0;
   vkCmdBindPipeline(m_ctx->current_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1426,12 +1471,14 @@ void vulkan_renderer::bind_material(material_handle material,
                           m_pipeline_layout, 0, 1, &d, 0, nullptr);
   // Opacity: <1 only for materials flagged translucent (glass), so opaque
   // materials are unaffected.
-  float opacity = 1.f;
-  if (material != null_handle) {
-    const opengl_material &mat = m_material_manager.material(material);
-    if (mat.is_translucent()) opacity = mat.get_or_guess_opacity();
-  }
-  const glm::vec4 misc(opacity, 0.f, 0.f, 0.f);
+  // uMisc.x carries the material's alpha-test threshold (MaSzyna 'opacity':
+  // texels with alpha below it are discarded). get_or_guess_opacity() returns
+  // 0 for alpha-blended atlases, ~0.5 for alpha-cutout, and is irrelevant for
+  // fully opaque textures (sampled alpha is 1). It is NOT a coverage multiplier.
+  float alpha_ref = 0.f;
+  if (material != null_handle)
+    alpha_ref = m_material_manager.material(material).get_or_guess_opacity();
+  const glm::vec4 misc(alpha_ref, 0.f, 0.f, 0.f);
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                      sizeof(float) * 28, sizeof(misc), &misc);
 }
@@ -1644,7 +1691,8 @@ void vulkan_renderer::pick_submodel(TSubModel *sm, const glm::mat4 &parent,
     if (sm->iFlags & 0xC000) {
       if (sm->fMatrix != nullptr)
         local = parent * glm::make_mat4(sm->fMatrix->readArray());
-      if (sm->b_aAnim != TAnimType::at_None) sm->RaAnimation(local, sm->b_aAnim);
+      if (m_submodel_animations && sm->b_aAnim != TAnimType::at_None)
+        sm->RaAnimation(local, sm->b_aAnim);
     }
     if (sm->eType < TP_ROTATOR) {
       ++index;
@@ -1819,6 +1867,7 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &rot,
                                       const glm::mat4 &proj,
                                       const material_handle *skins,
+                                      bool translucent_pass,
                                       VkCommandBuffer cmd) {
   if (sm == nullptr) return;
 
@@ -1829,12 +1878,13 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
       if (sm->fMatrix != nullptr)
         local = parent * glm::make_mat4(sm->fMatrix->readArray());
       // Submodel animation (gauges, levers, switches, wheels, clocks...).
-      if (sm->b_aAnim != TAnimType::at_None) sm->RaAnimation(local, sm->b_aAnim);
+      if (m_submodel_animations && sm->b_aAnim != TAnimType::at_None)
+        sm->RaAnimation(local, sm->b_aAnim);
     }
-    if (sm->eType < TP_ROTATOR) {
-      const glm::mat4 mvp = proj * rot * local;
-      vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                         sizeof(mvp), &mvp);
+    // Skip the legacy fake ground-shadow decal ("cien"): an opaque-ish dark
+    // quad on the railhead that would cover the track. Real shadows are a
+    // future shadow-mapping pass.
+    if (sm->eType < TP_ROTATOR && sm->pName != "cien") {
       // m_material: >0 direct handle, 0 none, <0 replacable skin index.
       material_handle mh = null_handle;
       if (sm->m_material > 0) {
@@ -1842,14 +1892,24 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
       } else if (sm->m_material < 0 && skins != nullptr) {
         mh = skins[-sm->m_material];
       }
-      bind_material(mh, cmd);
-      m_geometry.draw(sm->m_geometry.handle);
+      // Draw in the matching pass only: translucent materials in the
+      // translucent (depth-write off) pass, the rest in the opaque pass.
+      const bool translucent =
+          m_two_pass_translucency && (mh != null_handle) &&
+          m_material_manager.material(mh).is_translucent();
+      if (translucent == translucent_pass) {
+        const glm::mat4 mvp = proj * rot * local;
+        vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(mvp), &mvp);
+        bind_material(mh, cmd);
+        m_geometry.draw(sm->m_geometry.handle);
+      }
     }
     if (sm->Child != nullptr)
-      render_submodel(sm->Child, local, rot, proj, skins, cmd);
+      render_submodel(sm->Child, local, rot, proj, skins, translucent_pass, cmd);
   }
   if (sm->Next != nullptr)
-    render_submodel(sm->Next, parent, rot, proj, skins, cmd);
+    render_submodel(sm->Next, parent, rot, proj, skins, translucent_pass, cmd);
 }
 
 bool vulkan_renderer::Render() {
@@ -2007,6 +2067,12 @@ bool vulkan_renderer::Render() {
   vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
                      VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
                      sizeof(light), &light);
+  // Initialise the alpha-test threshold (uMisc.x) so draws before the first
+  // bind_material() never read an undefined push-constant value.
+  const glm::vec4 misc_default(0.f);
+  vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 28,
+                     sizeof(misc_default), &misc_default);
 
   auto push_group_mvp = [&](glm::dvec3 const &center) {
     const glm::mat4 model =
@@ -2022,7 +2088,7 @@ bool vulkan_renderer::Render() {
 
   // Render one placed scenery model (TAnimModel): translate by its world
   // position relative to the camera, then apply its Y/X/Z rotation (degrees).
-  auto render_instance = [&](TAnimModel *inst) {
+  auto render_instance = [&](TAnimModel *inst, bool translucent_pass) {
     if (inst == nullptr || inst->pModel == nullptr ||
         inst->pModel->Root == nullptr)
       return;
@@ -2036,93 +2102,23 @@ bool vulkan_renderer::Render() {
     if (ang.z != 0.f)
       model = glm::rotate(model, glm::radians(ang.z), glm::vec3(0, 0, 1));
     TSubModel::iInstance = reinterpret_cast<std::uintptr_t>(inst);
-    TSubModel::fSquareDist = static_cast<float>(
-        glm::length2(glm::vec3(pos)) / static_cast<double>(Global.ZoomFactor));
+    TSubModel::fSquareDist =
+        glm::length2(glm::vec3(pos) / static_cast<float>(Global.ZoomFactor));
     const material_data *md = inst->Material();
     const material_handle *skins =
         (md != nullptr) ? md->replacable_skins : nullptr;
     render_submodel(inst->pModel->Root, model, rot, proj, skins,
-                    frame.command_buffer);
+                    translucent_pass, frame.command_buffer);
   };
-
-  // Building track geometry needs the default rail profiles loaded; ensure
-  // they exist (idempotent) before any create_geometry() touches them.
-  TTrack::fetch_default_profiles();
-
-  // Walk the region sections around the camera and draw their opaque scenery.
-  // No frustum culling yet; a fixed range keeps the section count bounded.
-  if (scene::basic_region *region = simulation::Region) {
-    const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
-    const int half =
-        static_cast<int>(std::ceil(2000.0 / scene::EU07_SECTIONSIZE));
-    const int cx = static_cast<int>(
-        std::floor(campos.x / scene::EU07_SECTIONSIZE + side / 2));
-    const int cz = static_cast<int>(
-        std::floor(campos.z / scene::EU07_SECTIONSIZE + side / 2));
-    for (int z = cz - half; z <= cz + half; ++z) {
-      if (z < 0 || z >= side) continue;
-      for (int x = cx - half; x <= cx + half; ++x) {
-        if (x < 0 || x >= side) continue;
-        scene::basic_section *section =
-            region->get_section(static_cast<size_t>(z) * side + x);
-        if (section == nullptr) continue;
-        section->create_geometry();
-
-        if (!section->m_shapes.empty()) {
-          push_group_mvp(section->m_area.center);
-          for (auto const &shape : section->m_shapes) {
-            VkDescriptorSet d =
-                material_texture_descriptor(shape.data().material);
-            vkCmdBindDescriptorSets(frame.command_buffer,
-                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    m_pipeline_layout, 0, 1, &d, 0, nullptr);
-            m_geometry.draw(shape.data().geometry);
-          }
-        }
-        for (auto &cell : section->m_cells) {
-          if (!cell.m_active) continue;
-          // Shapes and tracks are stored relative to the cell centre.
-          push_group_mvp(cell.m_area.center);
-          for (auto const &shape : cell.m_shapesopaque) {
-            bind_mat(shape.data().material);
-            m_geometry.draw(shape.data().geometry);
-          }
-          // Tracks/roads: material1 -> rails, material2 -> trackbed/verge.
-          for (auto *track : cell.m_paths) {
-            if (track == nullptr || !track->m_visible) continue;
-            if (track->m_material1 != null_handle) {
-              bind_mat(track->m_material1);
-              for (auto const &g : track->Geometry1) m_geometry.draw(g);
-            }
-            if (track->m_material2 != null_handle) {
-              bind_mat(track->m_material2);
-              for (auto const &g : track->Geometry2) m_geometry.draw(g);
-            }
-            if (track->SwitchExtension &&
-                track->SwitchExtension->m_material3 != null_handle) {
-              bind_mat(track->SwitchExtension->m_material3);
-              m_geometry.draw(track->SwitchExtension->Geometry3);
-            }
-          }
-          // Placed scenery models (semaphores, poles, crossings, signs...).
-          for (auto const &bucket : cell.m_instancebuckets_opaque) {
-            for (auto *inst : bucket.second) render_instance(inst);
-          }
-          for (auto *inst : cell.m_instancesopaque) render_instance(inst);
-        }
-      }
-    }
-  }
 
   // Render a whole vehicle: body + low-poly interior + load (+ cab for the
   // occupied one). Models are in vehicle-local space placed by mMatrix.
-  auto render_vehicle = [&](TDynamicObject *veh, bool with_cab) {
+  auto render_vehicle = [&](TDynamicObject *veh, bool with_cab,
+                            bool translucent_pass) {
     if (veh == nullptr) return;
-    veh->ABuLittleUpdate(0.0);
     TSubModel::iInstance = reinterpret_cast<std::uintptr_t>(veh);
-    TSubModel::fSquareDist = static_cast<float>(
-        glm::length2(glm::vec3(veh->vPosition - campos)) /
-        static_cast<double>(Global.ZoomFactor));
+    TSubModel::fSquareDist = glm::length2(glm::vec3(veh->vPosition - campos) /
+                                          static_cast<float>(Global.ZoomFactor));
     const glm::mat4 vm =
         glm::translate(glm::mat4(1.f), glm::vec3(veh->vPosition - campos)) *
         glm::mat4(veh->mMatrix);
@@ -2131,26 +2127,32 @@ bool vulkan_renderer::Render() {
         (md != nullptr) ? md->replacable_skins : nullptr;
     if (veh->mdLowPolyInt && veh->mdLowPolyInt->Root)
       render_submodel(veh->mdLowPolyInt->Root, vm, rot, proj, skins,
-                      frame.command_buffer);
+                      translucent_pass, frame.command_buffer);
     if (veh->mdModel && veh->mdModel->Root)
       render_submodel(veh->mdModel->Root, vm, rot, proj, skins,
-                      frame.command_buffer);
+                      translucent_pass, frame.command_buffer);
     if (veh->mdLoad && veh->mdLoad->Root) {
       const glm::mat4 lm =
           glm::translate(vm, glm::vec3(0.f, veh->LoadOffset, 0.f));
-      render_submodel(veh->mdLoad->Root, lm, rot, proj, skins,
+      render_submodel(veh->mdLoad->Root, lm, rot, proj, skins, translucent_pass,
                       frame.command_buffer);
     }
     if (with_cab && veh->mdKabina && veh->mdKabina->Root)
       render_submodel(veh->mdKabina->Root, vm, rot, proj, skins,
-                      frame.command_buffer);
+                      translucent_pass, frame.command_buffer);
   };
 
-  // Render the player's whole consist (walk the coupling chain both ways).
+  // Building track geometry needs the default rail profiles loaded; ensure
+  // they exist (idempotent) before any create_geometry() touches them.
+  TTrack::fetch_default_profiles();
+
+  // Gather the player's consist once (walk the coupling chain both ways);
+  // both passes draw the same set.
+  std::set<TDynamicObject *> consist;
+  TDynamicObject *player = nullptr;
   if (simulation::Train != nullptr) {
-    TDynamicObject *player = simulation::Train->Dynamic();
+    player = simulation::Train->Dynamic();
     if (player != nullptr) {
-      std::set<TDynamicObject *> consist;
       consist.insert(player);
       for (TDynamicObject *v = player->NextConnected();
            v != nullptr && consist.insert(v).second; v = v->NextConnected()) {
@@ -2158,9 +2160,98 @@ bool vulkan_renderer::Render() {
       for (TDynamicObject *v = player->PrevConnected();
            v != nullptr && consist.insert(v).second; v = v->PrevConnected()) {
       }
-      for (TDynamicObject *v : consist) render_vehicle(v, v == player);
     }
   }
+  // Advance per-vehicle submodel animation exactly once per frame (bogie
+  // swivel, wheel spin...); mAnimMatrix is consume-on-read, so calling this
+  // once per pass would corrupt the second pass.
+  for (TDynamicObject *v : consist)
+    if (v != nullptr) v->ABuLittleUpdate(0.0);
+
+  // Draw the whole world for one pass. Opaque pass writes depth; the
+  // translucent pass (depth-write off) runs afterwards so glass and decals are
+  // depth-tested against the opaque scene without occluding what is behind.
+  auto draw_world = [&](bool translucent_pass) {
+    m_geo_ctx.translucent_mode = translucent_pass;
+    // No frustum culling yet; a fixed range keeps the section count bounded.
+    if (scene::basic_region *region = simulation::Region) {
+      const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
+      const int half =
+          static_cast<int>(std::ceil(2000.0 / scene::EU07_SECTIONSIZE));
+      const int cx = static_cast<int>(
+          std::floor(campos.x / scene::EU07_SECTIONSIZE + side / 2));
+      const int cz = static_cast<int>(
+          std::floor(campos.z / scene::EU07_SECTIONSIZE + side / 2));
+      for (int z = cz - half; z <= cz + half; ++z) {
+        if (z < 0 || z >= side) continue;
+        for (int x = cx - half; x <= cx + half; ++x) {
+          if (x < 0 || x >= side) continue;
+          scene::basic_section *section =
+              region->get_section(static_cast<size_t>(z) * side + x);
+          if (section == nullptr) continue;
+          section->create_geometry();
+
+          // Section-level shapes (incl. terrain) are opaque-only. bind_mat
+          // pushes the material's alpha-test threshold (uMisc.x) too; binding
+          // only the descriptor would leave a stale threshold.
+          if (!translucent_pass && !section->m_shapes.empty()) {
+            push_group_mvp(section->m_area.center);
+            for (auto const &shape : section->m_shapes) {
+              bind_mat(shape.data().material);
+              m_geometry.draw(shape.data().geometry);
+            }
+          }
+          for (auto &cell : section->m_cells) {
+            if (!cell.m_active) continue;
+            // Shapes/tracks are stored relative to the cell centre.
+            push_group_mvp(cell.m_area.center);
+            if (!translucent_pass) {
+              for (auto const &shape : cell.m_shapesopaque) {
+                bind_mat(shape.data().material);
+                m_geometry.draw(shape.data().geometry);
+              }
+              // Tracks/roads: material1 -> rails, material2 -> trackbed/verge.
+              for (auto *track : cell.m_paths) {
+                if (track == nullptr || !track->m_visible) continue;
+                if (track->m_material1 != null_handle) {
+                  bind_mat(track->m_material1);
+                  for (auto const &g : track->Geometry1) m_geometry.draw(g);
+                }
+                if (track->m_material2 != null_handle) {
+                  bind_mat(track->m_material2);
+                  for (auto const &g : track->Geometry2) m_geometry.draw(g);
+                }
+                if (track->SwitchExtension &&
+                    track->SwitchExtension->m_material3 != null_handle) {
+                  bind_mat(track->SwitchExtension->m_material3);
+                  m_geometry.draw(track->SwitchExtension->Geometry3);
+                }
+              }
+              // Placed scenery (semaphores, poles, crossings, signs...).
+              for (auto const &bucket : cell.m_instancebuckets_opaque) {
+                for (auto *inst : bucket.second) render_instance(inst, false);
+              }
+              for (auto *inst : cell.m_instancesopaque)
+                render_instance(inst, false);
+            } else {
+              for (auto const &shape : cell.m_shapestranslucent) {
+                bind_mat(shape.data().material);
+                m_geometry.draw(shape.data().geometry);
+              }
+              for (auto *inst : cell.m_instancetranslucent)
+                render_instance(inst, true);
+            }
+          }
+        }
+      }
+    }
+    for (TDynamicObject *v : consist)
+      render_vehicle(v, v == player, translucent_pass);
+  };
+
+  draw_world(false);  // opaque (and, when single-pass, everything)
+  if (m_two_pass_translucency) draw_world(true);  // depth-write-off translucent
+  m_geo_ctx.translucent_mode = false;
 
   m_geo_ctx.current_cmd = VK_NULL_HANDLE;
 

@@ -10,10 +10,10 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
   vec4 tex = texture(uTexture, vUV);
-  float a = tex.a * vOpacity;  // material opacity (1 for opaque materials)
-  // Drop only fully-transparent texels; the rest is alpha-blended by the
-  // pipeline so glass is see-through and dark shadow decals darken the ground
-  // instead of showing as black.
-  if (a < 0.04) discard;
-  outColor = vec4(tex.rgb * vLight, a);
+  // vOpacity is the material's alpha-test threshold (0 for blended atlases,
+  // ~0.5 for cutout). Drop texels below it (with a tiny floor so fully
+  // transparent texels never show), then keep the texture's own alpha so the
+  // pipeline alpha-blends glass while opaque surfaces (alpha 1) stay solid.
+  if (tex.a < max(vOpacity, 0.04)) discard;
+  outColor = vec4(tex.rgb * vLight, tex.a);
 }

@@ -38,10 +38,17 @@ struct vulkan_geometry_context {
   // the renderer's pipeline layout, so the pushed MVP stays valid).
   VkPipeline pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline pipeline_fans = VK_NULL_HANDLE;
+  // Translucent variants (depth-write off), bound when translucent_mode set.
+  VkPipeline translucent_triangles = VK_NULL_HANDLE;
+  VkPipeline translucent_strips = VK_NULL_HANDLE;
+  VkPipeline translucent_fans = VK_NULL_HANDLE;
   // Pick pipelines (flat ID colour), bound instead when pick_mode is set.
   VkPipeline pick_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline pick_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline pick_pipeline_fans = VK_NULL_HANDLE;
   bool pick_mode = false;
+  bool translucent_mode = false;
 };
 
 // GPU-backed geometry bank: uploads each chunk's basic_vertex/index data to
@@ -243,7 +250,8 @@ class vulkan_renderer : public gfx_renderer {
   void destroy_depth_resources();
   bool create_command_pool();
   bool create_default_texture();
-  bool create_world_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  bool create_world_pipeline(VkPrimitiveTopology topology, bool depth_write,
+                             VkPipeline &out);
   bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_pick_resources();
   void destroy_pick_resources();
@@ -257,7 +265,8 @@ class vulkan_renderer : public gfx_renderer {
   // submodels with m_material < 0.
   void render_submodel(TSubModel *sm, const glm::mat4 &parent,
                        const glm::mat4 &rot, const glm::mat4 &proj,
-                       const material_handle *skins, VkCommandBuffer cmd);
+                       const material_handle *skins, bool translucent_pass,
+                       VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -297,6 +306,16 @@ class vulkan_renderer : public gfx_renderer {
   VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
   VkPipeline m_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline m_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_fans = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_triangles_blend = VK_NULL_HANDLE;  // depth-write off
+  VkPipeline m_pipeline_strips_blend = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_fans_blend = VK_NULL_HANDLE;
+  // When false, the whole scene draws in a single opaque pass (the known-good
+  // path). When true, opaque first then a separate depth-write-off translucent
+  // pass for ordered transparency.
+  bool m_two_pass_translucency = false;
+  // Submodel animation (RaAnimation): gauges, levers, wheels, pantograph...
+  bool m_submodel_animations = true;
 
   // Texturing: a shared sampler + descriptor set layout (set 0 = combined
   // image sampler) and a default 1x1 white texture bound when a draw has no
@@ -315,6 +334,7 @@ class vulkan_renderer : public gfx_renderer {
   VkPipelineLayout m_pick_layout = VK_NULL_HANDLE;
   VkPipeline m_pick_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline m_pick_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline m_pick_pipeline_fans = VK_NULL_HANDLE;
   VkFormat m_pick_format = VK_FORMAT_R8G8B8A8_UNORM;
   VkImage m_pick_color_image = VK_NULL_HANDLE;
   VkDeviceMemory m_pick_color_memory = VK_NULL_HANDLE;
