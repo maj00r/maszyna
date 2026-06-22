@@ -14,12 +14,13 @@ layout(push_constant) uniform PushConstants {
   vec4 uSunDir;     // offset 64 (xyz: travel direction)
   vec4 uSunColor;   // offset 80
   vec4 uAmbient;    // offset 96
-  vec4 uMisc;       // offset 112 (.x: material opacity)
+  vec4 uMisc;       // offset 112 (.x: alpha-test threshold, .y: emission)
 } pc;
 
 layout(location = 0) out vec3 vLight;
 layout(location = 1) out vec2 vUV;
 layout(location = 2) out float vOpacity;
+layout(location = 3) out float vEmission;
 
 void main() {
   gl_Position = pc.uMVP * vec4(aPos, 1.0);
@@ -29,4 +30,5 @@ void main() {
   vec3 ambient = max(pc.uAmbient.rgb, vec3(0.2));  // floor to avoid black
   vLight = ambient + pc.uSunColor.rgb * ndl;
   vOpacity = pc.uMisc.x;
+  vEmission = pc.uMisc.y;
 }

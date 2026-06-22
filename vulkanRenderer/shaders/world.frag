@@ -3,6 +3,7 @@
 layout(location = 0) in vec3 vLight;
 layout(location = 1) in vec2 vUV;
 layout(location = 2) in float vOpacity;
+layout(location = 3) in float vEmission;
 
 layout(set = 0, binding = 0) uniform sampler2D uTexture;
 
@@ -15,5 +16,7 @@ void main() {
   // transparent texels never show), then keep the texture's own alpha so the
   // pipeline alpha-blends glass while opaque surfaces (alpha 1) stay solid.
   if (tex.a < max(vOpacity, 0.04)) discard;
-  outColor = vec4(tex.rgb * vLight, tex.a);
+  // vEmission (self-illumination) brightens the texture on top of the scene
+  // light so gauges/indicators glow when it is dark.
+  outColor = vec4(tex.rgb * (vLight + vEmission), tex.a);
 }

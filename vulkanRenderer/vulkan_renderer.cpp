@@ -2128,7 +2128,15 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
         const glm::mat4 mvp = proj * rot * local;
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(mvp), &mvp);
-        bind_material(mh, cmd);
+        bind_material(mh, cmd);  // pushes uMisc (.x threshold, .y emission = 0)
+        // Self-illumination: gauges/indicators/lit panels glow once the scene
+        // is dark enough (engine gate: f4Emision.a > 0 && fLuminance < fLight).
+        const float emission =
+            (sm->f4Emision.a > 0.f && Global.fLuminance < sm->fLight)
+                ? sm->f4Emision.a
+                : 0.f;
+        vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           sizeof(float) * 29, sizeof(float), &emission);
         m_geometry.draw(sm->m_geometry.handle);
       }
     }
