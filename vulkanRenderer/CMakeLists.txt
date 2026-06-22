@@ -38,6 +38,8 @@ embed_spirv_shader("shaders/imgui.vert" imgui_vert_spv)
 embed_spirv_shader("shaders/imgui.frag" imgui_frag_spv)
 embed_spirv_shader("shaders/pick.vert" pick_vert_spv)
 embed_spirv_shader("shaders/pick.frag" pick_frag_spv)
+embed_spirv_shader("shaders/skydome.vert" skydome_vert_spv)
+embed_spirv_shader("shaders/skydome.frag" skydome_frag_spv)
 
 add_custom_target(vulkanRenderer_shaders DEPENDS ${SHADER_HEADERS})
 

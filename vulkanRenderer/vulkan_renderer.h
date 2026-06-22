@@ -255,6 +255,11 @@ class vulkan_renderer : public gfx_renderer {
   bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_pick_resources();
   void destroy_pick_resources();
+  // Gradient skydome (vertex-coloured dome from simulation::Environment).
+  bool create_sky_pipeline();
+  void render_skydome(const glm::mat4 &proj, const glm::mat4 &rot,
+                      VkCommandBuffer cmd);
+  void destroy_sky();
   void pick_submodel(TSubModel *sm, const glm::mat4 &parent,
                      const glm::mat4 &rot, const glm::mat4 &proj,
                      VkCommandBuffer cmd, uint32_t &index);
@@ -310,10 +315,10 @@ class vulkan_renderer : public gfx_renderer {
   VkPipeline m_pipeline_triangles_blend = VK_NULL_HANDLE;  // depth-write off
   VkPipeline m_pipeline_strips_blend = VK_NULL_HANDLE;
   VkPipeline m_pipeline_fans_blend = VK_NULL_HANDLE;
-  // When false, the whole scene draws in a single opaque pass (the known-good
-  // path). When true, opaque first then a separate depth-write-off translucent
-  // pass for ordered transparency.
-  bool m_two_pass_translucency = false;
+  // When false, the whole scene draws in a single opaque pass. When true,
+  // opaque first then a separate depth-write-off translucent pass so glass and
+  // other translucent surfaces blend over what's behind without occluding it.
+  bool m_two_pass_translucency = true;
   // Submodel animation (RaAnimation): gauges, levers, wheels, pantograph...
   bool m_submodel_animations = true;
 
@@ -348,6 +353,20 @@ class vulkan_renderer : public gfx_renderer {
       m_pick_callbacks;
   TSubModel const *m_pick_control = nullptr;
   std::vector<TSubModel const *> m_pick_submodels;
+
+  // Gradient skydome: a flat-colour pipeline + position/colour/index buffers
+  // filled from simulation::Environment.skydome(). Colours are host-visible and
+  // re-uploaded when the simulation marks the dome dirty.
+  VkPipelineLayout m_sky_layout = VK_NULL_HANDLE;
+  VkPipeline m_sky_pipeline = VK_NULL_HANDLE;
+  VkBuffer m_sky_vertex = VK_NULL_HANDLE;
+  VkDeviceMemory m_sky_vertex_memory = VK_NULL_HANDLE;
+  VkBuffer m_sky_color = VK_NULL_HANDLE;
+  VkDeviceMemory m_sky_color_memory = VK_NULL_HANDLE;
+  VkBuffer m_sky_index = VK_NULL_HANDLE;
+  VkDeviceMemory m_sky_index_memory = VK_NULL_HANDLE;
+  uint32_t m_sky_index_count = 0;
+  bool m_sky_ready = false;
 
   // Shared state handed to every geometry bank (device + per-frame cmd buffer).
   vulkan_geometry_context m_geo_ctx;

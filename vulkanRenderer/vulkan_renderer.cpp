@@ -25,6 +25,7 @@
 #include "model/Model3d.h"
 #include "model/Texture.h"  // texture_manager::find_on_disk
 #include "scene/scene.h"
+#include "simulation/simulationenvironment.h"  // simulation::Environment, CSkyDome
 #include "utilities/Globals.h"
 #include "utilities/Logs.h"
 #include "vehicle/Train.h"
@@ -43,6 +44,8 @@ extern TTrain *Train;
 #include "world_frag_spv.h"
 #include "pick_vert_spv.h"
 #include "pick_frag_spv.h"
+#include "skydome_vert_spv.h"
+#include "skydome_frag_spv.h"
 
 namespace {
 
@@ -169,6 +172,7 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_pick_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
                             m_pick_pipeline_fans))
     return false;
+  if (!create_sky_pipeline()) return false;
   m_geo_ctx.physical_device = m_physical_device;
   m_geo_ctx.device = m_device;
   m_geo_ctx.pipeline_triangles = m_pipeline_triangles;
@@ -257,6 +261,7 @@ void vulkan_renderer::Shutdown() {
       vkDestroyPipeline(m_device, m_pipeline_fans_blend, nullptr);
       m_pipeline_fans_blend = VK_NULL_HANDLE;
     }
+    destroy_sky();
     if (m_pipeline_layout) {
       vkDestroyPipelineLayout(m_device, m_pipeline_layout, nullptr);
       m_pipeline_layout = VK_NULL_HANDLE;
@@ -1867,6 +1872,216 @@ void vulkan_renderer::Update_Pick_Control() {
   m_pick_callbacks.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Gradient skydome
+// ---------------------------------------------------------------------------
+
+bool vulkan_renderer::create_sky_pipeline() {
+  VkShaderModule vert =
+      create_shader_module(skydome_vert_spv, sizeof(skydome_vert_spv));
+  VkShaderModule frag =
+      create_shader_module(skydome_frag_spv, sizeof(skydome_frag_spv));
+  if (!vert || !frag) return false;
+
+  VkPipelineShaderStageCreateInfo stages[2] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vert;
+  stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = frag;
+  stages[1].pName = "main";
+
+  // Two vertex buffers: position (binding 0) and colour (binding 1).
+  VkVertexInputBindingDescription bindings[2]{};
+  bindings[0] = {0, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX};
+  bindings[1] = {1, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX};
+  VkVertexInputAttributeDescription attrs[2]{};
+  attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+  attrs[1] = {1, 1, VK_FORMAT_R32G32B32_SFLOAT, 0};
+  VkPipelineVertexInputStateCreateInfo vertex_input{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vertex_input.vertexBindingDescriptionCount = 2;
+  vertex_input.pVertexBindingDescriptions = bindings;
+  vertex_input.vertexAttributeDescriptionCount = 2;
+  vertex_input.pVertexAttributeDescriptions = attrs;
+
+  VkPipelineInputAssemblyStateCreateInfo input_assembly{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+  VkPipelineViewportStateCreateInfo viewport_state{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport_state.viewportCount = 1;
+  viewport_state.scissorCount = 1;
+
+  VkPipelineRasterizationStateCreateInfo raster{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo multisample{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState blend{};
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo color_blend{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  color_blend.attachmentCount = 1;
+  color_blend.pAttachments = &blend;
+
+  // No depth interaction: the dome is drawn first and the world overwrites it.
+  VkPipelineDepthStencilStateCreateInfo depth_stencil{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth_stencil.depthTestEnable = VK_FALSE;
+  depth_stencil.depthWriteEnable = VK_FALSE;
+
+  VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic_state{
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic_state.dynamicStateCount = 2;
+  dynamic_state.pDynamicStates = dyn;
+
+  VkPushConstantRange pc_range{};
+  pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  pc_range.offset = 0;
+  pc_range.size = sizeof(float) * 16;  // mat4 MVP
+  VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  lci.pushConstantRangeCount = 1;
+  lci.pPushConstantRanges = &pc_range;
+  VK_CHECK(vkCreatePipelineLayout(m_device, &lci, nullptr, &m_sky_layout));
+
+  VkPipelineRenderingCreateInfo rendering_ci{
+      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering_ci.colorAttachmentCount = 1;
+  rendering_ci.pColorAttachmentFormats = &m_swapchain_format;
+  rendering_ci.depthAttachmentFormat = m_depth_format;
+
+  VkGraphicsPipelineCreateInfo pci{
+      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  pci.pNext = &rendering_ci;
+  pci.stageCount = 2;
+  pci.pStages = stages;
+  pci.pVertexInputState = &vertex_input;
+  pci.pInputAssemblyState = &input_assembly;
+  pci.pViewportState = &viewport_state;
+  pci.pRasterizationState = &raster;
+  pci.pMultisampleState = &multisample;
+  pci.pColorBlendState = &color_blend;
+  pci.pDepthStencilState = &depth_stencil;
+  pci.pDynamicState = &dynamic_state;
+  pci.layout = m_sky_layout;
+  pci.renderPass = VK_NULL_HANDLE;
+
+  VkResult res = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pci,
+                                           nullptr, &m_sky_pipeline);
+  vkDestroyShaderModule(m_device, vert, nullptr);
+  vkDestroyShaderModule(m_device, frag, nullptr);
+  if (res != VK_SUCCESS) {
+    log_error("skydome pipeline creation failed.");
+    return false;
+  }
+  return true;
+}
+
+void vulkan_renderer::render_skydome(const glm::mat4 &proj, const glm::mat4 &rot,
+                                     VkCommandBuffer cmd) {
+  if (m_sky_pipeline == VK_NULL_HANDLE) return;
+  CSkyDome &dome = simulation::Environment.skydome();
+  const auto &verts = dome.vertices();
+  auto &cols = dome.colors();
+  const auto &idx = dome.indices();
+  if (verts.empty() || idx.empty() || cols.size() != verts.size()) return;
+
+  const VkDeviceSize csize = cols.size() * sizeof(glm::vec3);
+  if (!m_sky_ready) {
+    // Static position + index buffers (host-visible; uploaded once).
+    make_device_buffer(m_geo_ctx, verts.data(), verts.size() * sizeof(glm::vec3),
+                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, m_sky_vertex,
+                       m_sky_vertex_memory);
+    make_device_buffer(m_geo_ctx, idx.data(), idx.size() * sizeof(std::uint16_t),
+                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m_sky_index,
+                       m_sky_index_memory);
+    // Host-visible colour buffer, re-uploaded when the dome is dirty.
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = csize;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(m_device, &bi, nullptr, &m_sky_color) != VK_SUCCESS)
+      return;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(m_device, m_sky_color, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(
+        m_physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(m_device, &ai, nullptr, &m_sky_color_memory) !=
+        VK_SUCCESS)
+      return;
+    vkBindBufferMemory(m_device, m_sky_color, m_sky_color_memory, 0);
+    m_sky_index_count = static_cast<uint32_t>(idx.size());
+    m_sky_ready = true;
+    dome.is_dirty() = true;  // force the first colour upload below
+  }
+  if (dome.is_dirty()) {
+    void *mapped = nullptr;
+    vkMapMemory(m_device, m_sky_color_memory, 0, csize, 0, &mapped);
+    std::memcpy(mapped, cols.data(), static_cast<size_t>(csize));
+    vkUnmapMemory(m_device, m_sky_color_memory);
+    dome.is_dirty() = false;
+  }
+
+  // Camera-centred dome, scaled to sit far away (matches the GL renderer's 500m).
+  const glm::mat4 mvp =
+      proj * rot * glm::scale(glm::mat4(1.f), glm::vec3(500.f));
+
+  VkViewport vp{0.f,
+                0.f,
+                static_cast<float>(m_swapchain_extent.width),
+                static_cast<float>(m_swapchain_extent.height),
+                0.f,
+                1.f};
+  vkCmdSetViewport(cmd, 0, 1, &vp);
+  VkRect2D sc{{0, 0}, m_swapchain_extent};
+  vkCmdSetScissor(cmd, 0, 1, &sc);
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_sky_pipeline);
+  vkCmdPushConstants(cmd, m_sky_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                     sizeof(mvp), &mvp);
+  VkBuffer bufs[2] = {m_sky_vertex, m_sky_color};
+  VkDeviceSize offs[2] = {0, 0};
+  vkCmdBindVertexBuffers(cmd, 0, 2, bufs, offs);
+  vkCmdBindIndexBuffer(cmd, m_sky_index, 0, VK_INDEX_TYPE_UINT16);
+  vkCmdDrawIndexed(cmd, m_sky_index_count, 1, 0, 0, 0);
+}
+
+void vulkan_renderer::destroy_sky() {
+  if (m_sky_pipeline) vkDestroyPipeline(m_device, m_sky_pipeline, nullptr);
+  if (m_sky_layout) vkDestroyPipelineLayout(m_device, m_sky_layout, nullptr);
+  if (m_sky_vertex) vkDestroyBuffer(m_device, m_sky_vertex, nullptr);
+  if (m_sky_vertex_memory) vkFreeMemory(m_device, m_sky_vertex_memory, nullptr);
+  if (m_sky_color) vkDestroyBuffer(m_device, m_sky_color, nullptr);
+  if (m_sky_color_memory) vkFreeMemory(m_device, m_sky_color_memory, nullptr);
+  if (m_sky_index) vkDestroyBuffer(m_device, m_sky_index, nullptr);
+  if (m_sky_index_memory) vkFreeMemory(m_device, m_sky_index_memory, nullptr);
+  m_sky_pipeline = VK_NULL_HANDLE;
+  m_sky_layout = VK_NULL_HANDLE;
+  m_sky_vertex = VK_NULL_HANDLE;
+  m_sky_vertex_memory = VK_NULL_HANDLE;
+  m_sky_color = VK_NULL_HANDLE;
+  m_sky_color_memory = VK_NULL_HANDLE;
+  m_sky_index = VK_NULL_HANDLE;
+  m_sky_index_memory = VK_NULL_HANDLE;
+  m_sky_ready = false;
+}
+
 void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &rot,
                                       const glm::mat4 &proj,
@@ -1896,12 +2111,20 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
       } else if (sm->m_material < 0 && skins != nullptr) {
         mh = skins[-sm->m_material];
       }
-      // Draw in the matching pass only: translucent materials in the
-      // translucent (depth-write off) pass, the rest in the opaque pass.
-      const bool translucent =
-          m_two_pass_translucency && (mh != null_handle) &&
-          m_material_manager.material(mh).is_translucent();
-      if (translucent == translucent_pass) {
+      // Pass selection matches the engine's own split: iAlpha marks which of a
+      // submodel's texture layers are opaque (mask 0x1F) vs translucent
+      // (0x1F0000). Only genuinely translucent layers (e.g. glass) go to the
+      // depth-write-off pass; alpha-cutout bodies stay opaque so they keep
+      // writing depth and don't go see-through.
+      bool draw_this;
+      if (m_two_pass_translucency) {
+        draw_this = translucent_pass
+                        ? ((sm->iAlpha & sm->iFlags & 0x1F0000) != 0)
+                        : ((sm->iAlpha & sm->iFlags & 0x1F) != 0);
+      } else {
+        draw_this = !translucent_pass;  // single pass draws everything once
+      }
+      if (draw_this) {
         const glm::mat4 mvp = proj * rot * local;
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(mvp), &mvp);
@@ -2000,7 +2223,10 @@ bool vulkan_renderer::Render() {
   color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  color_attachment.clearValue.color = {{0.06f, 0.10f, 0.18f, 1.0f}};
+  // Clear to the horizon/fog colour (computed by the sim from the skydome) so
+  // the area below the dome reads as distant haze instead of a hard void.
+  const glm::vec3 fog = Global.FogColor;
+  color_attachment.clearValue.color = {{fog.r, fog.g, fog.b, 1.0f}};
 
   VkRenderingAttachmentInfo depth_attachment{
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -2050,6 +2276,10 @@ bool vulkan_renderer::Render() {
   // The geometry bank binds the right pipeline per chunk (triangles/strips);
   // both share the layout, so the per-group MVP push below stays valid.
   m_geo_ctx.current_cmd = frame.command_buffer;
+
+  // Sky first: the gradient dome fills the background; the world draws over it
+  // (the dome uses no depth, so opaque scene geometry overwrites it).
+  render_skydome(proj, rot, frame.command_buffer);
 
   // Bind the default (white) texture for set 0; persists across the pipeline
   // binds the bank does, since both pipelines share this layout. Per-material
