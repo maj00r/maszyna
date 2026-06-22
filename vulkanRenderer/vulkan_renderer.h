@@ -15,6 +15,7 @@
 #include <vulkan/vulkan.h>
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,8 @@
 struct GLFWwindow;
 class vulkan_imgui_renderer;
 class TSubModel;
+class TDynamicObject;
+class TAnimModel;
 
 // Shared, renderer-owned state the geometry banks need: the device (for buffer
 // allocation in create_) and the command buffer currently being recorded (for
@@ -47,8 +50,13 @@ struct vulkan_geometry_context {
   VkPipeline pick_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline pick_pipeline_strips = VK_NULL_HANDLE;
   VkPipeline pick_pipeline_fans = VK_NULL_HANDLE;
+  // Shadow (sun depth pre-pass) pipelines, bound when shadow_mode is set.
+  VkPipeline shadow_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline shadow_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline shadow_pipeline_fans = VK_NULL_HANDLE;
   bool pick_mode = false;
   bool translucent_mode = false;
+  bool shadow_mode = false;
 };
 
 // GPU-backed geometry bank: uploads each chunk's basic_vertex/index data to
@@ -253,6 +261,9 @@ class vulkan_renderer : public gfx_renderer {
   bool create_world_pipeline(VkPrimitiveTopology topology, bool depth_write,
                              VkPipeline &out);
   bool create_light_layout();  // set 1: per-frame light/scene UBO
+  bool create_shadow_resources();  // shadow map image/view/sampler
+  bool create_shadow_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  void destroy_shadow();
   bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_pick_resources();
   void destroy_pick_resources();
@@ -273,6 +284,13 @@ class vulkan_renderer : public gfx_renderer {
                        const glm::mat4 &rot, const glm::mat4 &proj,
                        const material_handle *skins, bool translucent_pass,
                        float interior, VkCommandBuffer cmd);
+  // Traverses the region + the player's consist for one pass, pushing the
+  // camera-relative model matrices. Used by the main colour pass and the sun
+  // shadow depth pass (which sets m_geo_ctx.shadow_mode).
+  void draw_scene(bool translucent_pass, const glm::dvec3 &campos,
+                  const glm::mat4 &rot, const glm::mat4 &proj,
+                  const std::set<TDynamicObject *> &consist,
+                  TDynamicObject *player, VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -338,9 +356,19 @@ class vulkan_renderer : public gfx_renderer {
   VkSampler m_sampler = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_texture_set_layout = VK_NULL_HANDLE;
   VkDescriptorPool m_descriptor_pool = VK_NULL_HANDLE;
-  // Set 1: per-frame light/scene uniform buffer (sun + dynamic lights).
+  // Set 1: per-frame light/scene uniform buffer (sun + dynamic lights) +
+  // the sun shadow map (binding 1).
   VkDescriptorSetLayout m_light_set_layout = VK_NULL_HANDLE;
   VkDescriptorPool m_light_pool = VK_NULL_HANDLE;
+  // Sun shadow map (fixed-size depth target sampled with comparison/PCF).
+  VkExtent2D m_shadow_extent = {2048, 2048};
+  VkImage m_shadow_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_shadow_memory = VK_NULL_HANDLE;
+  VkImageView m_shadow_view = VK_NULL_HANDLE;
+  VkSampler m_shadow_sampler = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_shadow_triangles = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_shadow_strips = VK_NULL_HANDLE;
+  VkPipeline m_pipeline_shadow_fans = VK_NULL_HANDLE;
   VkImage m_white_image = VK_NULL_HANDLE;
   VkDeviceMemory m_white_memory = VK_NULL_HANDLE;
   VkImageView m_white_view = VK_NULL_HANDLE;

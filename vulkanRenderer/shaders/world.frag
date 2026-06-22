@@ -22,11 +22,31 @@ layout(set = 1, binding = 0) uniform LightData {
   vec4 sun_color;
   vec4 ambient;
   vec4 interior_light;
+  mat4 lightspace;
   ivec4 count;
   GpuLight lights[8];
 } u;
 
+layout(set = 1, binding = 1) uniform sampler2DShadow uShadow;
+
 layout(location = 0) out vec4 outColor;
+
+// PCF sun-shadow factor (1 = lit, 0 = shadowed). The light-space matrix maps a
+// camera-relative position to [0,1] shadow-map UV + depth.
+float sun_shadow(vec3 camrel) {
+  vec4 ls = u.lightspace * vec4(camrel, 1.0);
+  if (ls.w <= 0.0) return 1.0;
+  vec3 p = ls.xyz / ls.w;
+  p.xy = p.xy * 0.5 + 0.5;
+  if (p.xy != clamp(p.xy, 0.0, 1.0) || p.z > 1.0) return 1.0;  // outside map
+  float bias = 0.0015;
+  float s = 0.0;
+  vec2 texel = 1.0 / vec2(textureSize(uShadow, 0));
+  for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x)
+      s += texture(uShadow, vec3(p.xy + vec2(x, y) * texel, p.z - bias));
+  return s / 9.0;
+}
 
 void main() {
   vec4 tex = texture(uTexture, vUV);
@@ -35,9 +55,11 @@ void main() {
   if (tex.a < max(vOpacity, 0.04)) discard;
 
   vec3 n = normalize(vNormal);
-  // Directional sun + ambient floor + cab interior glow (cab geometry only).
+  // Directional sun (shadowed) + ambient floor + cab interior glow.
+  float ndl = max(dot(n, normalize(-u.sun_dir.xyz)), 0.0);
+  float shadow = sun_shadow(vCamRel);
   vec3 light = max(u.ambient.rgb, vec3(0.2)) +
-               u.sun_color.rgb * max(dot(n, normalize(-u.sun_dir.xyz)), 0.0) +
+               u.sun_color.rgb * (ndl * shadow) +
                vInterior * u.interior_light.rgb;
 
   // Dynamic point/spot lights (headlights, lamps, signals).
