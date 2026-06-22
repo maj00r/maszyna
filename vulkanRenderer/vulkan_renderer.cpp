@@ -2561,6 +2561,36 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
                       cmd);
   };
 
+  // Camera frustum (camera-relative space) for culling the colour passes; the
+  // shadow pass keeps every caster (off-screen objects cast shadows into view).
+  const bool do_cull = !m_geo_ctx.shadow_mode;
+  glm::vec4 fplanes[6];
+  if (do_cull) {
+    const glm::mat4 vp = proj * rot;
+    auto prow = [&](int i) {
+      return glm::vec4(vp[0][i], vp[1][i], vp[2][i], vp[3][i]);
+    };
+    const glm::vec4 r3 = prow(3);
+    fplanes[0] = r3 + prow(0);  // left
+    fplanes[1] = r3 - prow(0);  // right
+    fplanes[2] = r3 + prow(1);  // bottom
+    fplanes[3] = r3 - prow(1);  // top
+    fplanes[4] = prow(2);       // near (Vulkan ZO depth)
+    fplanes[5] = r3 - prow(2);  // far
+    for (auto &p : fplanes) {
+      const float len = glm::length(glm::vec3(p));
+      if (len > 0.f) p /= len;
+    }
+  }
+  auto visible = [&](const glm::dvec3 &center, double radius) -> bool {
+    if (!do_cull) return true;
+    const glm::vec3 c = glm::vec3(center - campos);
+    const float r = static_cast<float>(radius);
+    for (auto const &p : fplanes)
+      if (glm::dot(glm::vec3(p), c) + p.w < -r) return false;
+    return true;
+  };
+
   if (scene::basic_region *region = simulation::Region) {
     const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
     const int half =
@@ -2577,6 +2607,7 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
             region->get_section(static_cast<size_t>(z) * side + x);
         if (section == nullptr) continue;
         section->create_geometry();
+        if (!visible(section->m_area.center, section->m_area.radius)) continue;
         if (!translucent_pass && !section->m_shapes.empty()) {
           push_group_mvp(section->m_area.center);
           for (auto const &shape : section->m_shapes) {
@@ -2586,6 +2617,7 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
         }
         for (auto &cell : section->m_cells) {
           if (!cell.m_active) continue;
+          if (!visible(cell.m_area.center, cell.m_area.radius)) continue;
           push_group_mvp(cell.m_area.center);
           if (!translucent_pass) {
             for (auto const &shape : cell.m_shapesopaque) {
