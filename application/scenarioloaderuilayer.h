@@ -13,9 +13,6 @@ http://mozilla.org/MPL/2.0/.
 #include "launcher/deferred_image.h"
 
 class scenarioloader_ui : public ui_layer {
-	int m_gradient_overlay_width;
-	int m_gradient_overlay_height;
-	GLuint m_gradient_overlay_tex;
 	deferred_image m_loading_wheel_frames[60];
     std::vector<std::string> m_trivia;
 public:
@@ -28,7 +25,6 @@ private:
 	/// and returns it as a vector of strings. Also performs background selection.
 	/// </summary>
 	std::vector<std::string> get_random_trivia();
-	void generate_gradient_tex();
 	void load_wheel_frames();
 
 	/// <summary>

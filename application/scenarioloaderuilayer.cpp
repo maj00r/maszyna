@@ -57,7 +57,6 @@ size_t utf8_char_count(const std::string& str)
 scenarioloader_ui::scenarioloader_ui()
 {
 	m_suppress_menu = true;
-	generate_gradient_tex();
 	load_wheel_frames();
 
 	m_trivia = get_random_trivia();
@@ -199,11 +198,15 @@ void scenarioloader_ui::render_()
 	ImGui::SetWindowFontScale(1);
 	const float font_scale_mult = 48 / ImGui::GetFontSize();
 	
-	// Gradient at the lower half of the screen
-	if (!Global.NvRenderer)
+	// Gradient at the lower half of the screen (transparent -> dark). Drawn
+	// natively with ImGui so it works on every renderer backend (no texture).
 	{
-		const ImTextureID tex = (ImTextureID)(intptr_t)m_gradient_overlay_tex; // See https://github.com/ocornut/imgui/wiki/Image-Loading-and-Displaying-Examples#example-for-opengl-users
-		draw_list->AddImage(tex, ImVec2(0, Global.window_size.y / 2), ImVec2(Global.window_size.x, Global.window_size.y), ImVec2(0, 0), ImVec2(1, 1));
+		const float mid_y = Global.window_size.y / 2;
+		const ImU32 top = IM_COL32(0, 0, 0, 0);
+		const ImU32 bottom = IM_COL32(0, 0, 0, 205);
+		draw_list->AddRectFilledMultiColor(
+		    ImVec2(0, mid_y), ImVec2(Global.window_size.x, Global.window_size.y),
+		    top, top, bottom, bottom);
 	}
 	
 	// [O] Loading...
@@ -293,42 +296,6 @@ void scenarioloader_ui::render_()
 	draw_list->AddRectFilled(p1, p2, ImColor(40, 210, 60, 255));
 	ImGui::PopFont();
 	ImGui::End();
-}
-
-void scenarioloader_ui::generate_gradient_tex()
-{
-	if (Global.NvRenderer)
-		return;
-	constexpr int image_width = 1;
-	constexpr int image_height = 256;
-	const auto image_data = new char[image_width * image_height * 4];
-	for (int x = 0; x < image_width; x++)
-		for (int y = 0; y < image_height; y++)
-		{
-			image_data[(y * image_width + x) * 4] = 0;
-			image_data[(y * image_width + x) * 4 + 1] = 0;
-			image_data[(y * image_width + x) * 4 + 2] = 0;
-			image_data[(y * image_width + x) * 4 + 3] = std::clamp(static_cast<int>(pow(y / 255.f, 0.7) * 255), 0, 255);
-		}
-
-	// Create a OpenGL texture identifier
-	GLuint image_texture;
-	glGenTextures(1, &image_texture);
-	glBindTexture(GL_TEXTURE_2D, image_texture);
-
-	// Setup filtering parameters for display
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-	// Upload pixels into texture
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image_width, image_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image_data);
-
-	delete[] image_data;
-
-	m_gradient_overlay_width = image_width;
-	m_gradient_overlay_height = image_height;
-	m_gradient_overlay_tex = image_texture;
 }
 
 void scenarioloader_ui::load_wheel_frames()

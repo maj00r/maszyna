@@ -438,9 +438,6 @@ void vulkan_imgui_renderer::Render() {
   VkCommandBuffer cmd = m_current_cmd;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          m_pipeline_layout, 0, 1, &m_descriptor_set, 0,
-                          nullptr);
 
   VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(cmd, 0, 1, &fb.vertex, &offset);
@@ -488,6 +485,16 @@ void vulkan_imgui_renderer::Render() {
         scissor.extent = {static_cast<uint32_t>(clip_w - clip_x),
                           static_cast<uint32_t>(clip_h - clip_y)};
         vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // Bind the texture for this command. ImGui carries a VkDescriptorSet in
+        // TextureId: the font atlas (set via io.Fonts->SetTexID) for text, or an
+        // image's descriptor for ImGui::Image/AddImage. Fall back to the font.
+        VkDescriptorSet set =
+            pcmd->TextureId != nullptr
+                ? reinterpret_cast<VkDescriptorSet>(pcmd->TextureId)
+                : m_descriptor_set;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                m_pipeline_layout, 0, 1, &set, 0, nullptr);
 
         vkCmdDrawIndexed(cmd, pcmd->ElemCount, 1,
                          global_idx + pcmd->IdxOffset,

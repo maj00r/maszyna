@@ -622,6 +622,10 @@ void ui_layer::render_background()
 	ImVec2 start_position((display_size.x - image_size.x) * 0.5f, (display_size.y - image_size.y) * 0.5f);
 	ImVec2 end_position(start_position.x + image_size.x, start_position.y + image_size.y);
 
-	// obrazek jest odwrócony w pionie – odwracamy UV
-	ImGui::GetBackgroundDrawList()->AddImage(reinterpret_cast<ImTextureID>(tex.get_id()), start_position, end_position, ImVec2(0, 1), ImVec2(1, 0));
+	// OpenGL stores textures bottom-up, so the V coordinate is flipped; Vulkan
+	// textures are top-down and use the natural UV.
+	const bool flip_v = (Global.GfxRenderer != "vulkan");
+	const ImVec2 uv_min(0.0f, flip_v ? 1.0f : 0.0f);
+	const ImVec2 uv_max(1.0f, flip_v ? 0.0f : 1.0f);
+	ImGui::GetBackgroundDrawList()->AddImage(reinterpret_cast<ImTextureID>(tex.get_id()), start_position, end_position, uv_min, uv_max);
 }

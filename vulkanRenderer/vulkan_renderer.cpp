@@ -1452,7 +1452,11 @@ texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
           view.m_width = static_cast<int>(img.width);
           view.m_height = static_cast<int>(img.height);
           view.m_alpha = (img.format != VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
-          view.m_id = m_textures.size();
+          // get_id() doubles as the ImGui texture id: hand back the descriptor
+          // set so reinterpret_cast<ImTextureID>(tex.get_id()) binds the right
+          // texture (the ImGui backend binds it per draw command). The set is
+          // bind-compatible with the ImGui pipeline (identical set-0 layout).
+          view.m_id = reinterpret_cast<std::size_t>(tex.descriptor);
           m_itextures.push_back(view);
           handle = static_cast<texture_handle>(m_textures.size());  // 1-based
         }
