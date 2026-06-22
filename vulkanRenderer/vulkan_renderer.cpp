@@ -24,6 +24,7 @@
 #include "model/AnimModel.h"  // TAnimModel
 #include "model/Model3d.h"
 #include "model/Texture.h"  // texture_manager::find_on_disk
+#include "rendering/lightarray.h"  // light_array (dynamic light sources)
 #include "scene/scene.h"
 #include "simulation/simulationenvironment.h"  // simulation::Environment, CSkyDome
 #include "utilities/Globals.h"
@@ -36,6 +37,7 @@
 namespace simulation {
 extern scene::basic_region *Region;
 extern TTrain *Train;
+extern light_array Lights;
 }  // namespace simulation
 
 // SPIR-V embedded by the build (glslangValidator --vn). Each header defines a
@@ -145,6 +147,7 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_swapchain()) return false;
   if (!create_command_pool()) return false;
   if (!create_default_texture()) return false;  // also creates the set layout
+  if (!create_light_layout()) return false;  // set 1 (light/scene UBO)
   if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true,
                              m_pipeline_triangles))
     return false;
@@ -229,8 +232,15 @@ void vulkan_renderer::Shutdown() {
       if (f.image_available) vkDestroySemaphore(m_device, f.image_available, nullptr);
       if (f.render_finished) vkDestroySemaphore(m_device, f.render_finished, nullptr);
       if (f.in_flight) vkDestroyFence(m_device, f.in_flight, nullptr);
+      if (f.light_ubo) vkDestroyBuffer(m_device, f.light_ubo, nullptr);
+      if (f.light_ubo_memory) vkFreeMemory(m_device, f.light_ubo_memory, nullptr);
     }
     m_frames.clear();
+    if (m_light_pool) vkDestroyDescriptorPool(m_device, m_light_pool, nullptr);
+    if (m_light_set_layout)
+      vkDestroyDescriptorSetLayout(m_device, m_light_set_layout, nullptr);
+    m_light_pool = VK_NULL_HANDLE;
+    m_light_set_layout = VK_NULL_HANDLE;
 
     if (m_command_pool) {
       vkDestroyCommandPool(m_device, m_command_pool, nullptr);
@@ -668,6 +678,85 @@ VkShaderModule vulkan_renderer::create_shader_module(const uint32_t *code,
   return module;
 }
 
+namespace {
+constexpr int kMaxLights = 8;
+// std140-compatible layout shared with world.vert/world.frag (set 1).
+struct GpuLight {
+  glm::vec4 pos;    // xyz: camera-relative position, w: 1 = spot
+  glm::vec4 dir;    // xyz: spot direction, w: range
+  glm::vec4 color;  // rgb: colour * intensity, a: cos(outer cone)
+  glm::vec4 extra;  // x: cos(inner cone)
+};
+struct LightUBO {
+  glm::mat4 viewproj;
+  glm::vec4 sun_dir;
+  glm::vec4 sun_color;
+  glm::vec4 ambient;
+  glm::vec4 interior_light;  // cab interior glow (colour * level)
+  glm::ivec4 count;
+  GpuLight lights[kMaxLights];
+};
+}  // namespace
+
+bool vulkan_renderer::create_light_layout() {
+  VkDescriptorSetLayoutBinding binding{};
+  binding.binding = 0;
+  binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  binding.descriptorCount = 1;
+  binding.stageFlags =
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorSetLayoutCreateInfo dlci{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dlci.bindingCount = 1;
+  dlci.pBindings = &binding;
+  VK_CHECK(
+      vkCreateDescriptorSetLayout(m_device, &dlci, nullptr, &m_light_set_layout));
+
+  VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                          kMaxFramesInFlight};
+  VkDescriptorPoolCreateInfo dpci{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpci.maxSets = kMaxFramesInFlight;
+  dpci.poolSizeCount = 1;
+  dpci.pPoolSizes = &ps;
+  VK_CHECK(vkCreateDescriptorPool(m_device, &dpci, nullptr, &m_light_pool));
+  return true;
+}
+
+void vulkan_renderer::update_lights(const glm::mat4 &viewproj,
+                                    const glm::dvec3 &campos, frame_sync &frame) {
+  LightUBO ubo{};
+  ubo.viewproj = viewproj;
+  ubo.sun_dir = glm::vec4(Global.DayLight.direction, 0.f);
+  ubo.sun_color = Global.DayLight.diffuse;
+  ubo.ambient = Global.DayLight.ambient;
+  // Cab interior glow (only applied to cab geometry, via the per-draw flag).
+  glm::vec3 interior(0.f);
+  if (simulation::Train != nullptr) {
+    if (TDynamicObject *p = simulation::Train->Dynamic())
+      interior = p->InteriorLight * p->InteriorLightLevel;
+  }
+  ubo.interior_light = glm::vec4(interior, 0.f);
+  // Gather active dynamic lights (vehicle head/marker lights), camera-relative.
+  int n = 0;
+  for (auto const &rec : simulation::Lights.data) {
+    if (n >= kMaxLights) break;
+    if (rec.intensity <= 0.01f) continue;
+    glm::vec3 dir = rec.direction;
+    if (glm::length(dir) < 0.001f) dir = glm::vec3(0.f, 0.f, 1.f);
+    GpuLight &gl = ubo.lights[n];
+    gl.pos = glm::vec4(glm::vec3(rec.position - campos), 1.f);  // spot
+    gl.dir = glm::vec4(glm::normalize(dir), 80.f);              // range 80 m
+    gl.color = glm::vec4(rec.color * rec.intensity,
+                         std::cos(glm::radians(35.f)));  // outer cone
+    gl.extra = glm::vec4(std::cos(glm::radians(20.f)), 0.f, 0.f, 0.f);  // inner
+    ++n;
+  }
+  ubo.count = glm::ivec4(n, 0, 0, 0);
+  if (frame.light_ubo_mapped != nullptr)
+    std::memcpy(frame.light_ubo_mapped, &ubo, sizeof(ubo));
+}
+
 bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
                                             bool depth_write, VkPipeline &out) {
   VkShaderModule vert =
@@ -757,18 +846,21 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   depth_stencil.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
   depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-  // Vertex push constant: mat4 MVP (offset 0) + directional sun
-  // (dir/color/ambient, offset 64) + misc (opacity, offset 112) = 128 bytes.
+  // Vertex push constant: mat4 local model matrix (offset 0) + misc
+  // (.x alpha-test threshold, .y emission, offset 64) = 80 bytes. The
+  // view-projection, sun and dynamic lights live in the set-1 UBO.
   VkPushConstantRange pc_range{};
   pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pc_range.offset = 0;
-  pc_range.size = sizeof(float) * 32;
+  pc_range.size = sizeof(float) * 20;
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
+    const VkDescriptorSetLayout set_layouts[2] = {m_texture_set_layout,
+                                                  m_light_set_layout};
     VkPipelineLayoutCreateInfo layout_ci{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout_ci.setLayoutCount = 1;
-    layout_ci.pSetLayouts = &m_texture_set_layout;
+    layout_ci.setLayoutCount = 2;
+    layout_ci.pSetLayouts = set_layouts;
     layout_ci.pushConstantRangeCount = 1;
     layout_ci.pPushConstantRanges = &pc_range;
     if (vkCreatePipelineLayout(m_device, &layout_ci, nullptr,
@@ -1224,6 +1316,40 @@ bool vulkan_renderer::create_frame_resources() {
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
     VK_CHECK(vkAllocateCommandBuffers(m_device, &ai, &f.command_buffer));
+
+    // Per-frame light/scene UBO (host-visible, persistently mapped) + its set.
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = sizeof(LightUBO);
+    bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(m_device, &bi, nullptr, &f.light_ubo));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(m_device, f.light_ubo, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(
+        m_physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &mai, nullptr, &f.light_ubo_memory));
+    vkBindBufferMemory(m_device, f.light_ubo, f.light_ubo_memory, 0);
+    vkMapMemory(m_device, f.light_ubo_memory, 0, sizeof(LightUBO), 0,
+                &f.light_ubo_mapped);
+
+    VkDescriptorSetAllocateInfo dsai{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = m_light_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &m_light_set_layout;
+    VK_CHECK(vkAllocateDescriptorSets(m_device, &dsai, &f.light_descriptor));
+    VkDescriptorBufferInfo dbi{f.light_ubo, 0, sizeof(LightUBO)};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = f.light_descriptor;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
   }
   return true;
 }
@@ -1489,7 +1615,7 @@ void vulkan_renderer::bind_material(material_handle material,
     alpha_ref = m_material_manager.material(material).get_or_guess_opacity();
   const glm::vec4 misc(alpha_ref, 0.f, 0.f, 0.f);
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                     sizeof(float) * 28, sizeof(misc), &misc);
+                     sizeof(float) * 16, sizeof(misc), &misc);  // uMisc @ offset 64
 }
 
 VkDescriptorSet vulkan_renderer::material_texture_descriptor(
@@ -2086,7 +2212,7 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &rot,
                                       const glm::mat4 &proj,
                                       const material_handle *skins,
-                                      bool translucent_pass,
+                                      bool translucent_pass, float interior,
                                       VkCommandBuffer cmd) {
   if (sm == nullptr) return;
 
@@ -2125,9 +2251,10 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
         draw_this = !translucent_pass;  // single pass draws everything once
       }
       if (draw_this) {
-        const glm::mat4 mvp = proj * rot * local;
+        // Push the camera-relative model matrix (offset 0); the UBO viewproj
+        // projects it. Lighting is per-fragment from the same UBO.
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(mvp), &mvp);
+                           sizeof(local), &local);
         bind_material(mh, cmd);  // pushes uMisc (.x threshold, .y emission = 0)
         // Self-illumination: gauges/indicators/lit panels glow once the scene
         // is dark enough (engine gate: f4Emision.a > 0 && fLuminance < fLight).
@@ -2135,16 +2262,20 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
             (sm->f4Emision.a > 0.f && Global.fLuminance < sm->fLight)
                 ? sm->f4Emision.a
                 : 0.f;
+        // uMisc.y = emission, uMisc.z = cab-interior flag (offset 68, 2 floats).
+        const float misc_yz[2] = {emission, interior};
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                           sizeof(float) * 29, sizeof(float), &emission);
+                           sizeof(float) * 17, sizeof(misc_yz), misc_yz);
         m_geometry.draw(sm->m_geometry.handle);
       }
     }
     if (sm->Child != nullptr)
-      render_submodel(sm->Child, local, rot, proj, skins, translucent_pass, cmd);
+      render_submodel(sm->Child, local, rot, proj, skins, translucent_pass,
+                      interior, cmd);
   }
   if (sm->Next != nullptr)
-    render_submodel(sm->Next, parent, rot, proj, skins, translucent_pass, cmd);
+    render_submodel(sm->Next, parent, rot, proj, skins, translucent_pass,
+                    interior, cmd);
 }
 
 bool vulkan_renderer::Render() {
@@ -2296,32 +2427,27 @@ bool vulkan_renderer::Render() {
                           m_pipeline_layout, 0, 1, &m_white_descriptor, 0,
                           nullptr);
 
-  // Push the directional sun once for the frame (offset 64; persists across
-  // the per-draw MVP pushes at offset 0 since the layout is shared).
-  struct {
-    glm::vec4 sun_dir;
-    glm::vec4 sun_color;
-    glm::vec4 ambient;
-  } light;
-  light.sun_dir = glm::vec4(Global.DayLight.direction, 0.f);
-  light.sun_color = Global.DayLight.diffuse;
-  light.ambient = Global.DayLight.ambient;
-  vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
-                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
-                     sizeof(light), &light);
-  // Initialise the alpha-test threshold (uMisc.x) so draws before the first
-  // bind_material() never read an undefined push-constant value.
+  // Per-frame light/scene UBO (set 1): view-projection, sun and dynamic lights.
+  const glm::mat4 viewproj = proj * rot;
+  update_lights(viewproj, campos, frame);
+  vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          m_pipeline_layout, 1, 1, &frame.light_descriptor, 0,
+                          nullptr);
+
+  // Initialise uMisc (.x alpha-test threshold, .y emission; offset 64) so draws
+  // before the first bind_material() never read an undefined push-constant.
   const glm::vec4 misc_default(0.f);
   vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
-                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 28,
+                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
                      sizeof(misc_default), &misc_default);
 
+  // The world shader takes the camera-relative model matrix in the push
+  // constant (offset 0); the UBO viewproj turns it into clip space.
   auto push_group_mvp = [&](glm::dvec3 const &center) {
     const glm::mat4 model =
         glm::translate(glm::mat4(1.f), glm::vec3(center - campos));
-    const glm::mat4 mvp = proj * rot * model;
     vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
+                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(model), &model);
   };
 
   auto bind_mat = [&](material_handle material) {
@@ -2350,7 +2476,7 @@ bool vulkan_renderer::Render() {
     const material_handle *skins =
         (md != nullptr) ? md->replacable_skins : nullptr;
     render_submodel(inst->pModel->Root, model, rot, proj, skins,
-                    translucent_pass, frame.command_buffer);
+                    translucent_pass, 0.f, frame.command_buffer);
   };
 
   // Render a whole vehicle: body + low-poly interior + load (+ cab for the
@@ -2367,21 +2493,23 @@ bool vulkan_renderer::Render() {
     const material_data *md = veh->Material();
     const material_handle *skins =
         (md != nullptr) ? md->replacable_skins : nullptr;
+    // Cab interior glow applies only to the occupied vehicle's interior.
+    const float interior = with_cab ? 1.f : 0.f;
     if (veh->mdLowPolyInt && veh->mdLowPolyInt->Root)
       render_submodel(veh->mdLowPolyInt->Root, vm, rot, proj, skins,
-                      translucent_pass, frame.command_buffer);
+                      translucent_pass, interior, frame.command_buffer);
     if (veh->mdModel && veh->mdModel->Root)
       render_submodel(veh->mdModel->Root, vm, rot, proj, skins,
-                      translucent_pass, frame.command_buffer);
+                      translucent_pass, 0.f, frame.command_buffer);
     if (veh->mdLoad && veh->mdLoad->Root) {
       const glm::mat4 lm =
           glm::translate(vm, glm::vec3(0.f, veh->LoadOffset, 0.f));
       render_submodel(veh->mdLoad->Root, lm, rot, proj, skins, translucent_pass,
-                      frame.command_buffer);
+                      0.f, frame.command_buffer);
     }
     if (with_cab && veh->mdKabina && veh->mdKabina->Root)
       render_submodel(veh->mdKabina->Root, vm, rot, proj, skins,
-                      translucent_pass, frame.command_buffer);
+                      translucent_pass, interior, frame.command_buffer);
   };
 
   // Building track geometry needs the default rail profiles loaded; ensure

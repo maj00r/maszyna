@@ -252,6 +252,7 @@ class vulkan_renderer : public gfx_renderer {
   bool create_default_texture();
   bool create_world_pipeline(VkPrimitiveTopology topology, bool depth_write,
                              VkPipeline &out);
+  bool create_light_layout();  // set 1: per-frame light/scene UBO
   bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_pick_resources();
   void destroy_pick_resources();
@@ -271,7 +272,7 @@ class vulkan_renderer : public gfx_renderer {
   void render_submodel(TSubModel *sm, const glm::mat4 &parent,
                        const glm::mat4 &rot, const glm::mat4 &proj,
                        const material_handle *skins, bool translucent_pass,
-                       VkCommandBuffer cmd);
+                       float interior, VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -281,7 +282,16 @@ class vulkan_renderer : public gfx_renderer {
     VkSemaphore render_finished = VK_NULL_HANDLE;
     VkFence in_flight = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    // Per-frame light/scene uniform buffer (set 1) + its descriptor.
+    VkBuffer light_ubo = VK_NULL_HANDLE;
+    VkDeviceMemory light_ubo_memory = VK_NULL_HANDLE;
+    void *light_ubo_mapped = nullptr;
+    VkDescriptorSet light_descriptor = VK_NULL_HANDLE;
   };
+
+  // Fills frame's light/scene UBO (set 1) from the sun + simulation::Lights.
+  void update_lights(const glm::mat4 &viewproj, const glm::dvec3 &campos,
+                     frame_sync &frame);
 
   GLFWwindow *m_window = nullptr;
 
@@ -328,6 +338,9 @@ class vulkan_renderer : public gfx_renderer {
   VkSampler m_sampler = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_texture_set_layout = VK_NULL_HANDLE;
   VkDescriptorPool m_descriptor_pool = VK_NULL_HANDLE;
+  // Set 1: per-frame light/scene uniform buffer (sun + dynamic lights).
+  VkDescriptorSetLayout m_light_set_layout = VK_NULL_HANDLE;
+  VkDescriptorPool m_light_pool = VK_NULL_HANDLE;
   VkImage m_white_image = VK_NULL_HANDLE;
   VkDeviceMemory m_white_memory = VK_NULL_HANDLE;
   VkImageView m_white_view = VK_NULL_HANDLE;
