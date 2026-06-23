@@ -41,14 +41,22 @@ layout(location = 2) out vec2 vUV;
 layout(location = 3) out float vOpacity;
 layout(location = 4) out float vEmission;
 layout(location = 5) out float vInterior;  // 1 for cab geometry, else 0
+layout(location = 6) out vec3 vTangent;    // world-space TBN basis
+layout(location = 7) out vec3 vBitangent;
+layout(location = 8) out float vHasNormal; // 1 when a real normal map is bound
 
 void main() {
   vec3 camrel = (pc.uLocal * vec4(aPos, 1.0)).xyz;
   vCamRel = camrel;
-  vNormal = mat3(pc.uLocal) * aNormal;
+  mat3 m = mat3(pc.uLocal);
+  vNormal = m * aNormal;
+  vTangent = m * aTangent.xyz;
+  // Bitangent from N x T with the stored handedness (aTangent.w).
+  vBitangent = cross(vNormal, vTangent) * aTangent.w;
   vUV = aUV;
   vOpacity = pc.uMisc.x;
   vEmission = pc.uMisc.y;
   vInterior = pc.uMisc.z;
+  vHasNormal = pc.uMisc.w;
   gl_Position = u.viewproj * vec4(camrel, 1.0);
 }

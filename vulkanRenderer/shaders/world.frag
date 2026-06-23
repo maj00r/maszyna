@@ -6,8 +6,12 @@ layout(location = 2) in vec2 vUV;
 layout(location = 3) in float vOpacity;
 layout(location = 4) in float vEmission;
 layout(location = 5) in float vInterior;
+layout(location = 6) in vec3 vTangent;
+layout(location = 7) in vec3 vBitangent;
+layout(location = 8) in float vHasNormal;
 
 layout(set = 0, binding = 0) uniform sampler2D uTexture;
+layout(set = 2, binding = 0) uniform sampler2D uNormal;  // rg: normal, b: height
 
 struct GpuLight {
   vec4 pos;    // xyz: camera-relative position, w: 1 = spot
@@ -76,7 +80,17 @@ void main() {
   // floor drops fully transparent texels. Glass keeps its own alpha for blend.
   if (tex.a < max(vOpacity, 0.04)) discard;
 
+  // Per-fragment normal: from the normal map (tangent space -> world via TBN)
+  // when a real one is bound, otherwise the interpolated geometric normal.
   vec3 n = normalize(vNormal);
+  if (vHasNormal > 0.5) {
+    vec4 nm = texture(uNormal, vUV);
+    vec3 nt;
+    nt.xy = nm.rg * 2.0 - 1.0;
+    nt.z = sqrt(max(1.0 - dot(nt.xy, nt.xy), 0.0));
+    mat3 tbn = mat3(normalize(vTangent), normalize(vBitangent), n);
+    n = normalize(tbn * nt);
+  }
   // Directional sun (shadowed) + ambient floor.
   float ndl = max(dot(n, normalize(-u.sun_dir.xyz)), 0.0);
   float shadow = sun_shadow(vCamRel);

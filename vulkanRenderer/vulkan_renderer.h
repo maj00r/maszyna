@@ -260,6 +260,7 @@ class vulkan_renderer : public gfx_renderer {
   void destroy_depth_resources();
   bool create_command_pool();
   bool create_default_texture();
+  bool create_flat_normal();
   bool create_world_pipeline(VkPrimitiveTopology topology, bool depth_write,
                              VkPipeline &out);
   bool create_light_layout();  // set 1: per-frame light/scene UBO
@@ -398,6 +399,12 @@ class vulkan_renderer : public gfx_renderer {
   VkDeviceMemory m_white_memory = VK_NULL_HANDLE;
   VkImageView m_white_view = VK_NULL_HANDLE;
   VkDescriptorSet m_white_descriptor = VK_NULL_HANDLE;
+  // Flat normal/height default (rg=0.5 -> normal (0,0,1), b=0 -> no parallax)
+  // bound to set 2 for materials that have no normal map.
+  VkImage m_flat_normal_image = VK_NULL_HANDLE;
+  VkDeviceMemory m_flat_normal_memory = VK_NULL_HANDLE;
+  VkImageView m_flat_normal_view = VK_NULL_HANDLE;
+  VkDescriptorSet m_flat_normal_descriptor = VK_NULL_HANDLE;
 
   // Control picking: an offscreen ID target (recreated with the swap chain),
   // pick pipelines (flat colour), a 1-pixel readback buffer, the queued
@@ -476,6 +483,9 @@ class vulkan_renderer : public gfx_renderer {
   // Returns the descriptor set for a material's diffuse texture, or the white
   // default if there is none.
   VkDescriptorSet material_texture_descriptor(material_handle material) const;
+  // Normal/height map descriptor for a material (set 2), or the flat-normal
+  // default when the material has no normal map.
+  VkDescriptorSet material_normal_descriptor(material_handle material) const;
   // Binds a material's texture (set 0) and pushes its opacity for the frame's
   // draw that follows.
   void bind_material(material_handle material, VkCommandBuffer cmd);

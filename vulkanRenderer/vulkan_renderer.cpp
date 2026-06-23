@@ -148,6 +148,7 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_swapchain()) return false;
   if (!create_command_pool()) return false;
   if (!create_default_texture()) return false;  // also creates the set layout
+  if (!create_flat_normal()) return false;      // set-2 default (no normal map)
   if (!create_light_layout()) return false;  // set 1 (light/scene UBO + shadow)
   if (!create_shadow_resources()) return false;  // sun shadow map
   if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true,
@@ -332,6 +333,18 @@ void vulkan_renderer::Shutdown() {
     if (m_white_memory) {
       vkFreeMemory(m_device, m_white_memory, nullptr);
       m_white_memory = VK_NULL_HANDLE;
+    }
+    if (m_flat_normal_view) {
+      vkDestroyImageView(m_device, m_flat_normal_view, nullptr);
+      m_flat_normal_view = VK_NULL_HANDLE;
+    }
+    if (m_flat_normal_image) {
+      vkDestroyImage(m_device, m_flat_normal_image, nullptr);
+      m_flat_normal_image = VK_NULL_HANDLE;
+    }
+    if (m_flat_normal_memory) {
+      vkFreeMemory(m_device, m_flat_normal_memory, nullptr);
+      m_flat_normal_memory = VK_NULL_HANDLE;
     }
 
     destroy_swapchain();
@@ -1132,11 +1145,13 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   pc_range.size = sizeof(float) * 20;
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
-    const VkDescriptorSetLayout set_layouts[2] = {m_texture_set_layout,
-                                                  m_light_set_layout};
+    // set 0 = diffuse, set 1 = light UBO + shadows, set 2 = normal/height map
+    // (same layout as set 0; bound per material for normal/parallax mapping).
+    const VkDescriptorSetLayout set_layouts[3] = {
+        m_texture_set_layout, m_light_set_layout, m_texture_set_layout};
     VkPipelineLayoutCreateInfo layout_ci{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout_ci.setLayoutCount = 2;
+    layout_ci.setLayoutCount = 3;
     layout_ci.pSetLayouts = set_layouts;
     layout_ci.pushConstantRangeCount = 1;
     layout_ci.pPushConstantRanges = &pc_range;
@@ -1874,6 +1889,36 @@ bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
 }
 }  // namespace
 
+bool vulkan_renderer::create_flat_normal() {
+  // Flat normal/height default for materials without a normal map: rg=0.5 ->
+  // tangent normal (0,0,1), b=0 -> zero parallax height.
+  decoded_image flat;
+  flat.width = 1;
+  flat.height = 1;
+  flat.format = VK_FORMAT_R8G8B8A8_UNORM;
+  flat.pixels = {128, 128, 0, 255};
+  if (!make_texture_image(m_physical_device, m_device, m_command_pool,
+                          m_graphics_queue, flat, m_flat_normal_image,
+                          m_flat_normal_memory, m_flat_normal_view))
+    return false;
+  VkDescriptorSetAllocateInfo nai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  nai.descriptorPool = m_descriptor_pool;
+  nai.descriptorSetCount = 1;
+  nai.pSetLayouts = &m_texture_set_layout;
+  VK_CHECK(vkAllocateDescriptorSets(m_device, &nai, &m_flat_normal_descriptor));
+  VkDescriptorImageInfo ninfo{};
+  ninfo.sampler = m_sampler;
+  ninfo.imageView = m_flat_normal_view;
+  ninfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet nwrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  nwrite.dstSet = m_flat_normal_descriptor;
+  nwrite.descriptorCount = 1;
+  nwrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  nwrite.pImageInfo = &ninfo;
+  vkUpdateDescriptorSets(m_device, 1, &nwrite, 0, nullptr);
+  return true;
+}
+
 texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
                                               bool const /*Loadnow*/,
                                               GLint /*format_hint*/) {
@@ -1948,6 +1993,11 @@ void vulkan_renderer::bind_material(material_handle material,
   VkDescriptorSet d = material_texture_descriptor(material);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           m_pipeline_layout, 0, 1, &d, 0, nullptr);
+  // set 2 = normal/height map (or the flat-normal default). When real, the
+  // fragment does normal mapping (uMisc.w flag).
+  VkDescriptorSet nd = material_normal_descriptor(material);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          m_pipeline_layout, 2, 1, &nd, 0, nullptr);
   // Opacity: <1 only for materials flagged translucent (glass), so opaque
   // materials are unaffected.
   // uMisc.x carries the material's alpha-test threshold (MaSzyna 'opacity':
@@ -1957,7 +2007,10 @@ void vulkan_renderer::bind_material(material_handle material,
   float alpha_ref = 0.f;
   if (material != null_handle)
     alpha_ref = m_material_manager.material(material).get_or_guess_opacity();
-  const glm::vec4 misc(alpha_ref, 0.f, 0.f, 0.f);
+  // uMisc.w = 1 when a real normal map is bound (enables normal mapping in the
+  // fragment shader; geometry without one keeps its geometric normal).
+  const float has_normal = (nd != m_flat_normal_descriptor) ? 1.f : 0.f;
+  const glm::vec4 misc(alpha_ref, 0.f, 0.f, has_normal);
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                      sizeof(float) * 16, sizeof(misc), &misc);  // uMisc @ offset 64
 }
@@ -1972,6 +2025,19 @@ VkDescriptorSet vulkan_renderer::material_texture_descriptor(
     }
   }
   return m_white_descriptor;
+}
+
+VkDescriptorSet vulkan_renderer::material_normal_descriptor(
+    material_handle material) const {
+  if (material != null_handle) {
+    // Slot 1 is the normal/height map in MaSzyna's material convention.
+    const texture_handle t = m_material_manager.material(material).GetTexture(1);
+    if (t != null_handle && static_cast<size_t>(t) <= m_textures.size()) {
+      const VkDescriptorSet d = m_textures[t - 1].descriptor;
+      if (d != VK_NULL_HANDLE) return d;
+    }
+  }
+  return m_flat_normal_descriptor;
 }
 
 // ---------------------------------------------------------------------------
@@ -2512,14 +2578,16 @@ void vulkan_renderer::render_skydome(const glm::mat4 &proj, const glm::mat4 &rot
   const glm::mat4 mvp =
       proj * rot * glm::scale(glm::mat4(1.f), glm::vec3(500.f));
 
+  // Match the supersampled render extent (the scene pass renders to the SSAA
+  // target, not the swapchain) so the subsequent draws keep the full viewport.
   VkViewport vp{0.f,
                 0.f,
-                static_cast<float>(m_swapchain_extent.width),
-                static_cast<float>(m_swapchain_extent.height),
+                static_cast<float>(m_render_extent.width),
+                static_cast<float>(m_render_extent.height),
                 0.f,
                 1.f};
   vkCmdSetViewport(cmd, 0, 1, &vp);
-  VkRect2D sc{{0, 0}, m_swapchain_extent};
+  VkRect2D sc{{0, 0}, m_render_extent};
   vkCmdSetScissor(cmd, 0, 1, &sc);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_sky_pipeline);
@@ -2902,6 +2970,10 @@ bool vulkan_renderer::Render() {
     vkCmdBindDescriptorSets(frame.command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout, 1,
                             1, &frame.light_descriptor, 0, nullptr);
+    // set 2 default = flat normal; bind_material() overrides it per material.
+    vkCmdBindDescriptorSets(frame.command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout, 2,
+                            1, &m_flat_normal_descriptor, 0, nullptr);
   };
   bind_world_sets();
   const glm::vec4 misc_default(0.f);
