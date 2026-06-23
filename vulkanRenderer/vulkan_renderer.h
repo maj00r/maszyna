@@ -427,7 +427,8 @@ class vulkan_renderer : public gfx_renderer {
   VkDeviceMemory m_shadow_memory = VK_NULL_HANDLE;
   VkImageView m_shadow_layer_views[kShadowLayers] = {};
   VkImageView m_shadow_array_view = VK_NULL_HANDLE;
-  VkSampler m_shadow_sampler = VK_NULL_HANDLE;
+  VkSampler m_shadow_sampler = VK_NULL_HANDLE;       // comparison (PCF)
+  VkSampler m_shadow_sampler_raw = VK_NULL_HANDLE;   // plain depth (PCSS blocker)
   VkPipeline m_pipeline_shadow_triangles = VK_NULL_HANDLE;
   VkPipeline m_pipeline_shadow_strips = VK_NULL_HANDLE;
   VkPipeline m_pipeline_shadow_fans = VK_NULL_HANDLE;

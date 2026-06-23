@@ -750,26 +750,30 @@ struct LightUBO {
 }  // namespace
 
 bool vulkan_renderer::create_light_layout() {
-  VkDescriptorSetLayoutBinding bindings[2]{};
+  VkDescriptorSetLayoutBinding bindings[3]{};
   bindings[0].binding = 0;  // light/scene UBO
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
   bindings[0].stageFlags =
       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-  bindings[1].binding = 1;  // sun shadow map
+  bindings[1].binding = 1;  // shadow map (comparison sampler, PCF)
   bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   bindings[1].descriptorCount = 1;
   bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  bindings[2].binding = 2;  // shadow map (plain sampler, PCSS blocker search)
+  bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[2].descriptorCount = 1;
+  bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
   VkDescriptorSetLayoutCreateInfo dlci{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  dlci.bindingCount = 2;
+  dlci.bindingCount = 3;
   dlci.pBindings = bindings;
   VK_CHECK(
       vkCreateDescriptorSetLayout(m_device, &dlci, nullptr, &m_light_set_layout));
 
   VkDescriptorPoolSize ps[2] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight}};
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 2}};
   VkDescriptorPoolCreateInfo dpci{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpci.maxSets = kMaxFramesInFlight;
@@ -832,6 +836,13 @@ bool vulkan_renderer::create_shadow_resources() {
   sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
   sci.maxLod = 1.f;
   VK_CHECK(vkCreateSampler(m_device, &sci, nullptr, &m_shadow_sampler));
+
+  // Plain (non-comparison) sampler so the lighting pass can read raw shadow
+  // depth for the PCSS blocker search.
+  sci.compareEnable = VK_FALSE;
+  sci.magFilter = VK_FILTER_NEAREST;
+  sci.minFilter = VK_FILTER_NEAREST;
+  VK_CHECK(vkCreateSampler(m_device, &sci, nullptr, &m_shadow_sampler_raw));
   return true;
 }
 
@@ -843,6 +854,8 @@ void vulkan_renderer::destroy_shadow() {
   if (m_pipeline_shadow_fans)
     vkDestroyPipeline(m_device, m_pipeline_shadow_fans, nullptr);
   if (m_shadow_sampler) vkDestroySampler(m_device, m_shadow_sampler, nullptr);
+  if (m_shadow_sampler_raw)
+    vkDestroySampler(m_device, m_shadow_sampler_raw, nullptr);
   for (auto &v : m_shadow_layer_views)
     if (v) {
       vkDestroyImageView(m_device, v, nullptr);
@@ -856,6 +869,7 @@ void vulkan_renderer::destroy_shadow() {
   m_pipeline_shadow_strips = VK_NULL_HANDLE;
   m_pipeline_shadow_fans = VK_NULL_HANDLE;
   m_shadow_sampler = VK_NULL_HANDLE;
+  m_shadow_sampler_raw = VK_NULL_HANDLE;
   m_shadow_array_view = VK_NULL_HANDLE;
   m_shadow_image = VK_NULL_HANDLE;
   m_shadow_memory = VK_NULL_HANDLE;
@@ -2057,7 +2071,12 @@ bool vulkan_renderer::create_frame_resources() {
     sii.sampler = m_shadow_sampler;
     sii.imageView = m_shadow_array_view;
     sii.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet writes[2] = {
+    VkDescriptorImageInfo sir{};  // raw depth for the PCSS blocker search
+    sir.sampler = m_shadow_sampler_raw;
+    sir.imageView = m_shadow_array_view;
+    sir.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet writes[3] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
     writes[0].dstSet = f.light_descriptor;
@@ -2070,7 +2089,12 @@ bool vulkan_renderer::create_frame_resources() {
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[1].pImageInfo = &sii;
-    vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
+    writes[2].dstSet = f.light_descriptor;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &sir;
+    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
   }
   return true;
 }

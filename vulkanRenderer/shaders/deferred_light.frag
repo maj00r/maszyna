@@ -30,10 +30,13 @@ layout(set = 1, binding = 0) uniform LightData {
   GpuLight lights[8];
 } u;
 
-layout(set = 1, binding = 1) uniform sampler2DArrayShadow uShadow;
+layout(set = 1, binding = 1) uniform sampler2DArrayShadow uShadow;     // PCF
+layout(set = 1, binding = 2) uniform sampler2DArray uShadowDepth;     // raw depth
 
 layout(location = 0) out vec4 outColor;
 
+// PCSS: a blocker search estimates how far the occluder is, then the PCF kernel
+// grows with that distance -> sharp contact shadows, soft far penumbrae.
 float sun_shadow(vec3 camrel) {
   float dist = length(camrel);
   int c = dist < u.cascade_splits.x ? 0 : (dist < u.cascade_splits.y ? 1 : 2);
@@ -42,13 +45,36 @@ float sun_shadow(vec3 camrel) {
   vec3 p = ls.xyz / ls.w;
   p.xy = p.xy * 0.5 + 0.5;
   if (p.xy != clamp(p.xy, 0.0, 1.0) || p.z > 1.0) return 1.0;
+  float recv = p.z;
   float bias = 0.0015;
   vec2 texel = 1.0 / vec2(textureSize(uShadow, 0).xy);
+
+  // 1. Blocker search: average depth of texels nearer the light than us.
+  float blockerSum = 0.0;
+  int blockerCount = 0;
+  for (int y = -2; y <= 2; ++y)
+    for (int x = -2; x <= 2; ++x) {
+      float d = texture(uShadowDepth,
+                        vec3(p.xy + vec2(x, y) * texel * 1.5, float(c))).r;
+      if (d < recv - bias) {
+        blockerSum += d;
+        blockerCount++;
+      }
+    }
+  if (blockerCount == 0) return 1.0;  // unoccluded
+  float avgBlocker = blockerSum / float(blockerCount);
+
+  // 2. Penumbra (similar triangles); grows with receiver-to-blocker distance.
+  float penumbra = (recv - avgBlocker) / max(avgBlocker, 1e-4);
+  float radius = clamp(penumbra * 40.0, 1.0, 6.0);  // PCF kernel in texels
+
+  // 3. PCF with the penumbra-sized kernel.
   float s = 0.0;
-  for (int y = -1; y <= 1; ++y)
-    for (int x = -1; x <= 1; ++x)
-      s += texture(uShadow, vec4(p.xy + vec2(x, y) * texel, float(c), p.z - bias));
-  return s / 9.0;
+  for (int y = -2; y <= 2; ++y)
+    for (int x = -2; x <= 2; ++x)
+      s += texture(uShadow, vec4(p.xy + vec2(x, y) * texel * radius * 0.5,
+                                 float(c), recv - bias));
+  return s / 25.0;
 }
 
 float cab_shadow(vec3 camrel) {
