@@ -486,6 +486,9 @@ class vulkan_renderer : public gfx_renderer {
   // Normal/height map descriptor for a material (set 2), or the flat-normal
   // default when the material has no normal map.
   VkDescriptorSet material_normal_descriptor(material_handle material) const;
+  // True when the material uses a parallax shader (declares a height_scale
+  // param), i.e. its normal map's blue channel is a height map -> safe to POM.
+  bool material_has_parallax(material_handle material) const;
   // Binds a material's texture (set 0) and pushes its opacity for the frame's
   // draw that follows.
   void bind_material(material_handle material, VkCommandBuffer cmd);

@@ -74,8 +74,44 @@ float cab_shadow(vec3 camrel) {
   return s / 9.0;
 }
 
+// Parallax occlusion mapping: ray-march the height map (normal map .b) along the
+// tangent-space view direction and return the displaced UV. Only used for
+// parallax materials (their .b really is a height). Mirrors the engine's POM.
+const float HEIGHT_SCALE = 0.05;
+vec2 parallax_uv(vec2 uv, vec3 viewDir) {
+  const float minLayers = 8.0;
+  const float maxLayers = 32.0;
+  float numLayers = mix(maxLayers, minLayers, clamp(abs(viewDir.z), 0.0, 1.0));
+  float layerDepth = 1.0 / numLayers;
+  float curDepth = 0.0;
+  vec2 dUV = (viewDir.xy * HEIGHT_SCALE) / numLayers;
+  vec2 cur = uv;
+  float curMap = texture(uNormal, cur).b;
+  for (int i = 0; i < 32 && curDepth < curMap; ++i) {
+    cur -= dUV;
+    curMap = texture(uNormal, cur).b;
+    curDepth += layerDepth;
+  }
+  vec2 prev = cur + dUV;
+  float after = curMap - curDepth;
+  float before = texture(uNormal, prev).b - curDepth + layerDepth;
+  float w = after / (after - before);
+  return mix(cur, prev, clamp(w, 0.0, 1.0));
+}
+
 void main() {
-  vec4 tex = texture(uTexture, vUV);
+  // Build the TBN once (used by parallax and normal mapping).
+  mat3 tbn = mat3(normalize(vTangent), normalize(vBitangent), normalize(vNormal));
+
+  // Parallax/displacement: offset the UVs using the height map before sampling
+  // (parallax materials only; vHasNormal == 2).
+  vec2 uv = vUV;
+  if (vHasNormal >= 1.5) {
+    vec3 vdir = normalize(transpose(tbn) * normalize(-vCamRel));
+    uv = parallax_uv(vUV, vdir);
+  }
+
+  vec4 tex = texture(uTexture, uv);
   // Alpha-test threshold (0 for blended atlases, ~0.5 for cutout); a small
   // floor drops fully transparent texels. Glass keeps its own alpha for blend.
   if (tex.a < max(vOpacity, 0.04)) discard;
@@ -84,11 +120,10 @@ void main() {
   // when a real one is bound, otherwise the interpolated geometric normal.
   vec3 n = normalize(vNormal);
   if (vHasNormal > 0.5) {
-    vec4 nm = texture(uNormal, vUV);
+    vec4 nm = texture(uNormal, uv);
     vec3 nt;
     nt.xy = nm.rg * 2.0 - 1.0;
     nt.z = sqrt(max(1.0 - dot(nt.xy, nt.xy), 0.0));
-    mat3 tbn = mat3(normalize(vTangent), normalize(vBitangent), n);
     n = normalize(tbn * nt);
   }
   // Directional sun (shadowed) + ambient floor.

@@ -2007,10 +2007,13 @@ void vulkan_renderer::bind_material(material_handle material,
   float alpha_ref = 0.f;
   if (material != null_handle)
     alpha_ref = m_material_manager.material(material).get_or_guess_opacity();
-  // uMisc.w = 1 when a real normal map is bound (enables normal mapping in the
-  // fragment shader; geometry without one keeps its geometric normal).
-  const float has_normal = (nd != m_flat_normal_descriptor) ? 1.f : 0.f;
-  const glm::vec4 misc(alpha_ref, 0.f, 0.f, has_normal);
+  // uMisc.w encodes the surface-detail mode for the fragment shader:
+  //   0 = none (geometric normal), 1 = normal mapping,
+  //   2 = normal mapping + parallax/displacement (height in the normal map .b).
+  float detail_mode = 0.f;
+  if (nd != m_flat_normal_descriptor)
+    detail_mode = material_has_parallax(material) ? 2.f : 1.f;
+  const glm::vec4 misc(alpha_ref, 0.f, 0.f, detail_mode);
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                      sizeof(float) * 16, sizeof(misc), &misc);  // uMisc @ offset 64
 }
@@ -2038,6 +2041,15 @@ VkDescriptorSet vulkan_renderer::material_normal_descriptor(
     }
   }
   return m_flat_normal_descriptor;
+}
+
+bool vulkan_renderer::material_has_parallax(material_handle material) const {
+  if (material == null_handle) return false;
+  const opengl_material &mat = m_material_manager.material(material);
+  // Parallax material variants declare a height_scale parameter; their normal
+  // map stores height in the blue channel. Plain normalmaps don't -> no POM
+  // (so we never misread a conventional normal map's .b = z as a height).
+  return mat.shader && mat.shader->param_conf.count("height_scale") > 0;
 }
 
 // ---------------------------------------------------------------------------
