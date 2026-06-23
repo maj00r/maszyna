@@ -54,9 +54,15 @@ struct vulkan_geometry_context {
   VkPipeline shadow_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline shadow_pipeline_strips = VK_NULL_HANDLE;
   VkPipeline shadow_pipeline_fans = VK_NULL_HANDLE;
+  // Deferred geometry-pass pipelines (write the G-buffer), bound when
+  // gbuffer_mode is set.
+  VkPipeline gbuffer_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline gbuffer_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline gbuffer_pipeline_fans = VK_NULL_HANDLE;
   bool pick_mode = false;
   bool translucent_mode = false;
   bool shadow_mode = false;
+  bool gbuffer_mode = false;
   // Within a shadow pass, restrict to the player cab (cab-light shadow map).
   bool cab_only = false;
 };
@@ -267,6 +273,11 @@ class vulkan_renderer : public gfx_renderer {
   bool create_shadow_resources();  // shadow map image/view/sampler
   bool create_shadow_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   void destroy_shadow();
+  // Deferred shading: geometry-pass pipelines (write the G-buffer) + the
+  // fullscreen lighting pass that consumes it.
+  bool create_gbuffer_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
+  bool create_deferred_light_pipeline();
+  void destroy_deferred();
   bool create_pick_pipeline(VkPrimitiveTopology topology, VkPipeline &out);
   bool create_pick_resources();
   void destroy_pick_resources();
@@ -350,6 +361,31 @@ class vulkan_renderer : public gfx_renderer {
   VkImage m_ssaa_color = VK_NULL_HANDLE;
   VkDeviceMemory m_ssaa_memory = VK_NULL_HANDLE;
   VkImageView m_ssaa_view = VK_NULL_HANDLE;
+
+  // Deferred shading G-buffer (geometry pass writes these at m_render_extent;
+  // the fullscreen lighting pass samples them). All recreated with the swapchain.
+  //   albedo:   rgb albedo, a emission strength
+  //   normal:   rgb world-space normal, a cab-interior flag
+  //   position: rgb camera-relative position
+  struct gbuffer_target {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+  };
+  gbuffer_target m_gbuf_albedo;
+  gbuffer_target m_gbuf_normal;
+  gbuffer_target m_gbuf_position;
+  VkSampler m_gbuffer_sampler = VK_NULL_HANDLE;             // nearest, clamp
+  VkDescriptorSetLayout m_gbuffer_set_layout = VK_NULL_HANDLE;  // 3 samplers
+  VkDescriptorPool m_gbuffer_pool = VK_NULL_HANDLE;
+  VkDescriptorSet m_gbuffer_descriptor = VK_NULL_HANDLE;
+  // Geometry-pass pipelines (write the G-buffer) + the fullscreen lighting pass.
+  VkPipeline m_gbuffer_pipeline_triangles = VK_NULL_HANDLE;
+  VkPipeline m_gbuffer_pipeline_strips = VK_NULL_HANDLE;
+  VkPipeline m_gbuffer_pipeline_fans = VK_NULL_HANDLE;
+  VkPipelineLayout m_deferred_light_layout = VK_NULL_HANDLE;
+  VkPipeline m_deferred_light_pipeline = VK_NULL_HANDLE;
 
   VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
   VkPipeline m_pipeline_triangles = VK_NULL_HANDLE;

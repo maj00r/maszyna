@@ -41,6 +41,9 @@ embed_spirv_shader("shaders/pick.frag" pick_frag_spv)
 embed_spirv_shader("shaders/skydome.vert" skydome_vert_spv)
 embed_spirv_shader("shaders/skydome.frag" skydome_frag_spv)
 embed_spirv_shader("shaders/shadow.vert" shadow_vert_spv)
+embed_spirv_shader("shaders/gbuffer.frag" gbuffer_frag_spv)
+embed_spirv_shader("shaders/deferred_light.vert" deferred_light_vert_spv)
+embed_spirv_shader("shaders/deferred_light.frag" deferred_light_frag_spv)
 
 add_custom_target(vulkanRenderer_shaders DEPENDS ${SHADER_HEADERS})
 
