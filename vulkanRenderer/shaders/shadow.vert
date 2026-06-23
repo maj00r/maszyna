@@ -27,11 +27,16 @@ layout(set = 1, binding = 0) uniform LightData {
   vec4 sun_color;
   vec4 ambient;
   vec4 interior_light;
-  mat4 lightspace;
+  mat4 lightspace[4];
+  vec4 cascade_splits;
+  vec4 cab_light;
   ivec4 count;
   GpuLight lights[8];
 } u;
 
 void main() {
-  gl_Position = u.lightspace * (pc.uLocal * vec4(aPos, 1.0));
+  // uMisc.w carries the shadow layer being rendered (sun cascade 0..2 or the
+  // cab light at 3), set per layer by the shadow pass.
+  int layer = int(pc.uMisc.w + 0.5);
+  gl_Position = u.lightspace[layer] * (pc.uLocal * vec4(aPos, 1.0));
 }

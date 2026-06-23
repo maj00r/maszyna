@@ -696,6 +696,7 @@ VkShaderModule vulkan_renderer::create_shader_module(const uint32_t *code,
 
 namespace {
 constexpr int kMaxLights = 8;
+constexpr int kCascades = 3;  // must match vulkan_renderer::kShadowCascades
 // std140-compatible layout shared with world.vert/world.frag (set 1).
 struct GpuLight {
   glm::vec4 pos;    // xyz: camera-relative position, w: 1 = spot
@@ -708,8 +709,10 @@ struct LightUBO {
   glm::vec4 sun_dir;
   glm::vec4 sun_color;
   glm::vec4 ambient;
-  glm::vec4 interior_light;  // cab interior glow (colour * level)
-  glm::mat4 lightspace;      // sun light-space matrix (camera-relative)
+  glm::vec4 interior_light;            // cab interior glow (colour * level)
+  glm::mat4 lightspace[kCascades + 1]; // [0..2] sun cascades, [3] cab light
+  glm::vec4 cascade_splits;            // .xyz: far distance of each cascade
+  glm::vec4 cab_light;                 // xyz: camera-relative pos, w: enable
   glm::ivec4 count;
   GpuLight lights[kMaxLights];
 };
@@ -751,7 +754,7 @@ bool vulkan_renderer::create_shadow_resources() {
   ici.format = m_depth_format;
   ici.extent = {m_shadow_extent.width, m_shadow_extent.height, 1};
   ici.mipLevels = 1;
-  ici.arrayLayers = 1;
+  ici.arrayLayers = kShadowLayers;  // sun cascades + cab-light layer
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
   ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -768,14 +771,25 @@ bool vulkan_renderer::create_shadow_resources() {
   VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &m_shadow_memory));
   vkBindImageMemory(m_device, m_shadow_image, m_shadow_memory, 0);
 
+  // One 2D view per layer (render targets: sun cascades + cab light).
+  for (uint32_t i = 0; i < kShadowLayers; ++i) {
+    VkImageViewCreateInfo lvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    lvci.image = m_shadow_image;
+    lvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    lvci.format = m_depth_format;
+    lvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, i, 1};
+    VK_CHECK(
+        vkCreateImageView(m_device, &lvci, nullptr, &m_shadow_layer_views[i]));
+  }
+  // Array view (sampled in the world shader as sampler2DArrayShadow).
   VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vci.image = m_shadow_image;
-  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   vci.format = m_depth_format;
-  vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-  VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &m_shadow_view));
+  vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowLayers};
+  VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &m_shadow_array_view));
 
-  // Comparison sampler -> hardware PCF via sampler2DShadow.
+  // Comparison sampler -> hardware PCF via sampler2DArrayShadow.
   VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   sci.magFilter = VK_FILTER_LINEAR;
   sci.minFilter = VK_FILTER_LINEAR;
@@ -798,14 +812,20 @@ void vulkan_renderer::destroy_shadow() {
   if (m_pipeline_shadow_fans)
     vkDestroyPipeline(m_device, m_pipeline_shadow_fans, nullptr);
   if (m_shadow_sampler) vkDestroySampler(m_device, m_shadow_sampler, nullptr);
-  if (m_shadow_view) vkDestroyImageView(m_device, m_shadow_view, nullptr);
+  for (auto &v : m_shadow_layer_views)
+    if (v) {
+      vkDestroyImageView(m_device, v, nullptr);
+      v = VK_NULL_HANDLE;
+    }
+  if (m_shadow_array_view)
+    vkDestroyImageView(m_device, m_shadow_array_view, nullptr);
   if (m_shadow_image) vkDestroyImage(m_device, m_shadow_image, nullptr);
   if (m_shadow_memory) vkFreeMemory(m_device, m_shadow_memory, nullptr);
   m_pipeline_shadow_triangles = VK_NULL_HANDLE;
   m_pipeline_shadow_strips = VK_NULL_HANDLE;
   m_pipeline_shadow_fans = VK_NULL_HANDLE;
   m_shadow_sampler = VK_NULL_HANDLE;
-  m_shadow_view = VK_NULL_HANDLE;
+  m_shadow_array_view = VK_NULL_HANDLE;
   m_shadow_image = VK_NULL_HANDLE;
   m_shadow_memory = VK_NULL_HANDLE;
 }
@@ -818,26 +838,75 @@ void vulkan_renderer::update_lights(const glm::mat4 &viewproj,
   ubo.sun_color = Global.DayLight.diffuse;
   ubo.ambient = Global.DayLight.ambient;
   // Cab interior glow (only applied to cab geometry, via the per-draw flag).
+  // Like the GL renderer it fades in as the scene darkens, so it doesn't blow
+  // out the (often brightly painted) cab in daylight.
+  // It stays on in daylight too (just dimmer), so it reacts alongside the sun
+  // rather than only at night; the floor keeps it visible without blowing out
+  // the brightly painted cab in full daylight.
+  const float cab_darkness =
+      glm::clamp(1.25f - static_cast<float>(Global.fLuminance), 0.f, 1.f);
+  const float cab_dim = 0.4f + 0.6f * cab_darkness;  // 0.4 (day) .. 1.0 (night)
+  float cab_level = 0.f;
   glm::vec3 interior(0.f);
   if (simulation::Train != nullptr) {
-    if (TDynamicObject *p = simulation::Train->Dynamic())
-      interior = p->InteriorLight * p->InteriorLightLevel;
+    if (TDynamicObject *p = simulation::Train->Dynamic()) {
+      cab_level = p->InteriorLightLevel;
+      interior = p->InteriorLight * cab_level * cab_dim;
+    }
   }
   ubo.interior_light = glm::vec4(interior, 0.f);
-  // Sun light-space matrix (camera-relative ortho box around the camera). The
-  // scene is rendered camera-relative, so the shadow box is centred at origin.
+  // Instrument backlight: the subtree the switch makes visible. Only it gets
+  // on-demand glow (lit gauges) even in daylight; the rest of the cab keeps the
+  // darkness-gated emission, so the switch lights the gauges, not the whole cab.
+  m_instrument_submodel =
+      (simulation::Train != nullptr)
+          ? simulation::Train->btInstrumentLight.on_submodel()
+          : nullptr;
+  // Cascaded sun light-space matrices: nested camera-relative ortho boxes, the
+  // near cascade tight (crisp near/cab shadows), the far one wide for coverage.
   {
     glm::vec3 sundir = glm::normalize(glm::vec3(Global.DayLight.direction));
     if (glm::length(sundir) < 0.001f) sundir = glm::vec3(0.f, -1.f, 0.f);
-    const float R = 250.f;   // half-extent of the shadow box (metres)
-    const float depth = 600.f;
     glm::vec3 up =
         std::abs(sundir.y) > 0.95f ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
-    glm::mat4 lview = glm::lookAtRH(-sundir * (depth * 0.5f),
-                                    glm::vec3(0.f), up);
-    glm::mat4 lproj = glm::orthoRH_ZO(-R, R, -R, R, 0.f, depth);
+    const float far_dist[kCascades] = {35.f, 130.f, 400.f};
+    ubo.cascade_splits =
+        glm::vec4(far_dist[0], far_dist[1], far_dist[2], 0.f);
+    for (int i = 0; i < kCascades; ++i) {
+      const float R = far_dist[i];          // half-extent of this cascade
+      const float depth = 2.f * R + 200.f;  // room for tall casters
+      glm::mat4 lview =
+          glm::lookAtRH(-sundir * (depth * 0.5f), glm::vec3(0.f), up);
+      glm::mat4 lproj = glm::orthoRH_ZO(-R, R, -R, R, 0.f, depth);
+      lproj[1][1] *= -1.f;  // Vulkan clip Y
+      ubo.lightspace[i] = lproj * lview;
+    }
+  }
+  // Cab-light shadow: a perspective depth map from the ceiling lamp above the
+  // console (camera-relative, only in cab view). Anchored with the vehicle's own
+  // axes (up/front) so it stays put as the player looks around, instead of
+  // floating above the eye. The cab light is otherwise a flat fill; this lets
+  // cab objects occlude it, i.e. cast shadows from it.
+  {
+    const bool enable = !FreeFlyModeFlag && cab_level > 0.01f;
+    glm::vec3 lamp(0.f, 0.85f, 0.f);  // fallback: above the eye
+    glm::vec3 down(0.f, -1.f, 0.f), fwd(0.f, 0.f, 1.f);
+    if (simulation::Train != nullptr) {
+      if (TDynamicObject *p = simulation::Train->Dynamic()) {
+        const glm::vec3 up = glm::vec3(p->VectorUp());
+        fwd = glm::vec3(p->VectorFront());
+        // Pick the cab end the driver actually occupies.
+        if (glm::dot(campos - p->vPosition, p->VectorFront()) < 0.0) fwd = -fwd;
+        lamp = up * 0.7f + fwd * 0.55f;  // up to the ceiling, forward to console
+        down = -up;
+      }
+    }
+    ubo.cab_light = glm::vec4(lamp, enable ? 1.f : 0.f);
+    glm::mat4 lview = glm::lookAtRH(lamp, lamp + down, fwd);
+    glm::mat4 lproj =
+        glm::perspectiveRH_ZO(glm::radians(150.f), 1.f, 0.05f, 6.f);
     lproj[1][1] *= -1.f;  // Vulkan clip Y
-    ubo.lightspace = lproj * lview;
+    ubo.lightspace[kCascades] = lproj * lview;  // layer 3
   }
   // Gather active dynamic lights (vehicle head/marker lights), camera-relative.
   int n = 0;
@@ -1011,7 +1080,11 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   VkPipelineRasterizationStateCreateInfo raster{
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   raster.polygonMode = VK_POLYGON_MODE_FILL;
-  raster.cullMode = VK_CULL_MODE_NONE;
+  // Engine geometry is CCW-front, cull-back (opengl33renderer.cpp:419), and that
+  // CCW winding carries through to the framebuffer here. Opaque culls back faces;
+  // translucent (depth_write off, e.g. glass) stays double-sided so it shows
+  // from both sides.
+  raster.cullMode = depth_write ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
   raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
   raster.lineWidth = 1.0f;
 
@@ -1552,7 +1625,7 @@ bool vulkan_renderer::create_frame_resources() {
     VkDescriptorBufferInfo dbi{f.light_ubo, 0, sizeof(LightUBO)};
     VkDescriptorImageInfo sii{};
     sii.sampler = m_shadow_sampler;
-    sii.imageView = m_shadow_view;
+    sii.imageView = m_shadow_array_view;
     sii.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet writes[2] = {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
@@ -2431,8 +2504,10 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                                       const glm::mat4 &proj,
                                       const material_handle *skins,
                                       bool translucent_pass, float interior,
-                                      VkCommandBuffer cmd) {
+                                      VkCommandBuffer cmd, bool instrument) {
   if (sm == nullptr) return;
+  // Inside the instrument-backlight subtree? (root or inherited from a parent.)
+  const bool is_instr = instrument || (sm == m_instrument_submodel);
 
   if (sm->iVisible && TSubModel::fSquareDist >= sm->fSquareMinDist &&
       TSubModel::fSquareDist < sm->fSquareMaxDist) {
@@ -2473,27 +2548,34 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
         // projects it. Lighting is per-fragment from the same UBO.
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(local), &local);
-        bind_material(mh, cmd);  // pushes uMisc (.x threshold, .y emission = 0)
-        // Self-illumination: gauges/indicators/lit panels glow once the scene
-        // is dark enough (engine gate: f4Emision.a > 0 && fLuminance < fLight).
-        const float emission =
-            (sm->f4Emision.a > 0.f && Global.fLuminance < sm->fLight)
-                ? sm->f4Emision.a
-                : 0.f;
-        // uMisc.y = emission, uMisc.z = cab-interior flag (offset 68, 2 floats).
-        const float misc_yz[2] = {emission, interior};
-        vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                           sizeof(float) * 17, sizeof(misc_yz), misc_yz);
+        if (!m_geo_ctx.shadow_mode) {
+          bind_material(mh, cmd);  // pushes uMisc (.x threshold, .y emission = 0)
+          // Self-illumination: gauges/indicators/lit panels glow once the scene
+          // is dark enough (engine gate: f4Emision.a > 0 && fLuminance < fLight),
+          // or whenever this is instrument-backlight geometry (only visible while
+          // the switch is on), so flipping it lights the gauges in any light.
+          const bool lit = (Global.fLuminance < sm->fLight) || is_instr;
+          const float emission = (sm->f4Emision.a > 0.f && lit) ? sm->f4Emision.a
+                                                                : 0.f;
+          // uMisc.y = emission, uMisc.z = cab-interior flag (offset 68).
+          const float misc_yz[2] = {emission, interior};
+          vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                             sizeof(float) * 17, sizeof(misc_yz), misc_yz);
+        }
+        // Shadow pass: depth only, no material/uMisc (cascade index in uMisc.w
+        // is pushed once per cascade and must survive).
         m_geometry.draw(sm->m_geometry.handle);
       }
     }
     if (sm->Child != nullptr)
+      // Children are inside this submodel's subtree (inherit is_instr); siblings
+      // (Next) are not, so they only carry the inherited `instrument` flag.
       render_submodel(sm->Child, local, rot, proj, skins, translucent_pass,
-                      interior, cmd);
+                      interior, cmd, is_instr);
   }
   if (sm->Next != nullptr)
     render_submodel(sm->Next, parent, rot, proj, skins, translucent_pass,
-                    interior, cmd);
+                    interior, cmd, instrument);
 }
 
 void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos,
@@ -2510,7 +2592,11 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
     vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                        sizeof(model), &model);
   };
-  auto bind_mat = [&](material_handle material) { bind_material(material, cmd); };
+  // Shadow pass is depth-only: skip material binds so the per-cascade uMisc.w
+  // push (cascade index) survives; push_group_mvp still sets the local matrix.
+  auto bind_mat = [&](material_handle material) {
+    if (!m_geo_ctx.shadow_mode) bind_material(material, cmd);
+  };
 
   auto render_instance = [&](TAnimModel *inst, bool tp) {
     if (inst == nullptr || inst->pModel == nullptr ||
@@ -2560,6 +2646,13 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
       render_submodel(veh->mdKabina->Root, vm, rot, proj, skins, tp, interior,
                       cmd);
   };
+
+  // Cab-light shadow pass: only the player vehicle (its cab/body occlude the
+  // lamp); nothing else is relevant to the cab interior.
+  if (m_geo_ctx.cab_only) {
+    if (player != nullptr) render_vehicle(player, true, false);
+    return;
+  }
 
   // Camera frustum (camera-relative space) for culling the colour passes; the
   // shadow pass keeps every caster (off-screen objects cast shadows into view).
@@ -2763,7 +2856,7 @@ bool vulkan_renderer::Render() {
                      VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
                      sizeof(misc_default), &misc_default);
 
-  // --- sun shadow depth pass (camera-relative, same frame -> no sliding) ---
+  // --- cascaded sun shadow depth passes (camera-relative, same frame) ---
   {
     VkImageMemoryBarrier sm{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     sm.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -2772,32 +2865,45 @@ bool vulkan_renderer::Render() {
     sm.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     sm.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     sm.image = m_shadow_image;
-    sm.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    sm.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowLayers};
     vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0,
                          nullptr, 0, nullptr, 1, &sm);
 
-    VkRenderingAttachmentInfo sdepth{
-        VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    sdepth.imageView = m_shadow_view;
-    sdepth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    sdepth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    sdepth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    sdepth.clearValue.depthStencil = {1.0f, 0};
-    VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    sri.renderArea.extent = m_shadow_extent;
-    sri.layerCount = 1;
-    sri.pDepthAttachment = &sdepth;
-    vkCmdBeginRendering(frame.command_buffer, &sri);
-    VkViewport svp{0.f, 0.f, static_cast<float>(m_shadow_extent.width),
-                   static_cast<float>(m_shadow_extent.height), 0.f, 1.f};
-    vkCmdSetViewport(frame.command_buffer, 0, 1, &svp);
-    VkRect2D ssc{{0, 0}, m_shadow_extent};
-    vkCmdSetScissor(frame.command_buffer, 0, 1, &ssc);
+    const VkViewport svp{0.f, 0.f, static_cast<float>(m_shadow_extent.width),
+                         static_cast<float>(m_shadow_extent.height), 0.f, 1.f};
+    const VkRect2D ssc{{0, 0}, m_shadow_extent};
     m_geo_ctx.shadow_mode = true;
-    draw_scene(false, campos, rot, proj, consist, player, frame.command_buffer);
+    // Layers 0..2 are sun cascades (full scene); layer 3 is the cab lamp (only
+    // the player cab is rendered, so cab objects occlude the lamp).
+    for (uint32_t c = 0; c < kShadowLayers; ++c) {
+      VkRenderingAttachmentInfo sdepth{
+          VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+      sdepth.imageView = m_shadow_layer_views[c];
+      sdepth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      sdepth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      sdepth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      sdepth.clearValue.depthStencil = {1.0f, 0};
+      VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+      sri.renderArea.extent = m_shadow_extent;
+      sri.layerCount = 1;
+      sri.pDepthAttachment = &sdepth;
+      vkCmdBeginRendering(frame.command_buffer, &sri);
+      vkCmdSetViewport(frame.command_buffer, 0, 1, &svp);
+      vkCmdSetScissor(frame.command_buffer, 0, 1, &ssc);
+      // uMisc.w = layer index; the shadow vertex selects lightspace[c]. The
+      // shadow pass skips material binds, so this push persists across draws.
+      const float cf = static_cast<float>(c);
+      vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                         VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 19,
+                         sizeof(float), &cf);
+      m_geo_ctx.cab_only = (c == kCabShadowLayer);
+      draw_scene(false, campos, rot, proj, consist, player,
+                 frame.command_buffer);
+      vkCmdEndRendering(frame.command_buffer);
+    }
+    m_geo_ctx.cab_only = false;
     m_geo_ctx.shadow_mode = false;
-    vkCmdEndRendering(frame.command_buffer);
 
     sm.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     sm.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;

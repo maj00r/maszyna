@@ -57,6 +57,8 @@ struct vulkan_geometry_context {
   bool pick_mode = false;
   bool translucent_mode = false;
   bool shadow_mode = false;
+  // Within a shadow pass, restrict to the player cab (cab-light shadow map).
+  bool cab_only = false;
 };
 
 // GPU-backed geometry bank: uploads each chunk's basic_vertex/index data to
@@ -283,7 +285,8 @@ class vulkan_renderer : public gfx_renderer {
   void render_submodel(TSubModel *sm, const glm::mat4 &parent,
                        const glm::mat4 &rot, const glm::mat4 &proj,
                        const material_handle *skins, bool translucent_pass,
-                       float interior, VkCommandBuffer cmd);
+                       float interior, VkCommandBuffer cmd,
+                       bool instrument = false);
   // Traverses the region + the player's consist for one pass, pushing the
   // camera-relative model matrices. Used by the main colour pass and the sun
   // shadow depth pass (which sets m_geo_ctx.shadow_mode).
@@ -349,6 +352,11 @@ class vulkan_renderer : public gfx_renderer {
   bool m_two_pass_translucency = true;
   // Submodel animation (RaAnimation): gauges, levers, wheels, pantograph...
   bool m_submodel_animations = true;
+  // Cab instrument backlight: the submodel (subtree) the switch makes visible
+  // (btInstrumentLight.on_submodel()). Only that subtree glows on demand (even in
+  // daylight); the rest of the cab keeps the normal darkness-gated emission, so
+  // flipping the switch lights the gauges, not the whole cab. Per-frame.
+  const TSubModel *m_instrument_submodel = nullptr;
 
   // Texturing: a shared sampler + descriptor set layout (set 0 = combined
   // image sampler) and a default 1x1 white texture bound when a draw has no
@@ -360,11 +368,17 @@ class vulkan_renderer : public gfx_renderer {
   // the sun shadow map (binding 1).
   VkDescriptorSetLayout m_light_set_layout = VK_NULL_HANDLE;
   VkDescriptorPool m_light_pool = VK_NULL_HANDLE;
-  // Sun shadow map (fixed-size depth target sampled with comparison/PCF).
+  // Cascaded sun shadow map: a depth texture array (one layer per cascade),
+  // sampled with comparison/PCF. Per-layer views render each cascade; the array
+  // view is sampled in the world shader.
+  static constexpr uint32_t kShadowCascades = 3;          // sun cascades
+  static constexpr uint32_t kCabShadowLayer = 3;          // cab-light layer
+  static constexpr uint32_t kShadowLayers = kShadowCascades + 1;
   VkExtent2D m_shadow_extent = {2048, 2048};
   VkImage m_shadow_image = VK_NULL_HANDLE;
   VkDeviceMemory m_shadow_memory = VK_NULL_HANDLE;
-  VkImageView m_shadow_view = VK_NULL_HANDLE;
+  VkImageView m_shadow_layer_views[kShadowLayers] = {};
+  VkImageView m_shadow_array_view = VK_NULL_HANDLE;
   VkSampler m_shadow_sampler = VK_NULL_HANDLE;
   VkPipeline m_pipeline_shadow_triangles = VK_NULL_HANDLE;
   VkPipeline m_pipeline_shadow_strips = VK_NULL_HANDLE;

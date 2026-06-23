@@ -27,9 +27,11 @@ layout(set = 1, binding = 0) uniform LightData {
   vec4 sun_dir;
   vec4 sun_color;
   vec4 ambient;
-  vec4 interior_light;  // cab glow (colour * level)
-  mat4 lightspace;      // sun light-space matrix (camera-relative)
-  ivec4 count;          // x: active light count
+  vec4 interior_light;   // cab glow (colour * level)
+  mat4 lightspace[4];    // [0..2] sun cascades, [3] cab light
+  vec4 cascade_splits;   // .xyz: far distance of each cascade
+  vec4 cab_light;        // xyz: camera-relative pos, w: enable
+  ivec4 count;           // x: active light count
   GpuLight lights[8];
 } u;
 

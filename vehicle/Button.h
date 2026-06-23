@@ -36,6 +36,8 @@ public:
     void AssignBool(bool const *bValue);
     // returns offset of submodel associated with the button from the model centre
     glm::vec3 model_offset() const;
+    // submodel shown in the "on" state (e.g. instrument backlight overlay)
+    inline TSubModel const *on_submodel() const { return pModelOn; }
 	void gain(float new_volume);
 	inline uint8_t b() { return m_state ? 1 : 0; };
 
