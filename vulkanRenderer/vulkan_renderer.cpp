@@ -1186,10 +1186,21 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
 }
 
 bool vulkan_renderer::create_depth_resources() {
+  // Supersampled render extent: swapchain * scale per axis, clamped so we don't
+  // exceed the device's max 2D image dimension.
+  const float scale = m_ssaa_scale > 0.f ? m_ssaa_scale : 1.f;
+  VkPhysicalDeviceProperties props;
+  vkGetPhysicalDeviceProperties(m_physical_device, &props);
+  const uint32_t maxdim = props.limits.maxImageDimension2D;
+  m_render_extent.width = std::min(
+      maxdim, static_cast<uint32_t>(m_swapchain_extent.width * scale + 0.5f));
+  m_render_extent.height = std::min(
+      maxdim, static_cast<uint32_t>(m_swapchain_extent.height * scale + 0.5f));
+
   VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ici.imageType = VK_IMAGE_TYPE_2D;
   ici.format = m_depth_format;
-  ici.extent = {m_swapchain_extent.width, m_swapchain_extent.height, 1};
+  ici.extent = {m_render_extent.width, m_render_extent.height, 1};
   ici.mipLevels = 1;
   ici.arrayLayers = 1;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1214,6 +1225,36 @@ bool vulkan_renderer::create_depth_resources() {
   vci.format = m_depth_format;
   vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
   VK_CHECK(vkCreateImageView(m_device, &vci, nullptr, &m_depth_view));
+
+  // SSAA colour target (scene renders here, then is downscaled to the swapchain).
+  VkImageCreateInfo cci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  cci.imageType = VK_IMAGE_TYPE_2D;
+  cci.format = m_swapchain_format;
+  cci.extent = {m_render_extent.width, m_render_extent.height, 1};
+  cci.mipLevels = 1;
+  cci.arrayLayers = 1;
+  cci.samples = VK_SAMPLE_COUNT_1_BIT;
+  cci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  cci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  cci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  cci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VK_CHECK(vkCreateImage(m_device, &cci, nullptr, &m_ssaa_color));
+  vkGetImageMemoryRequirements(m_device, m_ssaa_color, &req);
+  ai.allocationSize = req.size;
+  ai.memoryTypeIndex = find_memory_type(m_physical_device, req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VK_CHECK(vkAllocateMemory(m_device, &ai, nullptr, &m_ssaa_memory));
+  vkBindImageMemory(m_device, m_ssaa_color, m_ssaa_memory, 0);
+  VkImageViewCreateInfo cvi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  cvi.image = m_ssaa_color;
+  cvi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  cvi.format = m_swapchain_format;
+  cvi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VK_CHECK(vkCreateImageView(m_device, &cvi, nullptr, &m_ssaa_view));
+
+  log_info("SSAA render extent: " + std::to_string(m_render_extent.width) + "x" +
+           std::to_string(m_render_extent.height) + " (scale " +
+           std::to_string(scale) + ")");
   return true;
 }
 
@@ -1229,6 +1270,18 @@ void vulkan_renderer::destroy_depth_resources() {
   if (m_depth_memory) {
     vkFreeMemory(m_device, m_depth_memory, nullptr);
     m_depth_memory = VK_NULL_HANDLE;
+  }
+  if (m_ssaa_view) {
+    vkDestroyImageView(m_device, m_ssaa_view, nullptr);
+    m_ssaa_view = VK_NULL_HANDLE;
+  }
+  if (m_ssaa_color) {
+    vkDestroyImage(m_device, m_ssaa_color, nullptr);
+    m_ssaa_color = VK_NULL_HANDLE;
+  }
+  if (m_ssaa_memory) {
+    vkFreeMemory(m_device, m_ssaa_memory, nullptr);
+    m_ssaa_memory = VK_NULL_HANDLE;
   }
 }
 
@@ -2923,7 +2976,7 @@ bool vulkan_renderer::Render() {
   to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_color.image = image;
+  to_color.image = m_ssaa_color;  // scene renders to the supersampled target
   to_color.subresourceRange = range;
   vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
@@ -2945,7 +2998,7 @@ bool vulkan_renderer::Render() {
 
   VkRenderingAttachmentInfo color_attachment{
       VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-  color_attachment.imageView = view;
+  color_attachment.imageView = m_ssaa_view;  // supersampled scene target
   color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2964,7 +3017,7 @@ bool vulkan_renderer::Render() {
 
   VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
   rendering_info.renderArea.offset = {0, 0};
-  rendering_info.renderArea.extent = m_swapchain_extent;
+  rendering_info.renderArea.extent = m_render_extent;
   rendering_info.layerCount = 1;
   rendering_info.colorAttachmentCount = 1;
   rendering_info.pColorAttachments = &color_attachment;
@@ -2975,15 +3028,15 @@ bool vulkan_renderer::Render() {
   VkViewport viewport{};
   viewport.x = 0.f;
   viewport.y = 0.f;
-  viewport.width = static_cast<float>(m_swapchain_extent.width);
-  viewport.height = static_cast<float>(m_swapchain_extent.height);
+  viewport.width = static_cast<float>(m_render_extent.width);
+  viewport.height = static_cast<float>(m_render_extent.height);
   viewport.minDepth = 0.f;
   viewport.maxDepth = 1.f;
   vkCmdSetViewport(frame.command_buffer, 0, 1, &viewport);
 
   VkRect2D scissor{};
   scissor.offset = {0, 0};
-  scissor.extent = m_swapchain_extent;
+  scissor.extent = m_render_extent;
   vkCmdSetScissor(frame.command_buffer, 0, 1, &scissor);
 
   // Sky fills the background; then rebind the world descriptor sets (the sky
@@ -3000,16 +3053,80 @@ bool vulkan_renderer::Render() {
 
   m_geo_ctx.current_cmd = VK_NULL_HANDLE;
 
-  // Draw the UI into the same pass: render_ui() -> ImGui::Render() -> the
-  // ImGui backend records its draw data into this command buffer.
-  if (m_imgui) {
-    m_imgui->set_current_frame(frame.command_buffer, m_swapchain_extent);
-  }
-  Application.render_ui();
-  if (m_imgui) {
-    m_imgui->set_current_frame(VK_NULL_HANDLE, {});
+  // End the supersampled scene pass.
+  vkCmdEndRendering(frame.command_buffer);
+
+  // SSAA resolve: downscale the supersampled scene onto the swapchain image with
+  // a linear blit (this is the antialiasing), then draw the UI over it at native
+  // resolution so text/lines stay crisp.
+  {
+    VkImageMemoryBarrier pre[2] = {};
+    pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    pre[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre[0].image = m_ssaa_color;
+    pre[0].subresourceRange = range;
+    pre[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    pre[1].srcAccessMask = 0;
+    pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    pre[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre[1].image = image;
+    pre[1].subresourceRange = range;
+    vkCmdPipelineBarrier(frame.command_buffer,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                         2, pre);
+
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<int32_t>(m_render_extent.width),
+                          static_cast<int32_t>(m_render_extent.height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {static_cast<int32_t>(m_swapchain_extent.width),
+                          static_cast<int32_t>(m_swapchain_extent.height), 1};
+    vkCmdBlitImage(frame.command_buffer, m_ssaa_color,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   VK_FILTER_LINEAR);
+
+    VkImageMemoryBarrier toc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toc.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toc.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toc.image = image;
+    toc.subresourceRange = range;
+    vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &toc);
   }
 
+  // UI pass: draw ImGui onto the swapchain at native resolution, keeping the
+  // downscaled scene (loadOp LOAD). render_ui() -> ImGui::Render() records here.
+  VkRenderingAttachmentInfo ui_color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  ui_color.imageView = view;
+  ui_color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  ui_color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  ui_color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo ui_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ui_info.renderArea.extent = m_swapchain_extent;
+  ui_info.layerCount = 1;
+  ui_info.colorAttachmentCount = 1;
+  ui_info.pColorAttachments = &ui_color;
+  vkCmdBeginRendering(frame.command_buffer, &ui_info);
+  if (m_imgui)
+    m_imgui->set_current_frame(frame.command_buffer, m_swapchain_extent);
+  Application.render_ui();
+  if (m_imgui) m_imgui->set_current_frame(VK_NULL_HANDLE, {});
   vkCmdEndRendering(frame.command_buffer);
 
   // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC for presentation.

@@ -333,11 +333,22 @@ class vulkan_renderer : public gfx_renderer {
   std::vector<VkImage> m_swapchain_images;
   std::vector<VkImageView> m_swapchain_image_views;
 
-  // Depth buffer (recreated with the swap chain).
+  // Depth buffer (recreated with the swap chain). Sized at the supersampled
+  // render extent, not the swapchain extent.
   VkFormat m_depth_format = VK_FORMAT_D32_SFLOAT;
   VkImage m_depth_image = VK_NULL_HANDLE;
   VkDeviceMemory m_depth_memory = VK_NULL_HANDLE;
   VkImageView m_depth_view = VK_NULL_HANDLE;
+
+  // SSAA: the scene renders to this offscreen colour target at m_render_extent
+  // (= swapchain extent * m_ssaa_scale per axis), then is blitted/downscaled to
+  // the swapchain (the UI is drawn afterwards at native resolution). scale 1.0
+  // disables supersampling. 2.0 = 2x2 = 4x samples per pixel.
+  float m_ssaa_scale = 2.0f;
+  VkExtent2D m_render_extent = {0, 0};
+  VkImage m_ssaa_color = VK_NULL_HANDLE;
+  VkDeviceMemory m_ssaa_memory = VK_NULL_HANDLE;
+  VkImageView m_ssaa_view = VK_NULL_HANDLE;
 
   VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
   VkPipeline m_pipeline_triangles = VK_NULL_HANDLE;
