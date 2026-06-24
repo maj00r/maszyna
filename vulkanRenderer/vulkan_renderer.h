@@ -412,6 +412,19 @@ class vulkan_renderer : public gfx_renderer {
   VkSampler m_sampler = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_texture_set_layout = VK_NULL_HANDLE;
   VkDescriptorPool m_descriptor_pool = VK_NULL_HANDLE;
+
+  // Bindless textures: one large, partially-bound, update-after-bind sampler
+  // array (set 0 for the world/gbuffer pipelines). Each texture lives at slot
+  // (handle + 1); slot 0 = white default, slot 1 = flat-normal default. Draws
+  // push the diffuse/normal slot indices instead of binding per-material sets.
+  static constexpr uint32_t kBindlessTextures = 8192;
+  static constexpr uint32_t kBindlessWhiteSlot = 0;
+  static constexpr uint32_t kBindlessFlatNormalSlot = 1;
+  VkDescriptorSetLayout m_bindless_layout = VK_NULL_HANDLE;
+  VkDescriptorPool m_bindless_pool = VK_NULL_HANDLE;
+  VkDescriptorSet m_bindless_set = VK_NULL_HANDLE;
+  bool create_bindless();
+  void bindless_write(uint32_t slot, VkImageView view);
   // Set 1: per-frame light/scene uniform buffer (sun + dynamic lights) +
   // the sun shadow map (binding 1).
   VkDescriptorSetLayout m_light_set_layout = VK_NULL_HANDLE;

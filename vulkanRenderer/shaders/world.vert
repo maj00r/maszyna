@@ -11,8 +11,9 @@ layout(location = 2) in vec2 aUV;
 layout(location = 3) in vec4 aTangent;
 
 layout(push_constant) uniform PushConstants {
-  mat4 uLocal;  // offset 0  : camera-relative model matrix
-  vec4 uMisc;   // offset 64 : .x alpha-test threshold, .y emission
+  mat4 uLocal;   // offset 0  : camera-relative model matrix
+  vec4 uMisc;    // offset 64 : .x alpha-test threshold, .y emission, .w mode
+  ivec2 uTex;    // offset 80 : .x diffuse bindless slot, .y normal slot
 } pc;
 
 struct GpuLight {
@@ -43,7 +44,9 @@ layout(location = 4) out float vEmission;
 layout(location = 5) out float vInterior;  // 1 for cab geometry, else 0
 layout(location = 6) out vec3 vTangent;    // world-space TBN basis
 layout(location = 7) out vec3 vBitangent;
-layout(location = 8) out float vHasNormal; // 1 when a real normal map is bound
+layout(location = 8) out float vHasNormal; // 0 none, 1 normalmap, 2 +parallax
+layout(location = 9) flat out int vTexDiffuse;   // bindless slot indices
+layout(location = 10) flat out int vTexNormal;
 
 void main() {
   vec3 camrel = (pc.uLocal * vec4(aPos, 1.0)).xyz;
@@ -58,5 +61,7 @@ void main() {
   vEmission = pc.uMisc.y;
   vInterior = pc.uMisc.z;
   vHasNormal = pc.uMisc.w;
+  vTexDiffuse = pc.uTex.x;
+  vTexNormal = pc.uTex.y;
   gl_Position = u.viewproj * vec4(camrel, 1.0);
 }

@@ -152,6 +152,7 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   if (!create_command_pool()) return false;
   if (!create_default_texture()) return false;  // also creates the set layout
   if (!create_flat_normal()) return false;      // set-2 default (no normal map)
+  if (!create_bindless()) return false;         // big texture array (set 0)
   if (!create_light_layout()) return false;  // set 1 (light/scene UBO + shadow)
   if (!create_shadow_resources()) return false;  // sun shadow map
   if (!create_world_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true,
@@ -335,6 +336,14 @@ void vulkan_renderer::Shutdown() {
     if (m_texture_set_layout) {
       vkDestroyDescriptorSetLayout(m_device, m_texture_set_layout, nullptr);
       m_texture_set_layout = VK_NULL_HANDLE;
+    }
+    if (m_bindless_pool) {
+      vkDestroyDescriptorPool(m_device, m_bindless_pool, nullptr);
+      m_bindless_pool = VK_NULL_HANDLE;
+    }
+    if (m_bindless_layout) {
+      vkDestroyDescriptorSetLayout(m_device, m_bindless_layout, nullptr);
+      m_bindless_layout = VK_NULL_HANDLE;
     }
     if (m_sampler) {
       vkDestroySampler(m_device, m_sampler, nullptr);
@@ -542,12 +551,23 @@ bool vulkan_renderer::create_device() {
 
   VkPhysicalDeviceFeatures features{};
 
+  // Vulkan 1.2 descriptor indexing for bindless textures: one large, partially
+  // bound sampler array updated after bind, indexed per draw by a push constant.
+  VkPhysicalDeviceVulkan12Features features12{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  features12.descriptorIndexing = VK_TRUE;
+  features12.runtimeDescriptorArray = VK_TRUE;
+  features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+  features12.descriptorBindingPartiallyBound = VK_TRUE;
+  features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+
   // Vulkan 1.3 dynamic rendering lets us render straight to swap-chain image
   // views without VkRenderPass/VkFramebuffer objects.
   VkPhysicalDeviceVulkan13Features features13{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
   features13.dynamicRendering = VK_TRUE;
   features13.synchronization2 = VK_TRUE;
+  features13.pNext = &features12;
 
   VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   ci.pNext = &features13;
@@ -1196,16 +1216,16 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   VkPushConstantRange pc_range{};
   pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pc_range.offset = 0;
-  pc_range.size = sizeof(float) * 20;
+  pc_range.size = sizeof(float) * 22;  // mat4 + uMisc(vec4) + uTex(ivec2)
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
-    // set 0 = diffuse, set 1 = light UBO + shadows, set 2 = normal/height map
-    // (same layout as set 0; bound per material for normal/parallax mapping).
-    const VkDescriptorSetLayout set_layouts[3] = {
-        m_texture_set_layout, m_light_set_layout, m_texture_set_layout};
+    // set 0 = bindless texture array, set 1 = light UBO + shadows. Materials are
+    // selected by pushed slot indices, not per-material descriptor binds.
+    const VkDescriptorSetLayout set_layouts[2] = {m_bindless_layout,
+                                                  m_light_set_layout};
     VkPipelineLayoutCreateInfo layout_ci{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout_ci.setLayoutCount = 3;
+    layout_ci.setLayoutCount = 2;
     layout_ci.pSetLayouts = set_layouts;
     layout_ci.pushConstantRangeCount = 1;
     layout_ci.pPushConstantRanges = &pc_range;
@@ -2305,6 +2325,65 @@ bool vulkan_renderer::create_flat_normal() {
   return true;
 }
 
+bool vulkan_renderer::create_bindless() {
+  VkDescriptorSetLayoutBinding b{};
+  b.binding = 0;
+  b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  b.descriptorCount = kBindlessTextures;
+  b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorBindingFlags bflags =
+      VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+  VkDescriptorSetLayoutBindingFlagsCreateInfo bf{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  bf.bindingCount = 1;
+  bf.pBindingFlags = &bflags;
+  VkDescriptorSetLayoutCreateInfo lci{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.pNext = &bf;
+  lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  lci.bindingCount = 1;
+  lci.pBindings = &b;
+  VK_CHECK(
+      vkCreateDescriptorSetLayout(m_device, &lci, nullptr, &m_bindless_layout));
+
+  VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          kBindlessTextures};
+  VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pci.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+  pci.maxSets = 1;
+  pci.poolSizeCount = 1;
+  pci.pPoolSizes = &ps;
+  VK_CHECK(vkCreateDescriptorPool(m_device, &pci, nullptr, &m_bindless_pool));
+
+  VkDescriptorSetAllocateInfo dsai{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dsai.descriptorPool = m_bindless_pool;
+  dsai.descriptorSetCount = 1;
+  dsai.pSetLayouts = &m_bindless_layout;
+  VK_CHECK(vkAllocateDescriptorSets(m_device, &dsai, &m_bindless_set));
+
+  bindless_write(kBindlessWhiteSlot, m_white_view);
+  bindless_write(kBindlessFlatNormalSlot, m_flat_normal_view);
+  return true;
+}
+
+void vulkan_renderer::bindless_write(uint32_t slot, VkImageView view) {
+  if (view == VK_NULL_HANDLE || m_bindless_set == VK_NULL_HANDLE) return;
+  VkDescriptorImageInfo ii{};
+  ii.sampler = m_sampler;
+  ii.imageView = view;
+  ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = m_bindless_set;
+  w.dstBinding = 0;
+  w.dstArrayElement = slot;
+  w.descriptorCount = 1;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  w.pImageInfo = &ii;
+  vkUpdateDescriptorSets(m_device, 1, &w, 0, nullptr);
+}
+
 texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
                                               bool const /*Loadnow*/,
                                               GLint /*format_hint*/) {
@@ -2365,6 +2444,10 @@ texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
           view.m_id = reinterpret_cast<std::size_t>(tex.descriptor);
           m_itextures.push_back(view);
           handle = static_cast<texture_handle>(m_textures.size());  // 1-based
+          // Register into the bindless array at slot (handle + 1); draws sample
+          // it by that index (slots 0/1 are the white/flat-normal defaults).
+          const uint32_t slot = static_cast<uint32_t>(handle) + 1;
+          if (slot < kBindlessTextures) bindless_write(slot, tex.view);
         }
       }
     }
@@ -2376,32 +2459,34 @@ texture_handle vulkan_renderer::Fetch_Texture(std::string const &Filename,
 
 void vulkan_renderer::bind_material(material_handle material,
                                     VkCommandBuffer cmd) {
-  VkDescriptorSet d = material_texture_descriptor(material);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          m_pipeline_layout, 0, 1, &d, 0, nullptr);
-  // set 2 = normal/height map (or the flat-normal default). When real, the
-  // fragment does normal mapping (uMisc.w flag).
-  VkDescriptorSet nd = material_normal_descriptor(material);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          m_pipeline_layout, 2, 1, &nd, 0, nullptr);
-  // Opacity: <1 only for materials flagged translucent (glass), so opaque
-  // materials are unaffected.
-  // uMisc.x carries the material's alpha-test threshold (MaSzyna 'opacity':
-  // texels with alpha below it are discarded). get_or_guess_opacity() returns
-  // 0 for alpha-blended atlases, ~0.5 for alpha-cutout, and is irrelevant for
-  // fully opaque textures (sampled alpha is 1). It is NOT a coverage multiplier.
+  // Bindless: no per-material descriptor binds. Push the diffuse/normal slot
+  // indices into the big texture array plus the material misc. uMisc.x is the
+  // alpha-test threshold (0 for blended atlases, ~0.5 for cutout); uMisc.w is
+  // the detail mode (0 none, 1 normal map, 2 normal map + parallax).
   float alpha_ref = 0.f;
-  if (material != null_handle)
-    alpha_ref = m_material_manager.material(material).get_or_guess_opacity();
-  // uMisc.w encodes the surface-detail mode for the fragment shader:
-  //   0 = none (geometric normal), 1 = normal mapping,
-  //   2 = normal mapping + parallax/displacement (height in the normal map .b).
+  int32_t diff = static_cast<int32_t>(kBindlessWhiteSlot);
+  int32_t norm = static_cast<int32_t>(kBindlessFlatNormalSlot);
   float detail_mode = 0.f;
-  if (nd != m_flat_normal_descriptor)
-    detail_mode = material_has_parallax(material) ? 2.f : 1.f;
+  if (material != null_handle) {
+    const opengl_material &mat = m_material_manager.material(material);
+    alpha_ref = mat.get_or_guess_opacity();
+    const texture_handle dt = mat.GetTexture(0);
+    if (dt != null_handle &&
+        static_cast<uint32_t>(dt) + 1 < kBindlessTextures)
+      diff = static_cast<int32_t>(dt) + 1;
+    const texture_handle nt = mat.GetTexture(1);
+    if (nt != null_handle &&
+        static_cast<uint32_t>(nt) + 1 < kBindlessTextures) {
+      norm = static_cast<int32_t>(nt) + 1;
+      detail_mode = material_has_parallax(material) ? 2.f : 1.f;
+    }
+  }
   const glm::vec4 misc(alpha_ref, 0.f, 0.f, detail_mode);
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                     sizeof(float) * 16, sizeof(misc), &misc);  // uMisc @ offset 64
+                     sizeof(float) * 16, sizeof(misc), &misc);  // uMisc @ 64
+  const int32_t idx[2] = {diff, norm};
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 20, sizeof(idx), idx);  // uTex @ 80
 }
 
 VkDescriptorSet vulkan_renderer::material_texture_descriptor(
@@ -3362,22 +3447,25 @@ bool vulkan_renderer::Render() {
   // shadow and main passes (rebound after the sky, whose layout differs). Also
   // seed uMisc so draws before the first bind_material() are well-defined.
   auto bind_world_sets = [&]() {
+    // set 0 = bindless texture array (materials select slots via push); set 1 =
+    // per-frame light UBO + shadow maps.
     vkCmdBindDescriptorSets(frame.command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout, 0,
-                            1, &m_white_descriptor, 0, nullptr);
+                            1, &m_bindless_set, 0, nullptr);
     vkCmdBindDescriptorSets(frame.command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout, 1,
                             1, &frame.light_descriptor, 0, nullptr);
-    // set 2 default = flat normal; bind_material() overrides it per material.
-    vkCmdBindDescriptorSets(frame.command_buffer,
-                            VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout, 2,
-                            1, &m_flat_normal_descriptor, 0, nullptr);
   };
   bind_world_sets();
   const glm::vec4 misc_default(0.f);
   vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
                      VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 16,
                      sizeof(misc_default), &misc_default);
+  const int32_t idx_default[2] = {static_cast<int32_t>(kBindlessWhiteSlot),
+                                  static_cast<int32_t>(kBindlessFlatNormalSlot)};
+  vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 20,
+                     sizeof(idx_default), idx_default);
 
   // --- cascaded sun shadow depth passes (camera-relative, same frame) ---
   {
