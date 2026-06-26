@@ -550,6 +550,7 @@ bool vulkan_renderer::create_device() {
   const char *device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
   VkPhysicalDeviceFeatures features{};
+  features.samplerAnisotropy = VK_TRUE;  // anisotropic texture filtering
 
   // Vulkan 1.2 descriptor indexing for bindless textures: one large, partially
   // bound sampler array updated after bind, indexed per draw by a push constant.
@@ -764,6 +765,7 @@ struct LightUBO {
   glm::mat4 lightspace[kCascades + 1]; // [0..2] sun cascades, [3] cab light
   glm::vec4 cascade_splits;            // .xyz: far distance of each cascade
   glm::vec4 cab_light;                 // xyz: camera-relative pos, w: enable
+  glm::vec4 fog;                       // rgb: fog colour, a: 1/range (density)
   glm::ivec4 count;
   GpuLight lights[kMaxLights];
 };
@@ -924,6 +926,10 @@ void vulkan_renderer::update_lights(const glm::mat4 &viewproj,
   ubo.sun_dir = glm::vec4(Global.DayLight.direction, 0.f);
   ubo.sun_color = Global.DayLight.diffuse;
   ubo.ambient = Global.DayLight.ambient;
+  // Distance fog: blend to the horizon colour over the sim's visibility range
+  // (fFogEnd shrinks in fog/rain weather, so fog appears then).
+  ubo.fog = glm::vec4(glm::vec3(Global.FogColor),
+                      std::max(1.f, static_cast<float>(Global.fFogEnd)));
   // Cab interior glow (only applied to cab geometry, via the per-draw flag).
   // Like the GL renderer it fades in as the scene darkens, so it doesn't blow
   // out the (often brightly painted) cab in daylight.
@@ -1216,7 +1222,7 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   VkPushConstantRange pc_range{};
   pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pc_range.offset = 0;
-  pc_range.size = sizeof(float) * 22;  // mat4 + uMisc(vec4) + uTex(ivec2)
+  pc_range.size = sizeof(float) * 23;  // mat4 + uMisc + uTex(ivec2) + uGloss
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
     // set 0 = bindless texture array, set 1 = light UBO + shadows. Materials are
@@ -1884,7 +1890,12 @@ bool vulkan_renderer::create_default_texture() {
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.maxLod = VK_LOD_CLAMP_NONE;
-    sci.maxAnisotropy = 1.f;
+    // Anisotropic filtering (needs the mip chain to do much): sharpens textures
+    // viewed at grazing angles (rails, ground, long surfaces).
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(m_physical_device, &props);
+    sci.anisotropyEnable = VK_TRUE;
+    sci.maxAnisotropy = std::min(16.f, props.limits.maxSamplerAnisotropy);
     VK_CHECK(vkCreateSampler(m_device, &sci, nullptr, &m_sampler));
   }
 
@@ -2129,9 +2140,10 @@ bool vulkan_renderer::create_frame_resources() {
 
 namespace {
 struct decoded_image {
-  std::vector<uint8_t> pixels;  // raw or BC-compressed mip-0 data
+  std::vector<uint8_t> pixels;  // mip chain, concatenated mip 0..mip_levels-1
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t mip_levels = 1;  // how many mips are present in `pixels`
   VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
@@ -2165,13 +2177,28 @@ bool decode_dds(const std::string &path, decoded_image &out) {
   } else {
     return false;
   }
-  const uint32_t bw = std::max(1u, (width + 3) / 4);
-  const uint32_t bh = std::max(1u, (height + 3) / 4);
-  const size_t mip0 = static_cast<size_t>(bw) * bh * blockbytes;
-  if (b.size() < 128 + mip0) return false;
+  // Read the whole mip chain the file carries (BC can't be downscaled on the
+  // GPU, so we rely on the precomputed mips in the .dds).
+  uint32_t mipcount = rd32(28);  // dwMipMapCount
+  if (mipcount == 0) mipcount = 1;
+  size_t total = 0;
+  uint32_t levels = 0;
+  for (uint32_t i = 0; i < mipcount; ++i) {
+    const uint32_t w = std::max(1u, width >> i);
+    const uint32_t h = std::max(1u, height >> i);
+    const size_t sz =
+        static_cast<size_t>(std::max(1u, (w + 3) / 4)) *
+        std::max(1u, (h + 3) / 4) * blockbytes;
+    if (b.size() < 128 + total + sz) break;  // truncated; stop at what we have
+    total += sz;
+    ++levels;
+    if (w == 1 && h == 1) break;
+  }
+  if (levels == 0) return false;
   out.width = width;
   out.height = height;
-  out.pixels.assign(b.begin() + 128, b.begin() + 128 + mip0);
+  out.mip_levels = levels;
+  out.pixels.assign(b.begin() + 128, b.begin() + 128 + total);
   return true;
 }
 
@@ -2217,15 +2244,43 @@ bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
     vkUnmapMemory(dev, staging_mem);
   }
 
+  // Mip levels: use the chain provided in the file (DDS); otherwise generate a
+  // full chain by blitting (only for blittable/uncompressed formats).
+  const bool blittable = (src.format == VK_FORMAT_R8G8B8A8_UNORM);
+  uint32_t full_levels = 1;
+  for (uint32_t d = std::max(src.width, src.height); d > 1; d >>= 1) ++full_levels;
+  uint32_t mip_levels;
+  bool generate;
+  if (src.mip_levels > 1) {
+    mip_levels = src.mip_levels;  // precomputed chain in the file
+    generate = false;
+  } else if (blittable) {
+    mip_levels = full_levels;
+    generate = true;
+  } else {
+    mip_levels = 1;
+    generate = false;
+  }
+  auto level_bytes = [&](uint32_t lvl) -> size_t {
+    const uint32_t w = std::max(1u, src.width >> lvl);
+    const uint32_t h = std::max(1u, src.height >> lvl);
+    if (blittable) return static_cast<size_t>(w) * h * 4;
+    const uint32_t bb =
+        (src.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) ? 8u : 16u;
+    return static_cast<size_t>(std::max(1u, (w + 3) / 4)) *
+           std::max(1u, (h + 3) / 4) * bb;
+  };
+
   VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ici.imageType = VK_IMAGE_TYPE_2D;
   ici.format = src.format;
   ici.extent = {src.width, src.height, 1};
-  ici.mipLevels = 1;
+  ici.mipLevels = mip_levels;
   ici.arrayLayers = 1;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VK_CHECK(vkCreateImage(dev, &ici, nullptr, &image));
@@ -2251,6 +2306,7 @@ bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
   bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(cmd, &bbi);
 
+  const uint32_t upload_levels = generate ? 1u : mip_levels;
   VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
   to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2258,23 +2314,93 @@ bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
   to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.image = image;
-  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                        1, &to_dst);
-  VkBufferImageCopy region{};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {src.width, src.height, 1};
+
+  // Copy the uploaded mip(s) from the staging buffer.
+  std::vector<VkBufferImageCopy> copies;
+  size_t off = 0;
+  for (uint32_t i = 0; i < upload_levels; ++i) {
+    VkBufferImageCopy r{};
+    r.bufferOffset = off;
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+    r.imageExtent = {std::max(1u, src.width >> i), std::max(1u, src.height >> i),
+                     1};
+    copies.push_back(r);
+    off += level_bytes(i);
+  }
   vkCmdCopyBufferToImage(cmd, staging, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-  VkImageMemoryBarrier to_read = to_dst;
-  to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         static_cast<uint32_t>(copies.size()), copies.data());
+
+  if (generate) {
+    // Blit-generate the chain: each level is a linear downscale of the previous.
+    int32_t mw = static_cast<int32_t>(src.width);
+    int32_t mh = static_cast<int32_t>(src.height);
+    for (uint32_t i = 1; i < mip_levels; ++i) {
+      VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      b.image = image;
+      b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1};
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &b);
+      const int32_t nw = mw > 1 ? mw / 2 : 1;
+      const int32_t nh = mh > 1 ? mh / 2 : 1;
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+      blit.srcOffsets[1] = {mw, mh, 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+      blit.dstOffsets[1] = {nw, nh, 1};
+      vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     VK_FILTER_LINEAR);
+      mw = nw;
+      mh = nh;
+    }
+  }
+
+  // Everything -> shader-read. Levels written as DST (or, when generated, all
+  // but the last are SRC) need the right old layout, so do it in two ranges.
+  VkImageMemoryBarrier to_read[2] = {};
+  uint32_t nbarriers = 0;
+  if (generate && mip_levels > 1) {
+    to_read[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_read[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_read[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_read[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_read[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read[0].image = image;
+    to_read[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels - 1,
+                                   0, 1};
+    to_read[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_read[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_read[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read[1].image = image;
+    to_read[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip_levels - 1, 1,
+                                   0, 1};
+    nbarriers = 2;
+  } else {
+    to_read[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_read[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_read[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read[0].image = image;
+    to_read[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0,
+                                   1};
+    nbarriers = 1;
+  }
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &to_read);
+                       nullptr, nbarriers, to_read);
   vkEndCommandBuffer(cmd);
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
@@ -2289,7 +2415,7 @@ bool make_texture_image(VkPhysicalDevice pd, VkDevice dev, VkCommandPool pool,
   vci.image = image;
   vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
   vci.format = src.format;
-  vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
   VK_CHECK(vkCreateImageView(dev, &vci, nullptr, &view));
   return true;
 }
@@ -2467,9 +2593,11 @@ void vulkan_renderer::bind_material(material_handle material,
   int32_t diff = static_cast<int32_t>(kBindlessWhiteSlot);
   int32_t norm = static_cast<int32_t>(kBindlessFlatNormalSlot);
   float detail_mode = 0.f;
+  float gloss = 16.f;
   if (material != null_handle) {
     const opengl_material &mat = m_material_manager.material(material);
     alpha_ref = mat.get_or_guess_opacity();
+    gloss = mat.glossiness;
     const texture_handle dt = mat.GetTexture(0);
     if (dt != null_handle &&
         static_cast<uint32_t>(dt) + 1 < kBindlessTextures)
@@ -2487,6 +2615,8 @@ void vulkan_renderer::bind_material(material_handle material,
   const int32_t idx[2] = {diff, norm};
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                      sizeof(float) * 20, sizeof(idx), idx);  // uTex @ 80
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 22, sizeof(gloss), &gloss);  // uGloss @ 88
 }
 
 VkDescriptorSet vulkan_renderer::material_texture_descriptor(
@@ -3466,6 +3596,10 @@ bool vulkan_renderer::Render() {
   vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
                      VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 20,
                      sizeof(idx_default), idx_default);
+  const float gloss_default = 16.f;
+  vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
+                     VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 22,
+                     sizeof(gloss_default), &gloss_default);
 
   // --- cascaded sun shadow depth passes (camera-relative, same frame) ---
   {

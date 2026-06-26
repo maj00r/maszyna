@@ -15,12 +15,13 @@ layout(location = 7) in vec3 vBitangent;
 layout(location = 8) in float vHasNormal;
 layout(location = 9) flat in int vTexDiffuse;
 layout(location = 10) flat in int vTexNormal;
+layout(location = 11) in float vGloss;
 
 layout(set = 0, binding = 0) uniform sampler2D uTextures[8192];  // bindless
 
 layout(location = 0) out vec4 oAlbedo;    // rgb albedo, a emission strength
 layout(location = 1) out vec4 oNormal;    // rgb world normal, a interior flag
-layout(location = 2) out vec4 oPosition;  // rgb camera-relative position, a = 1
+layout(location = 2) out vec4 oPosition;  // rgb camera-rel position, a glossiness
 
 const float HEIGHT_SCALE = 0.05;
 vec2 parallax_uv(vec2 uv, vec3 viewDir) {
@@ -67,5 +68,6 @@ void main() {
 
   oAlbedo = vec4(tex.rgb, vEmission);
   oNormal = vec4(n, vInterior);
-  oPosition = vec4(vCamRel, 1.0);
+  // a >= 1 doubles as the "has geometry" marker the lighting pass tests.
+  oPosition = vec4(vCamRel, max(vGloss, 1.0));
 }

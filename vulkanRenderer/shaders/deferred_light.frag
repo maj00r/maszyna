@@ -26,6 +26,7 @@ layout(set = 1, binding = 0) uniform LightData {
   mat4 lightspace[4];
   vec4 cascade_splits;
   vec4 cab_light;
+  vec4 fog;
   ivec4 count;
   GpuLight lights[8];
 } u;
@@ -138,5 +139,18 @@ void main() {
     light += u.lights[i].color.rgb * (ndlp * atten * spot);
   }
 
-  outColor = vec4(alb.rgb * (light + emission), 1.0);
+  // Specular highlight from the sun (Blinn-Phong; glossiness from G-buffer .a).
+  vec3 V = normalize(-camrel);
+  vec3 Ls = normalize(-u.sun_dir.xyz);
+  vec3 H = normalize(Ls + V);
+  float gloss = max(pos.a, 1.0);
+  float spec = pow(max(dot(n, H), 0.0), gloss) * shadow * step(0.0, dot(n, Ls));
+  vec3 color = alb.rgb * (light + emission) + u.sun_color.rgb * (spec * 0.35);
+
+  // Distance fog: blend to the horizon colour over the visibility range.
+  float fdist = length(camrel);
+  float fogf = 1.0 - exp(-pow(fdist * 1.5 / max(u.fog.a, 1.0), 2.0));
+  color = mix(color, u.fog.rgb, clamp(fogf, 0.0, 1.0));
+
+  outColor = vec4(color, 1.0);
 }

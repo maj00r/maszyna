@@ -11,6 +11,7 @@ layout(location = 7) in vec3 vBitangent;
 layout(location = 8) in float vHasNormal;
 layout(location = 9) flat in int vTexDiffuse;
 layout(location = 10) flat in int vTexNormal;
+layout(location = 11) in float vGloss;
 
 layout(set = 0, binding = 0) uniform sampler2D uTextures[8192];  // bindless
 
@@ -30,6 +31,7 @@ layout(set = 1, binding = 0) uniform LightData {
   mat4 lightspace[4];
   vec4 cascade_splits;
   vec4 cab_light;        // xyz: camera-relative pos, w: enable
+  vec4 fog;              // rgb: fog colour, a: visibility range
   ivec4 count;
   GpuLight lights[8];
 } u;

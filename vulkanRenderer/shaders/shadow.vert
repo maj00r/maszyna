@@ -30,6 +30,7 @@ layout(set = 1, binding = 0) uniform LightData {
   mat4 lightspace[4];
   vec4 cascade_splits;
   vec4 cab_light;
+  vec4 fog;
   ivec4 count;
   GpuLight lights[8];
 } u;
