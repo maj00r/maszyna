@@ -11,10 +11,11 @@ layout(location = 2) in vec2 aUV;
 layout(location = 3) in vec4 aTangent;
 
 layout(push_constant) uniform PushConstants {
-  mat4 uLocal;   // offset 0  : camera-relative model matrix
-  vec4 uMisc;    // offset 64 : .x alpha-test threshold, .y emission, .w mode
-  ivec2 uTex;    // offset 80 : .x diffuse bindless slot, .y normal slot
-  float uGloss;  // offset 88 : material glossiness (specular exponent)
+  mat4 uLocal;        // offset 0  : submodel-local (or full camera-rel) matrix
+  vec4 uMisc;         // offset 64 : .x alpha-test threshold, .y emission, .w mode
+  ivec2 uTex;         // offset 80 : .x diffuse bindless slot, .y normal slot
+  float uGloss;       // offset 88 : material glossiness (specular exponent)
+  int uInstanceBase;  // offset 92 : first slot in the instance matrix buffer
 } pc;
 
 struct GpuLight {
@@ -38,6 +39,13 @@ layout(set = 1, binding = 0) uniform LightData {
   GpuLight lights[8];
 } u;
 
+// Per-instance camera-relative root matrices, indexed by gl_InstanceIndex.
+// Slot 0 is kept at identity, so non-instanced draws (uInstanceBase = 0,
+// instanceCount = 1) fall through with uLocal already in camera space.
+layout(set = 1, binding = 3) readonly buffer InstanceData {
+  mat4 m[];
+} inst;
+
 layout(location = 0) out vec3 vCamRel;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
@@ -52,9 +60,10 @@ layout(location = 10) flat out int vTexNormal;
 layout(location = 11) out float vGloss;          // material glossiness
 
 void main() {
-  vec3 camrel = (pc.uLocal * vec4(aPos, 1.0)).xyz;
+  mat4 world = inst.m[pc.uInstanceBase + gl_InstanceIndex] * pc.uLocal;
+  vec3 camrel = (world * vec4(aPos, 1.0)).xyz;
   vCamRel = camrel;
-  mat3 m = mat3(pc.uLocal);
+  mat3 m = mat3(world);
   vNormal = m * aNormal;
   vTangent = m * aTangent.xyz;
   // Bitangent from N x T with the stored handedness (aTangent.w).

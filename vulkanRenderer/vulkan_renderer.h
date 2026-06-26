@@ -59,6 +59,9 @@ struct vulkan_geometry_context {
   VkPipeline gbuffer_pipeline_triangles = VK_NULL_HANDLE;
   VkPipeline gbuffer_pipeline_strips = VK_NULL_HANDLE;
   VkPipeline gbuffer_pipeline_fans = VK_NULL_HANDLE;
+  // Instance count for the next chunk draw: >1 routes draw() through an
+  // instanced draw call (gl_InstanceIndex selects the per-instance matrix).
+  uint32_t instance_count = 1;
   bool pick_mode = false;
   bool translucent_mode = false;
   bool shadow_mode = false;
@@ -306,6 +309,14 @@ class vulkan_renderer : public gfx_renderer {
                   const glm::mat4 &rot, const glm::mat4 &proj,
                   const std::set<TDynamicObject *> &consist,
                   TDynamicObject *player, VkCommandBuffer cmd);
+  // GPU-instanced draw of one bucket (same model + skins): builds the per-
+  // instance root matrices, uploads them, and traverses the submodel tree once
+  // per sub-batch with instanceCount = batch. fplanes (or null) frustum-culls.
+  void render_instanced_bucket(TModel3d *model, const material_handle *skins,
+                               const std::vector<TAnimModel *> &instances,
+                               const glm::dvec3 &campos, const glm::mat4 &rot,
+                               const glm::mat4 &proj, bool translucent_pass,
+                               const glm::vec4 *fplanes, VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
   void recreate_swapchain();
@@ -320,6 +331,11 @@ class vulkan_renderer : public gfx_renderer {
     VkDeviceMemory light_ubo_memory = VK_NULL_HANDLE;
     void *light_ubo_mapped = nullptr;
     VkDescriptorSet light_descriptor = VK_NULL_HANDLE;
+    // Per-frame instance matrix storage buffer (set 1, binding 3), persistently
+    // mapped; filled per batch by the instanced-draw flush.
+    VkBuffer instance_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory instance_memory = VK_NULL_HANDLE;
+    void *instance_mapped = nullptr;
   };
 
   // Fills frame's light/scene UBO (set 1) from the sun + simulation::Lights.
@@ -476,6 +492,13 @@ class vulkan_renderer : public gfx_renderer {
       m_pick_callbacks;
   TSubModel const *m_pick_control = nullptr;
   std::vector<TSubModel const *> m_pick_submodels;
+
+  // Instanced-draw scratch: current frame's mapped instance buffer, the next
+  // free matrix slot this frame (slot 0 stays identity), and a reused staging
+  // vector of per-instance matrices.
+  void *m_instance_mapped = nullptr;
+  uint32_t m_instance_cursor = 0;
+  std::vector<glm::mat4> m_instance_matrices;
 
   // Gradient skydome: a flat-colour pipeline + position/colour/index buffers
   // filled from simulation::Environment.skydome(). Colours are host-visible and

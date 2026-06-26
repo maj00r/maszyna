@@ -10,8 +10,11 @@ layout(location = 2) in vec2 aUV;
 layout(location = 3) in vec4 aTangent;
 
 layout(push_constant) uniform PushConstants {
-  mat4 uLocal;
-  vec4 uMisc;
+  mat4 uLocal;        // offset 0
+  vec4 uMisc;         // offset 64 : .w = shadow layer being rendered
+  ivec2 uTex;         // offset 80 : unused here, keeps the shared layout aligned
+  float uGloss;       // offset 88 : unused here
+  int uInstanceBase;  // offset 92 : first slot in the instance matrix buffer
 } pc;
 
 struct GpuLight {
@@ -35,9 +38,16 @@ layout(set = 1, binding = 0) uniform LightData {
   GpuLight lights[8];
 } u;
 
+// Per-instance camera-relative root matrices (slot 0 = identity for the
+// non-instanced path); must match world.vert's binding for the shared layout.
+layout(set = 1, binding = 3) readonly buffer InstanceData {
+  mat4 m[];
+} inst;
+
 void main() {
   // uMisc.w carries the shadow layer being rendered (sun cascade 0..2 or the
   // cab light at 3), set per layer by the shadow pass.
   int layer = int(pc.uMisc.w + 0.5);
-  gl_Position = u.lightspace[layer] * (pc.uLocal * vec4(aPos, 1.0));
+  mat4 world = inst.m[pc.uInstanceBase + gl_InstanceIndex] * pc.uLocal;
+  gl_Position = u.lightspace[layer] * (world * vec4(aPos, 1.0));
 }

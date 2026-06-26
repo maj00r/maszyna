@@ -268,6 +268,10 @@ void vulkan_renderer::Shutdown() {
       if (f.in_flight) vkDestroyFence(m_device, f.in_flight, nullptr);
       if (f.light_ubo) vkDestroyBuffer(m_device, f.light_ubo, nullptr);
       if (f.light_ubo_memory) vkFreeMemory(m_device, f.light_ubo_memory, nullptr);
+      if (f.instance_buffer)
+        vkDestroyBuffer(m_device, f.instance_buffer, nullptr);
+      if (f.instance_memory)
+        vkFreeMemory(m_device, f.instance_memory, nullptr);
     }
     m_frames.clear();
     if (m_light_pool) vkDestroyDescriptorPool(m_device, m_light_pool, nullptr);
@@ -749,6 +753,10 @@ VkShaderModule vulkan_renderer::create_shader_module(const uint32_t *code,
 namespace {
 constexpr int kMaxLights = 8;
 constexpr int kCascades = 3;  // must match vulkan_renderer::kShadowCascades
+// Instanced draws: total mat4 slots in the per-frame instance buffer (slot 0 is
+// reserved as identity for the non-instanced path), and the per-batch cap.
+constexpr uint32_t kInstanceCapacity = 16384;
+constexpr uint32_t kMaxInstancesPerBatch = 256;
 // std140-compatible layout shared with world.vert/world.frag (set 1).
 struct GpuLight {
   glm::vec4 pos;    // xyz: camera-relative position, w: 1 = spot
@@ -772,7 +780,7 @@ struct LightUBO {
 }  // namespace
 
 bool vulkan_renderer::create_light_layout() {
-  VkDescriptorSetLayoutBinding bindings[3]{};
+  VkDescriptorSetLayoutBinding bindings[4]{};
   bindings[0].binding = 0;  // light/scene UBO
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -786,20 +794,25 @@ bool vulkan_renderer::create_light_layout() {
   bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   bindings[2].descriptorCount = 1;
   bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  bindings[3].binding = 3;  // per-instance root matrices (instanced draws)
+  bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[3].descriptorCount = 1;
+  bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   VkDescriptorSetLayoutCreateInfo dlci{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  dlci.bindingCount = 3;
+  dlci.bindingCount = 4;
   dlci.pBindings = bindings;
   VK_CHECK(
       vkCreateDescriptorSetLayout(m_device, &dlci, nullptr, &m_light_set_layout));
 
-  VkDescriptorPoolSize ps[2] = {
+  VkDescriptorPoolSize ps[3] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 2}};
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 2},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxFramesInFlight}};
   VkDescriptorPoolCreateInfo dpci{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpci.maxSets = kMaxFramesInFlight;
-  dpci.poolSizeCount = 2;
+  dpci.poolSizeCount = 3;
   dpci.pPoolSizes = ps;
   VK_CHECK(vkCreateDescriptorPool(m_device, &dpci, nullptr, &m_light_pool));
   return true;
@@ -1222,7 +1235,7 @@ bool vulkan_renderer::create_world_pipeline(VkPrimitiveTopology topology,
   VkPushConstantRange pc_range{};
   pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pc_range.offset = 0;
-  pc_range.size = sizeof(float) * 23;  // mat4 + uMisc + uTex(ivec2) + uGloss
+  pc_range.size = sizeof(float) * 24;  // + uGloss + uInstanceBase (@92)
 
   if (m_pipeline_layout == VK_NULL_HANDLE) {
     // set 0 = bindless texture array, set 1 = light UBO + shadows. Materials are
@@ -1850,13 +1863,14 @@ std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
 
   VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(m_ctx->current_cmd, 0, 1, &g.vbuf, &offset);
+  const uint32_t instances = m_ctx->instance_count;  // >1 for batched draws
   if (g.index_count > 0) {
     vkCmdBindIndexBuffer(m_ctx->current_cmd, g.ibuf, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(m_ctx->current_cmd, g.index_count, 1, 0, 0, 0);
-    return g.index_count / 3;
+    vkCmdDrawIndexed(m_ctx->current_cmd, g.index_count, instances, 0, 0, 0);
+    return (g.index_count / 3) * instances;
   }
-  vkCmdDraw(m_ctx->current_cmd, g.vertex_count, 1, 0, 0);
-  return g.vertex_count / 3;
+  vkCmdDraw(m_ctx->current_cmd, g.vertex_count, instances, 0, 0);
+  return (g.vertex_count / 3) * instances;
 }
 
 void vulkan_renderer::recreate_swapchain() {
@@ -2091,6 +2105,28 @@ bool vulkan_renderer::create_frame_resources() {
     vkMapMemory(m_device, f.light_ubo_memory, 0, sizeof(LightUBO), 0,
                 &f.light_ubo_mapped);
 
+    // Per-frame instance matrix buffer (host-visible, persistently mapped). The
+    // instanced-draw flush writes one region per batch and indexes it via the
+    // uInstanceBase push constant.
+    const VkDeviceSize inst_size =
+        static_cast<VkDeviceSize>(kInstanceCapacity) * sizeof(glm::mat4);
+    VkBufferCreateInfo ibi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    ibi.size = inst_size;
+    ibi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    ibi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(m_device, &ibi, nullptr, &f.instance_buffer));
+    VkMemoryRequirements ireq;
+    vkGetBufferMemoryRequirements(m_device, f.instance_buffer, &ireq);
+    VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    imai.allocationSize = ireq.size;
+    imai.memoryTypeIndex = find_memory_type(
+        m_physical_device, ireq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(m_device, &imai, nullptr, &f.instance_memory));
+    vkBindBufferMemory(m_device, f.instance_buffer, f.instance_memory, 0);
+    vkMapMemory(m_device, f.instance_memory, 0, inst_size, 0, &f.instance_mapped);
+
     VkDescriptorSetAllocateInfo dsai{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = m_light_pool;
@@ -2106,7 +2142,9 @@ bool vulkan_renderer::create_frame_resources() {
     sir.sampler = m_shadow_sampler_raw;
     sir.imageView = m_shadow_array_view;
     sir.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet writes[3] = {
+    VkDescriptorBufferInfo idbi{f.instance_buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[4] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -2125,7 +2163,12 @@ bool vulkan_renderer::create_frame_resources() {
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[2].pImageInfo = &sir;
-    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+    writes[3].dstSet = f.light_descriptor;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &idbi;
+    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
   }
   return true;
 }
@@ -3312,11 +3355,89 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
                     interior, cmd, instrument);
 }
 
+void vulkan_renderer::render_instanced_bucket(
+    TModel3d *model, const material_handle *skins,
+    const std::vector<TAnimModel *> &instances, const glm::dvec3 &campos,
+    const glm::mat4 &rot, const glm::mat4 &proj, bool translucent_pass,
+    const glm::vec4 *fplanes, VkCommandBuffer cmd) {
+  if (model == nullptr || model->Root == nullptr || instances.empty()) return;
+  if (m_instance_mapped == nullptr) return;
+
+  // Build the camera-relative root matrix for each visible instance, matching
+  // render_instance's transform (translate * rotate per axis; no scale).
+  m_instance_matrices.clear();
+  float closest = 1e30f;
+  for (auto *inst : instances) {
+    if (inst == nullptr || !inst->m_visible) continue;
+    const glm::dvec3 off = inst->location() - campos;
+    const glm::vec3 c(off);
+    if (fplanes != nullptr) {
+      const float r = static_cast<float>(inst->radius());
+      bool in = true;
+      for (int i = 0; i < 6; ++i)
+        if (glm::dot(glm::vec3(fplanes[i]), c) + fplanes[i].w < -r) {
+          in = false;
+          break;
+        }
+      if (!in) continue;
+    }
+    glm::mat4 m = glm::translate(glm::mat4(1.f), c);
+    const glm::vec3 ang = inst->vAngle;
+    if (ang.y != 0.f) m = glm::rotate(m, glm::radians(ang.y), glm::vec3(0, 1, 0));
+    if (ang.x != 0.f) m = glm::rotate(m, glm::radians(ang.x), glm::vec3(1, 0, 0));
+    if (ang.z != 0.f) m = glm::rotate(m, glm::radians(ang.z), glm::vec3(0, 0, 1));
+    m_instance_matrices.push_back(m);
+    closest = std::min(
+        closest, glm::length2(c / static_cast<float>(Global.ZoomFactor)));
+  }
+  if (m_instance_matrices.empty()) return;
+
+  TSubModel::fSquareDist = closest;  // shared global, drives submodel LOD gating
+  const glm::mat4 identity(1.f);
+  auto *const slots = static_cast<glm::mat4 *>(m_instance_mapped);
+
+  const size_t total = m_instance_matrices.size();
+  size_t done = 0;
+  while (done < total) {
+    size_t batch = std::min<size_t>(total - done, kMaxInstancesPerBatch);
+    if (m_instance_cursor + batch > kInstanceCapacity)
+      batch = kInstanceCapacity - m_instance_cursor;  // buffer full this frame
+    if (batch == 0) break;
+    const uint32_t base = m_instance_cursor;
+    std::memcpy(slots + base, m_instance_matrices.data() + done,
+                batch * sizeof(glm::mat4));
+    m_instance_cursor += static_cast<uint32_t>(batch);
+
+    // uInstanceBase @ offset 92: the shader reads inst.m[base + gl_InstanceIndex].
+    const int32_t ibase = static_cast<int32_t>(base);
+    vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       sizeof(float) * 23, sizeof(ibase), &ibase);
+    m_geo_ctx.instance_count = static_cast<uint32_t>(batch);
+    render_submodel(model->Root, identity, rot, proj, skins, translucent_pass,
+                    0.f, cmd);
+    done += batch;
+  }
+
+  // Restore the non-instanced defaults for subsequent draws in this pass.
+  m_geo_ctx.instance_count = 1;
+  const int32_t zero = 0;
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 23, sizeof(zero), &zero);
+}
+
 void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos,
                                 const glm::mat4 &rot, const glm::mat4 &proj,
                                 const std::set<TDynamicObject *> &consist,
                                 TDynamicObject *player, VkCommandBuffer cmd) {
   m_geo_ctx.translucent_mode = translucent_pass;
+
+  // Default every draw in this pass to the non-instanced path (identity slot 0)
+  // until the instanced flush overrides uInstanceBase for its batches.
+  {
+    const int32_t zero = 0;
+    vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       sizeof(float) * 23, sizeof(zero), &zero);
+  }
 
   // The world shader takes the camera-relative model matrix in the push
   // constant (offset 0); the UBO viewproj turns it into clip space.
@@ -3418,6 +3539,11 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
     return true;
   };
 
+  // Merge every visible cell's instance buckets keyed by (model, skins); the
+  // batched draws are issued once per unique key after the region loop, so the
+  // same model spread across many cells collapses into a few instanced draws.
+  scene::basic_cell::instance_bucket_map framebuckets;
+
   if (scene::basic_region *region = simulation::Region) {
     const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
     const int half =
@@ -3468,7 +3594,8 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
               }
             }
             for (auto const &bucket : cell.m_instancebuckets_opaque) {
-              for (auto *inst : bucket.second) render_instance(inst, false);
+              auto &dst = framebuckets[bucket.first];
+              dst.insert(dst.end(), bucket.second.begin(), bucket.second.end());
             }
             for (auto *inst : cell.m_instancesopaque)
               render_instance(inst, false);
@@ -3484,6 +3611,16 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
       }
     }
   }
+
+  // Flush the accumulated opaque instance buckets as batched draws. The shadow
+  // pass keeps every caster (fplanes = null); the colour passes frustum-cull
+  // each instance. (Translucent instances are not bucketed, so this is a no-op
+  // there.)
+  for (auto const &b : framebuckets)
+    render_instanced_bucket(b.first.pModel, b.first.skins.data(), b.second,
+                            campos, rot, proj, translucent_pass,
+                            do_cull ? fplanes : nullptr, cmd);
+
   for (TDynamicObject *v : consist)
     render_vehicle(v, v == player, translucent_pass);
 }
@@ -3552,6 +3689,14 @@ bool vulkan_renderer::Render() {
 
   m_geo_ctx.current_cmd = frame.command_buffer;
   update_lights(viewproj, campos, frame);
+
+  // Reset the per-frame instance buffer: slot 0 is identity (used by every
+  // non-instanced draw via uInstanceBase = 0); batched draws allocate from 1.
+  m_instance_mapped = frame.instance_mapped;
+  if (m_instance_mapped != nullptr) {
+    *static_cast<glm::mat4 *>(m_instance_mapped) = glm::mat4(1.f);
+    m_instance_cursor = 1;
+  }
 
   // Gather the player's consist once; both passes draw the same set, and
   // submodel animation is advanced exactly once per frame.
