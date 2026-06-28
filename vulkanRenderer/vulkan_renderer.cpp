@@ -13,8 +13,13 @@
 #include "vulkan_imgui.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <set>
+#include <thread>
 
 #include <fstream>
 
@@ -53,7 +58,87 @@ extern light_array Lights;
 #include "deferred_light_vert_spv.h"
 #include "deferred_light_frag_spv.h"
 
+// Fixed-size worker pool: dispatch a batch of jobs and block until all finish.
+// Workers persist for the renderer's lifetime so per-frame dispatch is cheap.
+class render_thread_pool {
+ public:
+  explicit render_thread_pool(unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+      m_workers.emplace_back([this] { worker(); });
+  }
+  ~render_thread_pool() {
+    {
+      std::unique_lock<std::mutex> lk(m_mtx);
+      m_stop = true;
+    }
+    m_cv.notify_all();
+    for (auto &t : m_workers)
+      if (t.joinable()) t.join();
+  }
+
+  // Run jobs[0..n) across the workers (plus the calling thread helps drain),
+  // returning once every job has completed.
+  void run(const std::vector<std::function<void()>> &jobs) {
+    if (jobs.empty()) return;
+    {
+      std::unique_lock<std::mutex> lk(m_mtx);
+      for (auto const &j : jobs) m_queue.push(j);
+      m_outstanding += jobs.size();
+    }
+    m_cv.notify_all();
+    // The dispatching thread also pulls jobs so it isn't idle while waiting.
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lk(m_mtx);
+        if (m_queue.empty()) break;
+        job = std::move(m_queue.front());
+        m_queue.pop();
+      }
+      job();
+      finish_one();
+    }
+    std::unique_lock<std::mutex> lk(m_mtx);
+    m_done_cv.wait(lk, [this] { return m_outstanding == 0; });
+  }
+
+ private:
+  void worker() {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_cv.wait(lk, [this] { return m_stop || !m_queue.empty(); });
+        if (m_stop && m_queue.empty()) return;
+        job = std::move(m_queue.front());
+        m_queue.pop();
+      }
+      job();
+      finish_one();
+    }
+  }
+  void finish_one() {
+    std::unique_lock<std::mutex> lk(m_mtx);
+    if (--m_outstanding == 0) m_done_cv.notify_all();
+  }
+
+  std::vector<std::thread> m_workers;
+  std::queue<std::function<void()>> m_queue;
+  std::mutex m_mtx;
+  std::condition_variable m_cv;
+  std::condition_variable m_done_cv;
+  size_t m_outstanding = 0;
+  bool m_stop = false;
+};
+
 namespace {
+
+// The geometry context the current thread records into. The geometry bank's
+// draw_() reads it, so each worker points it at its own job context; the main
+// thread points it at m_geo_ctx. Per-thread instance-matrix staging lives here
+// too, so concurrent batched flushes don't share a scratch buffer.
+thread_local vulkan_geometry_context *g_active_ctx = nullptr;
+thread_local std::vector<glm::mat4> g_instance_scratch;
 
 void log_info(const std::string &msg) {
   WriteLog("vulkan_renderer: " + msg);
@@ -221,6 +306,9 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   m_geo_ctx.gbuffer_pipeline_triangles = m_gbuffer_pipeline_triangles;
   m_geo_ctx.gbuffer_pipeline_strips = m_gbuffer_pipeline_strips;
   m_geo_ctx.gbuffer_pipeline_fans = m_gbuffer_pipeline_fans;
+  // Seed the per-job contexts with the shared pipelines/device; per-frame
+  // instance slices and per-job modes are set during recording.
+  for (auto &c : m_job_ctx) c = m_geo_ctx;
   {
     // 1-pixel readback buffer for control picking.
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -240,6 +328,7 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
   }
   if (!create_test_geometry()) return false;
   if (!create_frame_resources()) return false;
+  if (!create_record_resources()) return false;
 
   // Hand the ImGui backend everything it needs to build its font texture and
   // pipeline when the UI layer later calls its Init().
@@ -258,6 +347,13 @@ bool vulkan_renderer::Init(GLFWwindow *Window) {
 void vulkan_renderer::Shutdown() {
   if (m_device != VK_NULL_HANDLE) {
     vkDeviceWaitIdle(m_device);
+
+    // Stop the recording workers before tearing down their command pools.
+    m_thread_pool.reset();
+    for (auto &slots : m_record_slots)
+      for (auto &s : slots)
+        if (s.pool) vkDestroyCommandPool(m_device, s.pool, nullptr);
+    m_record_slots.clear();
 
     // Destroy ImGui GPU resources while the device is still alive.
     if (m_imgui) m_imgui->Shutdown();
@@ -754,8 +850,10 @@ namespace {
 constexpr int kMaxLights = 8;
 constexpr int kCascades = 3;  // must match vulkan_renderer::kShadowCascades
 // Instanced draws: total mat4 slots in the per-frame instance buffer (slot 0 is
-// reserved as identity for the non-instanced path), and the per-batch cap.
-constexpr uint32_t kInstanceCapacity = 16384;
+// reserved as identity for the non-instanced path), and the per-batch cap. The
+// buffer is split into one slice per recording job, so it must be large enough
+// to cover every pass's instances at once (shadow passes don't frustum-cull).
+constexpr uint32_t kInstanceCapacity = 65536;  // 4 MB of mat4 per frame
 constexpr uint32_t kMaxInstancesPerBatch = 256;
 // std140-compatible layout shared with world.vert/world.frag (set 1).
 struct GpuLight {
@@ -1830,7 +1928,10 @@ void vulkan_geometrybank::replace_(gfx::geometry_handle const &Geometry) {
 std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
                                        gfx::stream_units const & /*Units*/,
                                        unsigned int const /*Streams*/) {
-  if (m_ctx == nullptr || m_ctx->current_cmd == VK_NULL_HANDLE) return 0;
+  // The recording thread's context (worker job context or, on the main thread,
+  // m_geo_ctx). Falls back to the constructor-supplied context if unset.
+  const vulkan_geometry_context *ctx = g_active_ctx ? g_active_ctx : m_ctx;
+  if (ctx == nullptr || ctx->current_cmd == VK_NULL_HANDLE) return 0;
   const uint32_t index = Geometry.chunk - 1;
   if (index >= m_gpu.size()) return 0;
   const gpu_chunk &g = m_gpu[index];
@@ -1840,36 +1941,37 @@ std::size_t vulkan_geometrybank::draw_(gfx::geometry_handle const &Geometry,
   // other types are skipped for now). In pick mode use the ID-colour pipelines.
   VkPipeline pipe = VK_NULL_HANDLE;
   if (g.type == GL_TRIANGLES) {
-    pipe = m_ctx->shadow_mode        ? m_ctx->shadow_pipeline_triangles
-           : m_ctx->gbuffer_mode     ? m_ctx->gbuffer_pipeline_triangles
-           : m_ctx->pick_mode        ? m_ctx->pick_pipeline_triangles
-           : m_ctx->translucent_mode ? m_ctx->translucent_triangles
-                                     : m_ctx->pipeline_triangles;
+    pipe = ctx->shadow_mode        ? ctx->shadow_pipeline_triangles
+           : ctx->gbuffer_mode     ? ctx->gbuffer_pipeline_triangles
+           : ctx->pick_mode        ? ctx->pick_pipeline_triangles
+           : ctx->translucent_mode ? ctx->translucent_triangles
+                                   : ctx->pipeline_triangles;
   } else if (g.type == GL_TRIANGLE_STRIP) {
-    pipe = m_ctx->shadow_mode        ? m_ctx->shadow_pipeline_strips
-           : m_ctx->gbuffer_mode     ? m_ctx->gbuffer_pipeline_strips
-           : m_ctx->pick_mode        ? m_ctx->pick_pipeline_strips
-           : m_ctx->translucent_mode ? m_ctx->translucent_strips
-                                     : m_ctx->pipeline_strips;
+    pipe = ctx->shadow_mode        ? ctx->shadow_pipeline_strips
+           : ctx->gbuffer_mode     ? ctx->gbuffer_pipeline_strips
+           : ctx->pick_mode        ? ctx->pick_pipeline_strips
+           : ctx->translucent_mode ? ctx->translucent_strips
+                                   : ctx->pipeline_strips;
   } else if (g.type == GL_TRIANGLE_FAN) {
-    pipe = m_ctx->shadow_mode        ? m_ctx->shadow_pipeline_fans
-           : m_ctx->gbuffer_mode     ? m_ctx->gbuffer_pipeline_fans
-           : m_ctx->pick_mode        ? m_ctx->pick_pipeline_fans
-           : m_ctx->translucent_mode ? m_ctx->translucent_fans
-                                     : m_ctx->pipeline_fans;
+    pipe = ctx->shadow_mode        ? ctx->shadow_pipeline_fans
+           : ctx->gbuffer_mode     ? ctx->gbuffer_pipeline_fans
+           : ctx->pick_mode        ? ctx->pick_pipeline_fans
+           : ctx->translucent_mode ? ctx->translucent_fans
+                                   : ctx->pipeline_fans;
   }
   if (pipe == VK_NULL_HANDLE) return 0;
-  vkCmdBindPipeline(m_ctx->current_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  const VkCommandBuffer cmd = ctx->current_cmd;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
 
   VkDeviceSize offset = 0;
-  vkCmdBindVertexBuffers(m_ctx->current_cmd, 0, 1, &g.vbuf, &offset);
-  const uint32_t instances = m_ctx->instance_count;  // >1 for batched draws
+  vkCmdBindVertexBuffers(cmd, 0, 1, &g.vbuf, &offset);
+  const uint32_t instances = ctx->instance_count;  // >1 for batched draws
   if (g.index_count > 0) {
-    vkCmdBindIndexBuffer(m_ctx->current_cmd, g.ibuf, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(m_ctx->current_cmd, g.index_count, instances, 0, 0, 0);
+    vkCmdBindIndexBuffer(cmd, g.ibuf, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, g.index_count, instances, 0, 0, 0);
     return (g.index_count / 3) * instances;
   }
-  vkCmdDraw(m_ctx->current_cmd, g.vertex_count, instances, 0, 0);
+  vkCmdDraw(cmd, g.vertex_count, instances, 0, 0);
   return (g.vertex_count / 3) * instances;
 }
 
@@ -2171,6 +2273,132 @@ bool vulkan_renderer::create_frame_resources() {
     vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
   }
   return true;
+}
+
+bool vulkan_renderer::create_record_resources() {
+  // Worker pool sized to the job count (capped by the core count).
+  const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  m_thread_pool =
+      std::make_unique<render_thread_pool>(std::min<unsigned>(hw, kRecordJobs));
+
+  // Per frame-in-flight, per job: a command pool (one thread records from it at
+  // a time) + a secondary command buffer, reset per frame.
+  m_record_slots.resize(m_frames.size());
+  for (auto &slots : m_record_slots) {
+    for (uint32_t j = 0; j < kRecordJobs; ++j) {
+      VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      pci.queueFamilyIndex = m_graphics_family;
+      pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+      VK_CHECK(vkCreateCommandPool(m_device, &pci, nullptr, &slots[j].pool));
+      VkCommandBufferAllocateInfo ai{
+          VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      ai.commandPool = slots[j].pool;
+      ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+      ai.commandBufferCount = 1;
+      VK_CHECK(vkAllocateCommandBuffers(m_device, &ai, &slots[j].secondary));
+    }
+  }
+  return true;
+}
+
+void vulkan_renderer::ensure_region_geometry(const glm::dvec3 &campos) {
+  // Mirrors draw_scene's section iteration, but only forces lazy geometry
+  // creation (bank allocation + GPU upload) — work the parallel jobs must not
+  // do. After the first time a section is in range it's a cheap flag check.
+  scene::basic_region *region = simulation::Region;
+  if (region == nullptr) return;
+  const int side = scene::EU07_REGIONSIDESECTIONCOUNT;
+  const int half = static_cast<int>(std::ceil(2000.0 / scene::EU07_SECTIONSIZE));
+  const int cx = static_cast<int>(
+      std::floor(campos.x / scene::EU07_SECTIONSIZE + side / 2));
+  const int cz = static_cast<int>(
+      std::floor(campos.z / scene::EU07_SECTIONSIZE + side / 2));
+  for (int z = cz - half; z <= cz + half; ++z) {
+    if (z < 0 || z >= side) continue;
+    for (int x = cx - half; x <= cx + half; ++x) {
+      if (x < 0 || x >= side) continue;
+      scene::basic_section *section =
+          region->get_section(static_cast<size_t>(z) * side + x);
+      if (section != nullptr) section->create_geometry();
+    }
+  }
+}
+
+void vulkan_renderer::record_scene_job(
+    uint32_t frame_index, uint32_t job, const glm::dvec3 &campos,
+    const glm::mat4 &rot, const glm::mat4 &proj,
+    const std::set<TDynamicObject *> &consist, TDynamicObject *player) {
+  record_slot &slot = m_record_slots[frame_index][job];
+  vulkan_geometry_context &ctx = m_job_ctx[job];
+  g_active_ctx = &ctx;  // route this thread's draws + instance state here
+
+  const bool is_gbuffer = (job == kShadowLayers);
+
+  // Inheritance: which dynamic-rendering target this secondary continues.
+  VkFormat color_formats[3] = {m_gbuf_albedo.format, m_gbuf_normal.format,
+                               m_gbuf_position.format};
+  VkCommandBufferInheritanceRenderingInfo iri{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+  iri.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  iri.depthAttachmentFormat = m_depth_format;
+  if (is_gbuffer) {
+    iri.colorAttachmentCount = 3;
+    iri.pColorAttachmentFormats = color_formats;
+  }
+  VkCommandBufferInheritanceInfo inh{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+  inh.pNext = &iri;
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT |
+             VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+  bi.pInheritanceInfo = &inh;
+  vkResetCommandPool(m_device, slot.pool, 0);
+  vkBeginCommandBuffer(slot.secondary, &bi);
+  const VkCommandBuffer cmd = slot.secondary;
+  ctx.current_cmd = cmd;
+
+  // Viewport/scissor + descriptor sets are per-command-buffer state and don't
+  // carry from the primary into a secondary, so set them here.
+  const VkExtent2D extent = is_gbuffer ? m_render_extent : m_shadow_extent;
+  const VkViewport vp{0.f, 0.f, static_cast<float>(extent.width),
+                      static_cast<float>(extent.height), 0.f, 1.f};
+  const VkRect2D sc{{0, 0}, extent};
+  vkCmdSetViewport(cmd, 0, 1, &vp);
+  vkCmdSetScissor(cmd, 0, 1, &sc);
+  frame_sync &frame = m_frames[frame_index];
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout,
+                          0, 1, &m_bindless_set, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline_layout,
+                          1, 1, &frame.light_descriptor, 0, nullptr);
+  // Seed push constants for draws preceding the first bind_material().
+  const glm::vec4 misc_default(0.f);
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 16, sizeof(misc_default), &misc_default);
+  const int32_t idx_default[2] = {static_cast<int32_t>(kBindlessWhiteSlot),
+                                  static_cast<int32_t>(kBindlessFlatNormalSlot)};
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 20, sizeof(idx_default), idx_default);
+  const float gloss_default = 16.f;
+  vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                     sizeof(float) * 22, sizeof(gloss_default), &gloss_default);
+
+  if (is_gbuffer) {
+    ctx.gbuffer_mode = true;
+    draw_scene(false, campos, rot, proj, consist, player, cmd);
+    ctx.gbuffer_mode = false;
+  } else {
+    ctx.shadow_mode = true;
+    ctx.cab_only = (job == kCabShadowLayer);
+    const float cf = static_cast<float>(job);  // uMisc.w = shadow layer
+    vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       sizeof(float) * 19, sizeof(float), &cf);
+    draw_scene(false, campos, rot, proj, consist, player, cmd);
+    ctx.shadow_mode = false;
+    ctx.cab_only = false;
+  }
+
+  vkEndCommandBuffer(cmd);
+  g_active_ctx = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -3011,6 +3239,7 @@ void vulkan_renderer::Update_Pick_Control() {
       glm::translate(glm::mat4(1.f), glm::vec3(player->vPosition - Global.pCamera.Pos)) *
       glm::mat4(player->mMatrix);
 
+  g_active_ctx = &m_geo_ctx;  // pick records on the main thread
   m_geo_ctx.current_cmd = cmd;
   m_geo_ctx.pick_mode = true;
   TSubModel::fSquareDist = 0.f;
@@ -3325,7 +3554,7 @@ void vulkan_renderer::render_submodel(TSubModel *sm, const glm::mat4 &parent,
         // projects it. Lighting is per-fragment from the same UBO.
         vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(local), &local);
-        if (!m_geo_ctx.shadow_mode) {
+        if (!g_active_ctx->shadow_mode) {
           bind_material(mh, cmd);  // pushes uMisc (.x threshold, .y emission = 0)
           // Self-illumination: gauges/indicators/lit panels glow once the scene
           // is dark enough (engine gate: f4Emision.a > 0 && fLuminance < fLight),
@@ -3360,12 +3589,15 @@ void vulkan_renderer::render_instanced_bucket(
     const std::vector<TAnimModel *> &instances, const glm::dvec3 &campos,
     const glm::mat4 &rot, const glm::mat4 &proj, bool translucent_pass,
     const glm::vec4 *fplanes, VkCommandBuffer cmd) {
+  vulkan_geometry_context &gc = *g_active_ctx;
   if (model == nullptr || model->Root == nullptr || instances.empty()) return;
-  if (m_instance_mapped == nullptr) return;
+  if (gc.instance_mapped == nullptr) return;
 
   // Build the camera-relative root matrix for each visible instance, matching
-  // render_instance's transform (translate * rotate per axis; no scale).
-  m_instance_matrices.clear();
+  // render_instance's transform (translate * rotate per axis; no scale). The
+  // staging vector is thread-local so parallel jobs don't share it.
+  std::vector<glm::mat4> &mats = g_instance_scratch;
+  mats.clear();
   float closest = 1e30f;
   for (auto *inst : instances) {
     if (inst == nullptr || !inst->m_visible) continue;
@@ -3386,40 +3618,39 @@ void vulkan_renderer::render_instanced_bucket(
     if (ang.y != 0.f) m = glm::rotate(m, glm::radians(ang.y), glm::vec3(0, 1, 0));
     if (ang.x != 0.f) m = glm::rotate(m, glm::radians(ang.x), glm::vec3(1, 0, 0));
     if (ang.z != 0.f) m = glm::rotate(m, glm::radians(ang.z), glm::vec3(0, 0, 1));
-    m_instance_matrices.push_back(m);
+    mats.push_back(m);
     closest = std::min(
         closest, glm::length2(c / static_cast<float>(Global.ZoomFactor)));
   }
-  if (m_instance_matrices.empty()) return;
+  if (mats.empty()) return;
 
-  TSubModel::fSquareDist = closest;  // shared global, drives submodel LOD gating
+  TSubModel::fSquareDist = closest;  // thread_local, drives submodel LOD gating
   const glm::mat4 identity(1.f);
-  auto *const slots = static_cast<glm::mat4 *>(m_instance_mapped);
+  auto *const slots = static_cast<glm::mat4 *>(gc.instance_mapped);
 
-  const size_t total = m_instance_matrices.size();
+  const size_t total = mats.size();
   size_t done = 0;
   while (done < total) {
     size_t batch = std::min<size_t>(total - done, kMaxInstancesPerBatch);
-    if (m_instance_cursor + batch > kInstanceCapacity)
-      batch = kInstanceCapacity - m_instance_cursor;  // buffer full this frame
+    if (gc.instance_cursor + batch > gc.instance_limit)
+      batch = gc.instance_limit - gc.instance_cursor;  // slice full this frame
     if (batch == 0) break;
-    const uint32_t base = m_instance_cursor;
-    std::memcpy(slots + base, m_instance_matrices.data() + done,
-                batch * sizeof(glm::mat4));
-    m_instance_cursor += static_cast<uint32_t>(batch);
+    const uint32_t base = gc.instance_cursor;
+    std::memcpy(slots + base, mats.data() + done, batch * sizeof(glm::mat4));
+    gc.instance_cursor += static_cast<uint32_t>(batch);
 
     // uInstanceBase @ offset 92: the shader reads inst.m[base + gl_InstanceIndex].
     const int32_t ibase = static_cast<int32_t>(base);
     vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        sizeof(float) * 23, sizeof(ibase), &ibase);
-    m_geo_ctx.instance_count = static_cast<uint32_t>(batch);
+    gc.instance_count = static_cast<uint32_t>(batch);
     render_submodel(model->Root, identity, rot, proj, skins, translucent_pass,
                     0.f, cmd);
     done += batch;
   }
 
   // Restore the non-instanced defaults for subsequent draws in this pass.
-  m_geo_ctx.instance_count = 1;
+  gc.instance_count = 1;
   const int32_t zero = 0;
   vkCmdPushConstants(cmd, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                      sizeof(float) * 23, sizeof(zero), &zero);
@@ -3429,7 +3660,8 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
                                 const glm::mat4 &rot, const glm::mat4 &proj,
                                 const std::set<TDynamicObject *> &consist,
                                 TDynamicObject *player, VkCommandBuffer cmd) {
-  m_geo_ctx.translucent_mode = translucent_pass;
+  vulkan_geometry_context &gc = *g_active_ctx;
+  gc.translucent_mode = translucent_pass;
 
   // Default every draw in this pass to the non-instanced path (identity slot 0)
   // until the instanced flush overrides uInstanceBase for its batches.
@@ -3450,7 +3682,7 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
   // Shadow pass is depth-only: skip material binds so the per-cascade uMisc.w
   // push (cascade index) survives; push_group_mvp still sets the local matrix.
   auto bind_mat = [&](material_handle material) {
-    if (!m_geo_ctx.shadow_mode) bind_material(material, cmd);
+    if (!gc.shadow_mode) bind_material(material, cmd);
   };
 
   auto render_instance = [&](TAnimModel *inst, bool tp) {
@@ -3504,14 +3736,14 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
 
   // Cab-light shadow pass: only the player vehicle (its cab/body occlude the
   // lamp); nothing else is relevant to the cab interior.
-  if (m_geo_ctx.cab_only) {
+  if (gc.cab_only) {
     if (player != nullptr) render_vehicle(player, true, false);
     return;
   }
 
   // Camera frustum (camera-relative space) for culling the colour passes; the
   // shadow pass keeps every caster (off-screen objects cast shadows into view).
-  const bool do_cull = !m_geo_ctx.shadow_mode;
+  const bool do_cull = !gc.shadow_mode;
   glm::vec4 fplanes[6];
   if (do_cull) {
     const glm::mat4 vp = proj * rot;
@@ -3687,15 +3919,27 @@ bool vulkan_renderer::Render() {
   const glm::dvec3 campos = Global.pCamera.Pos;
   const glm::mat4 viewproj = proj * rot;
 
+  g_active_ctx = &m_geo_ctx;  // main thread records into the primary context
   m_geo_ctx.current_cmd = frame.command_buffer;
   update_lights(viewproj, campos, frame);
 
   // Reset the per-frame instance buffer: slot 0 is identity (used by every
-  // non-instanced draw via uInstanceBase = 0); batched draws allocate from 1.
-  m_instance_mapped = frame.instance_mapped;
-  if (m_instance_mapped != nullptr) {
-    *static_cast<glm::mat4 *>(m_instance_mapped) = glm::mat4(1.f);
-    m_instance_cursor = 1;
+  // non-instanced draw via uInstanceBase = 0). The rest is split into disjoint
+  // slices, one per recording job, so concurrent batched flushes never share a
+  // cursor. The main-thread context (translucent pass) doesn't instance, so it
+  // gets an empty slice.
+  if (frame.instance_mapped != nullptr) {
+    *static_cast<glm::mat4 *>(frame.instance_mapped) = glm::mat4(1.f);
+    const uint32_t slice = (kInstanceCapacity - 1) / kRecordJobs;
+    for (uint32_t j = 0; j < kRecordJobs; ++j) {
+      vulkan_geometry_context &c = m_job_ctx[j];
+      c.instance_mapped = frame.instance_mapped;
+      c.instance_base = c.instance_cursor = 1 + j * slice;
+      c.instance_limit = 1 + (j + 1) * slice;
+    }
+    m_geo_ctx.instance_mapped = frame.instance_mapped;
+    m_geo_ctx.instance_base = m_geo_ctx.instance_cursor = 1;
+    m_geo_ctx.instance_limit = 1;  // no instancing on the main thread
   }
 
   // Gather the player's consist once; both passes draw the same set, and
@@ -3717,6 +3961,21 @@ bool vulkan_renderer::Render() {
   TTrack::fetch_default_profiles();
   for (TDynamicObject *v : consist)
     if (v != nullptr) v->ABuLittleUpdate(0.0);
+
+  // Build any newly in-range geometry single-threaded (lazy bank upload can't
+  // run on the workers), then record the shadow cascades + G-buffer pass in
+  // parallel into secondary command buffers. The primary just executes them.
+  ensure_region_geometry(campos);
+  {
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(kRecordJobs);
+    for (uint32_t j = 0; j < kRecordJobs; ++j)
+      jobs.emplace_back([this, j, &campos, &rot, &proj, &consist, player] {
+        record_scene_job(m_frame_index, j, campos, rot, proj, consist, player);
+      });
+    m_thread_pool->run(jobs);
+  }
+  g_active_ctx = &m_geo_ctx;  // workers cleared it; the primary path needs it
 
   // Bind set 0 (white) + set 1 (light UBO + shadow map); they persist into the
   // shadow and main passes (rebound after the sky, whose layout differs). Also
@@ -3760,12 +4019,9 @@ bool vulkan_renderer::Render() {
                          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0,
                          nullptr, 0, nullptr, 1, &sm);
 
-    const VkViewport svp{0.f, 0.f, static_cast<float>(m_shadow_extent.width),
-                         static_cast<float>(m_shadow_extent.height), 0.f, 1.f};
-    const VkRect2D ssc{{0, 0}, m_shadow_extent};
-    m_geo_ctx.shadow_mode = true;
-    // Layers 0..2 are sun cascades (full scene); layer 3 is the cab lamp (only
-    // the player cab is rendered, so cab objects occlude the lamp).
+    // Each layer was recorded into its own secondary command buffer (job c);
+    // the primary just runs it inside the layer's render target. Layers 0..2 are
+    // sun cascades; layer 3 is the cab lamp.
     for (uint32_t c = 0; c < kShadowLayers; ++c) {
       VkRenderingAttachmentInfo sdepth{
           VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -3775,25 +4031,15 @@ bool vulkan_renderer::Render() {
       sdepth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       sdepth.clearValue.depthStencil = {1.0f, 0};
       VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+      sri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
       sri.renderArea.extent = m_shadow_extent;
       sri.layerCount = 1;
       sri.pDepthAttachment = &sdepth;
       vkCmdBeginRendering(frame.command_buffer, &sri);
-      vkCmdSetViewport(frame.command_buffer, 0, 1, &svp);
-      vkCmdSetScissor(frame.command_buffer, 0, 1, &ssc);
-      // uMisc.w = layer index; the shadow vertex selects lightspace[c]. The
-      // shadow pass skips material binds, so this push persists across draws.
-      const float cf = static_cast<float>(c);
-      vkCmdPushConstants(frame.command_buffer, m_pipeline_layout,
-                         VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 19,
-                         sizeof(float), &cf);
-      m_geo_ctx.cab_only = (c == kCabShadowLayer);
-      draw_scene(false, campos, rot, proj, consist, player,
-                 frame.command_buffer);
+      vkCmdExecuteCommands(frame.command_buffer, 1,
+                           &m_record_slots[m_frame_index][c].secondary);
       vkCmdEndRendering(frame.command_buffer);
     }
-    m_geo_ctx.cab_only = false;
-    m_geo_ctx.shadow_mode = false;
 
     sm.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     sm.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -3856,21 +4102,16 @@ bool vulkan_renderer::Render() {
     gdepth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;  // composite pass reads it
     gdepth.clearValue.depthStencil = {1.0f, 0};
     VkRenderingInfo gri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    gri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
     gri.renderArea.extent = m_render_extent;
     gri.layerCount = 1;
     gri.colorAttachmentCount = 3;
     gri.pColorAttachments = gcol;
     gri.pDepthAttachment = &gdepth;
     vkCmdBeginRendering(frame.command_buffer, &gri);
-    const VkViewport gvp{0.f, 0.f, static_cast<float>(m_render_extent.width),
-                         static_cast<float>(m_render_extent.height), 0.f, 1.f};
-    vkCmdSetViewport(frame.command_buffer, 0, 1, &gvp);
-    const VkRect2D gsc{{0, 0}, m_render_extent};
-    vkCmdSetScissor(frame.command_buffer, 0, 1, &gsc);
-    bind_world_sets();
-    m_geo_ctx.gbuffer_mode = true;
-    draw_scene(false, campos, rot, proj, consist, player, frame.command_buffer);
-    m_geo_ctx.gbuffer_mode = false;
+    // The G-buffer pass was recorded into the last job's secondary command buffer.
+    vkCmdExecuteCommands(frame.command_buffer, 1,
+                         &m_record_slots[m_frame_index][kShadowLayers].secondary);
     vkCmdEndRendering(frame.command_buffer);
 
     // G-buffers -> shader-readable; opaque depth -> readable for translucent.

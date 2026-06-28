@@ -14,6 +14,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include <array>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -29,6 +31,9 @@ class vulkan_imgui_renderer;
 class TSubModel;
 class TDynamicObject;
 class TAnimModel;
+class TModel3d;
+// Minimal fixed-size worker pool used to record render passes in parallel.
+class render_thread_pool;
 
 // Shared, renderer-owned state the geometry banks need: the device (for buffer
 // allocation in create_) and the command buffer currently being recorded (for
@@ -62,6 +67,13 @@ struct vulkan_geometry_context {
   // Instance count for the next chunk draw: >1 routes draw() through an
   // instanced draw call (gl_InstanceIndex selects the per-instance matrix).
   uint32_t instance_count = 1;
+  // Instanced-draw scratch, per recording thread: each worker owns a disjoint
+  // slice [base, limit) of the frame's instance buffer so concurrent batched
+  // flushes never share a cursor. (Slot 0 stays the global identity.)
+  void *instance_mapped = nullptr;
+  uint32_t instance_base = 1;
+  uint32_t instance_cursor = 1;
+  uint32_t instance_limit = 1;
   bool pick_mode = false;
   bool translucent_mode = false;
   bool shadow_mode = false;
@@ -319,6 +331,21 @@ class vulkan_renderer : public gfx_renderer {
                                const glm::vec4 *fplanes, VkCommandBuffer cmd);
   VkShaderModule create_shader_module(const uint32_t *code, size_t size_bytes);
   bool create_frame_resources();
+  // Per-frame secondary command pools/buffers + the worker pool for parallel
+  // pass recording.
+  bool create_record_resources();
+  // Single-threaded pre-pass: lazily build (and GPU-upload) the geometry of
+  // every section in range so the parallel recording jobs only read it. Must
+  // run before dispatching record_scene_job() (which can't touch the bank).
+  void ensure_region_geometry(const glm::dvec3 &campos);
+  // Record one scene pass (shadow layer `job` in [0,kShadowLayers), or the
+  // G-buffer pass at job == kShadowLayers) into its secondary command buffer.
+  // Runs on a worker thread; touches only that job's slot/context.
+  void record_scene_job(uint32_t frame_index, uint32_t job,
+                        const glm::dvec3 &campos, const glm::mat4 &rot,
+                        const glm::mat4 &proj,
+                        const std::set<TDynamicObject *> &consist,
+                        TDynamicObject *player);
   void recreate_swapchain();
 
   struct frame_sync {
@@ -493,13 +520,6 @@ class vulkan_renderer : public gfx_renderer {
   TSubModel const *m_pick_control = nullptr;
   std::vector<TSubModel const *> m_pick_submodels;
 
-  // Instanced-draw scratch: current frame's mapped instance buffer, the next
-  // free matrix slot this frame (slot 0 stays identity), and a reused staging
-  // vector of per-instance matrices.
-  void *m_instance_mapped = nullptr;
-  uint32_t m_instance_cursor = 0;
-  std::vector<glm::mat4> m_instance_matrices;
-
   // Gradient skydome: a flat-colour pipeline + position/colour/index buffers
   // filled from simulation::Environment.skydome(). Colours are host-visible and
   // re-uploaded when the simulation marks the dome dirty.
@@ -528,6 +548,20 @@ class vulkan_renderer : public gfx_renderer {
   uint32_t m_frame_index = 0;
   uint32_t m_acquired_image = 0;
   bool m_frame_acquired = false;
+
+  // ---- Multi-threaded command recording ----
+  // kRecordJobs independent recording tasks per frame: one per shadow layer +
+  // one for the deferred G-buffer pass. Each records into its own secondary
+  // command buffer (a VkCommandPool can't be shared across threads, so each job
+  // gets its own pool), driven by its own geometry context + instance slice.
+  static constexpr uint32_t kRecordJobs = kShadowLayers + 1;
+  struct record_slot {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer secondary = VK_NULL_HANDLE;
+  };
+  std::vector<std::array<record_slot, kRecordJobs>> m_record_slots;  // [frame][job]
+  std::array<vulkan_geometry_context, kRecordJobs> m_job_ctx{};
+  std::unique_ptr<render_thread_pool> m_thread_pool;
 
   bool m_enable_validation = false;
   bool m_vsync = true;

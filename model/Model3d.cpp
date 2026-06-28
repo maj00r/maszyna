@@ -28,8 +28,8 @@ Copyright (C) 2001-2004  Marcin Wozniak, Maciej Czapkiewicz and others
 
 using namespace Mtable;
 
-float TSubModel::fSquareDist = 0.f;
-std::uintptr_t TSubModel::iInstance; // numer renderowanego egzemplarza obiektu
+thread_local float TSubModel::fSquareDist = 0.f;
+thread_local std::uintptr_t TSubModel::iInstance; // numer renderowanego egzemplarza obiektu
 texture_handle const *TSubModel::ReplacableSkinId = NULL;
 int TSubModel::iAlpha = 0x30300030; // maska do testowania flag tekstur wymiennych
 TModel3d *TSubModel::pRoot; // Ra: tymczasowo wskaźnik na model widoczny z submodelu

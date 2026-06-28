@@ -167,10 +167,14 @@ public:
     bool is_emitter() const;
 
 public:
-	static size_t iInstance; // identyfikator egzemplarza, który aktualnie renderuje model
+	// thread_local: the Vulkan renderer records several passes on worker threads
+	// at once, each traversing the same models; per-thread copies keep the
+	// set-then-use of these two from racing. Transparent to single-threaded
+	// (GL/sim) callers, which all run on one thread.
+	static thread_local size_t iInstance; // identyfikator egzemplarza, który aktualnie renderuje model
 	static material_handle const *ReplacableSkinId;
 	static int iAlpha; // maska bitowa dla danego przebiegu
-	static float fSquareDist;
+	static thread_local float fSquareDist;
 	static TModel3d *pRoot;
 	static std::string *pasText; // tekst dla wyświetlacza (!!!! do przemyślenia)
     TSubModel() = default;
