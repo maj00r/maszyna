@@ -69,7 +69,7 @@ endif()
 
 option(WITH_OPENGL_MODERN "Compile with OpenGL modern renderer" ON)
 option(WITH_OPENGL_LEGACY "Compile with OpenGL legacy renderer" ON)
-option(WITH_PYTHON "Compile with python2" ON)
+option(WITH_PYTHON "Compile with python3 (embedded CPython 3.14)" ON)
 option(WITH_UART "Compile with libserialport" ON)
 option(WITH_LUA "Compile with lua scripting support" ON)
 option(WITH_OPENVR "Compile with OpenVR" OFF)
@@ -476,9 +476,15 @@ endif()
 target_link_libraries(${PROJECT_NAME} glfw)
 
 if (WITH_PYTHON)
-	find_package(PythonLibs 2 REQUIRED)
-	target_include_directories(${PROJECT_NAME} PRIVATE ${PYTHON_INCLUDE_DIRS})
-	target_link_libraries(${PROJECT_NAME} ${PYTHON_LIBRARIES})
+	# Embedded interpreter is now Python 3.x (CPython 3.14). Locate its
+	# development files (headers + import lib); overrides the bundled py2.7
+	# paths set in the WIN32 deps block above, including the singular
+	# PYTHON_INCLUDE_DIR consumed by the vulkanRenderer subproject.
+	find_package(Python3 3.14 COMPONENTS Development REQUIRED)
+	set(PYTHON_INCLUDE_DIR ${Python3_INCLUDE_DIRS})
+	set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS})
+	target_include_directories(${PROJECT_NAME} PRIVATE ${Python3_INCLUDE_DIRS})
+	target_link_libraries(${PROJECT_NAME} ${Python3_LIBRARIES})
 endif()
 
 if (NOT WIN32)

@@ -85,8 +85,8 @@ void render_task::run()
 
 		if (outputWidth != nullptr && outputHeight != nullptr && m_target != nullptr)
 		{
-			const int screenWidth = static_cast<int>(PyInt_AsLong(outputWidth));
-			const int screenHeight = static_cast<int>(PyInt_AsLong(outputHeight));
+			const int screenWidth = static_cast<int>(PyLong_AsLong(outputWidth));
+			const int screenHeight = static_cast<int>(PyLong_AsLong(outputHeight));
 
 			const bool useRgb = (false && !Global.gfx_usegles);
 
@@ -98,8 +98,9 @@ void render_task::run()
 			Py_ssize_t pythonBufferBytes = 0;
 			char *pythonBufferPtr = nullptr;
 
+			// render() returns image.tobytes() -> a Python bytes object.
 			const bool bufferExtracted =
-				(PyString_AsStringAndSize(output, &pythonBufferPtr, &pythonBufferBytes) == 0)
+				(PyBytes_AsStringAndSize(output, &pythonBufferPtr, &pythonBufferBytes) == 0)
 				&& (pythonBufferPtr != nullptr);
 
 			if (!bufferExtracted)
@@ -230,25 +231,30 @@ auto python_taskqueue::init() -> bool
 	crashreport_add_info("python.threadedupload", Global.python_threadedupload ? "yes" : "no");
 	crashreport_add_info("python.uploadmain", Global.python_uploadmain ? "yes" : "no");
 
+	// Python 3 removed Py_SetPythonHome(char*)/Py_InitializeEx in favour of the
+	// PyConfig API. The interpreter home points at the bundled CPython tree that
+	// carries the standard library (and site-packages with Pillow).
 #ifdef _WIN32
-	if (sizeof(void *) == 8)
-		Py_SetPythonHome(const_cast<char *>("python64"));
-	else
-		Py_SetPythonHome(const_cast<char *>("python"));
+	const wchar_t *pythonhome = (sizeof(void *) == 8) ? L"python64" : L"python";
 #elif __linux__
-	if (sizeof(void *) == 8)
-		Py_SetPythonHome(const_cast<char *>("linuxpython64"));
-	else
-		Py_SetPythonHome(const_cast<char *>("linuxpython"));
+	const wchar_t *pythonhome = (sizeof(void *) == 8) ? L"linuxpython64" : L"linuxpython";
 #elif __APPLE__
-	if (sizeof(void *) == 8)
-		Py_SetPythonHome(const_cast<char *>("macpython64"));
-	else
-		Py_SetPythonHome(const_cast<char *>("macpython"));
+	const wchar_t *pythonhome = (sizeof(void *) == 8) ? L"macpython64" : L"macpython";
 #endif
-	Py_InitializeEx(0);
-
-	PyEval_InitThreads();
+	PyConfig pyconfig;
+	PyConfig_InitPythonConfig(&pyconfig);
+	PyConfig_SetString(&pyconfig, &pyconfig.home, pythonhome);
+	{
+		PyStatus status = Py_InitializeFromConfig(&pyconfig);
+		PyConfig_Clear(&pyconfig);
+		if (PyStatus_Exception(status))
+		{
+			ErrorLog(std::string("Python Interpreter: init failed: ") +
+			         (status.err_msg ? status.err_msg : "unknown error"));
+			return false;
+		}
+	}
+	// PyEval_InitThreads() is a removed no-op in 3.9+: the GIL is always ready.
 
 	PyObject *stringiomodule{nullptr};
 	PyObject *stringioclassname{nullptr};
@@ -262,7 +268,8 @@ auto python_taskqueue::init() -> bool
 		goto release_and_exit;
 	}
 
-	stringiomodule = PyImport_ImportModule("cStringIO");
+	// Python 3: cStringIO is gone; StringIO lives in the io module.
+	stringiomodule = PyImport_ImportModule("io");
 	stringioclassname = (stringiomodule != nullptr ? PyObject_GetAttrString(stringiomodule, "StringIO") : nullptr);
 	stringioobject = (stringioclassname != nullptr ? PyObject_CallObject(stringioclassname, nullptr) : nullptr);
 	m_stderr = {(stringioobject == nullptr ? nullptr : PySys_SetObject(const_cast<char *>("stderr"), stringioobject) != 0 ? nullptr : stringioobject)};
@@ -297,7 +304,9 @@ auto python_taskqueue::init() -> bool
 	return true;
 
 release_and_exit:
-	PyEval_ReleaseLock();
+	// Release the GIL the failed setup still holds (Python 3 dropped the old
+	// PyEval_ReleaseLock); leaves the interpreter idle with python disabled.
+	PyEval_SaveThread();
 	return false;
 }
 
@@ -492,11 +501,9 @@ void python_taskqueue::run(GLFWwindow *Context, rendertask_sequence &Tasks, uplo
 	if (Context)
 		glfwMakeContextCurrent(Context);
 
-	// create a state object for this thread
-	PyEval_AcquireLock();
-	auto *threadstate{PyThreadState_New(m_mainthread->interp)};
-	PyEval_ReleaseLock();
-
+	// Python 3: the removed PyEval_AcquireLock/PyThreadState_New dance is
+	// replaced by PyGILState_Ensure/Release around each task, which creates and
+	// manages this thread's interpreter state automatically.
 	std::shared_ptr<render_task> task{nullptr};
 
 	while (false == Exit.load())
@@ -519,8 +526,8 @@ void python_taskqueue::run(GLFWwindow *Context, rendertask_sequence &Tasks, uplo
 			}
 			if (task != nullptr)
 			{
-				// swap in my thread state
-				PyEval_RestoreThread(threadstate);
+				// acquire the GIL (and this thread's state) for the call
+				PyGILState_STATE gil = PyGILState_Ensure();
 				{
 					// execute python code
 					task->run();
@@ -534,8 +541,8 @@ void python_taskqueue::run(GLFWwindow *Context, rendertask_sequence &Tasks, uplo
 					if (PyErr_Occurred() != nullptr)
 						error();
 				}
-				// clear the thread state
-				PyEval_SaveThread();
+				// release the GIL
+				PyGILState_Release(gil);
 			}
 			// TBD, TODO: add some idle time between tasks in case we're on a single thread cpu?
 		} while (task != nullptr);
@@ -545,12 +552,8 @@ void python_taskqueue::run(GLFWwindow *Context, rendertask_sequence &Tasks, uplo
 		// shutdown checks
 		Condition.wait_for(std::chrono::milliseconds(250));
 	}
-	// clean up thread state data
-	PyEval_AcquireLock();
-	PyThreadState_Swap(nullptr);
-	PyThreadState_Clear(threadstate);
-	PyThreadState_Delete(threadstate);
-	PyEval_ReleaseLock();
+	// PyGILState_Ensure/Release already tore down this thread's interpreter
+	// state after the last task; nothing to clean up here in Python 3.
 
 	// detach the GL context before the worker terminates; some drivers
 	// (NVIDIA on X11, certain Mesa/Wayland configs) hang in process teardown
@@ -572,14 +575,25 @@ void python_taskqueue::update()
 void python_taskqueue::error()
 {
 
+	// Python 3: text comes back as a str; PyUnicode_AsUTF8 may return null, so
+	// guard before handing it to std::string.
+	auto as_utf8 = [](PyObject *o) -> std::string {
+		if (o == nullptr)
+			return {};
+		const char *s = PyUnicode_AsUTF8(o);
+		return s ? std::string(s) : std::string();
+	};
+
 	if (m_stderr != nullptr)
 	{
 		// std err pythona jest buforowane
 		PyErr_Print();
 		auto *errortext{PyObject_CallMethod(m_stderr, const_cast<char *>("getvalue"), nullptr)};
-		ErrorLog(PyString_AsString(errortext));
-		// czyscimy bufor na kolejne bledy
-		PyObject_CallMethod(m_stderr, const_cast<char *>("truncate"), const_cast<char *>("i"), 0);
+		ErrorLog(as_utf8(errortext));
+		Py_XDECREF(errortext);
+		// czyscimy bufor na kolejne bledy (truncate nie przesuwa kursora w io.StringIO)
+		Py_XDECREF(PyObject_CallMethod(m_stderr, const_cast<char *>("seek"), const_cast<char *>("i"), 0));
+		Py_XDECREF(PyObject_CallMethod(m_stderr, const_cast<char *>("truncate"), const_cast<char *>("i"), 0));
 	}
 	else
 	{
@@ -598,21 +612,28 @@ void python_taskqueue::error()
 		auto *typetext{PyObject_Str(type)};
 		if (typetext != nullptr)
 		{
-			ErrorLog(PyString_AsString(typetext));
+			ErrorLog(as_utf8(typetext));
+			Py_DECREF(typetext);
 		}
 		if (value != nullptr)
 		{
-			ErrorLog(PyString_AsString(value));
+			auto *valuetext{PyObject_Str(value)};
+			ErrorLog(as_utf8(valuetext));
+			Py_XDECREF(valuetext);
 		}
 		auto *tracebacktext{PyObject_Str(traceback)};
 		if (tracebacktext != nullptr)
 		{
-			ErrorLog(PyString_AsString(tracebacktext));
+			ErrorLog(as_utf8(tracebacktext));
+			Py_DECREF(tracebacktext);
 		}
 		else
 		{
 			WriteLog("Python Interpreter: failed to retrieve the stack traceback");
 		}
+		Py_XDECREF(type);
+		Py_XDECREF(value);
+		Py_XDECREF(traceback);
 	}
 }
 
@@ -636,7 +657,7 @@ std::vector<std::string> python_external_utils::PyObjectToStringArray(PyObject *
 			return emptyIfError;
 		}
 
-		const char *str = PyString_AsString(item);
+		const char *str = PyUnicode_AsUTF8(item);
 		if (str == nullptr)
 		{
 			Py_DECREF(item);
