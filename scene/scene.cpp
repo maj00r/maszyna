@@ -24,9 +24,6 @@ http://mozilla.org/MPL/2.0/.
 
 namespace scene {
 
-std::string const EU07_FILEEXTENSION_REGION { ".sbt" };
-std::uint32_t const EU07_FILEHEADER { MAKE_ID4( 'E','U','0','7' ) };
-std::uint32_t const EU07_FILEVERSION_REGION { MAKE_ID4( 'S', 'B', 'T', '2' ) };
 std::map<std::string, basic_node *> Hierarchy;
  
 // potentially activates event handler with the same name as provided node, and within handler activation range
@@ -278,6 +275,16 @@ basic_cell::insert( shape_node Shape ) {
         shapedata.translucent ?
             m_shapestranslucent :
             m_shapesopaque );
+    // if this cell's geometry was already baked (deferred visual streaming inserting into a
+    // section the renderer already finalised), don't try to merge into an existing shape
+    // whose CPU-side vertices were freed at bake time -- add the shape standalone and upload
+    // it straight into the live bank, otherwise it would never become visible.
+    if( m_geometrybank != null_handle ) {
+        Shape.origin( m_area.center );
+        shapes.emplace_back( Shape );
+        shapes.back().create_geometry( m_geometrybank );
+        return;
+    }
     for( auto &targetshape : shapes ) {
         // try to merge shapes with matching view ranges...
         auto const &targetshapedata { targetshape.data() };
@@ -305,6 +312,14 @@ basic_cell::insert( lines_node Lines ) {
     m_active = true;
 
     auto const &linesdata { Lines.data() };
+    // see the matching note in insert( shape_node ): once the cell is baked, append the new
+    // lines straight into the live bank rather than merging into vertex-freed geometry.
+    if( m_geometrybank != null_handle ) {
+        Lines.origin( m_area.center );
+        m_lines.emplace_back( Lines );
+        m_lines.back().create_geometry( m_geometrybank );
+        return;
+    }
     for( auto &targetlines : m_lines ) {
         // try to merge shapes with matching view ranges...
         auto const &targetlinesdata { targetlines.data() };
@@ -635,6 +650,10 @@ basic_cell::center( glm::dvec3 Center ) {
 void
 basic_cell::create_geometry( gfx::geometrybank_handle const &Bank ) {
 
+    // remember the bank for *all* cells (even ones empty at bake time): a deferred visual
+    // node may activate this cell later, and insert() needs the live bank to upload into.
+    m_geometrybank = Bank;
+
     if( false == m_active ) { return; } // nothing to do here
 
     for( auto &shape : m_shapesopaque )      { shape.create_geometry( Bank ); }
@@ -853,6 +872,14 @@ basic_section::insert( shape_node Shape ) {
     }
     else {
         // large, opaque shapes are placed on section level
+        // if the section was already baked (deferred visual streaming), append straight into
+        // the live bank instead of merging into vertex-freed geometry -- see basic_cell::insert.
+        if( true == m_geometrycreated ) {
+            Shape.origin( m_area.center );
+            m_shapes.emplace_back( Shape );
+            m_shapes.back().create_geometry( m_geometrybank );
+            return;
+        }
         for( auto &shape : m_shapes ) {
             // check first if the shape can't be merged with one of the shapes already present in the section
             if( true == shape.merge( Shape ) ) {
@@ -1103,123 +1130,6 @@ basic_region::update_traction( TDynamicObject *Vehicle, int const Pantographinde
     for( auto *section : sectionlist ) {
         section->update_traction( Vehicle, Pantographindex );
     }
-}
-
-// checks whether specified file is a valid region data file
-bool
-basic_region::is_scene( std::string const &Scenariofile ) const {
-
-    auto filename { Scenariofile };
-    while( filename[ 0 ] == '$' ) {
-        // trim leading $ char rainsted utility may add to the base name for modified .scn files
-        filename.erase( 0, 1 );
-    }
-    erase_extension( filename );
-    filename = Global.asCurrentSceneryPath + filename;
-    filename += EU07_FILEEXTENSION_REGION;
-
-    if( false == FileExists( filename ) ) {
-        return false;
-    }
-    // file type and version check
-    std::ifstream input( filename, std::ios::binary );
-
-    uint32_t headermain{ sn_utils::ld_uint32( input ) };
-    uint32_t headertype{ sn_utils::ld_uint32( input ) };
-
-    if( ( headermain != EU07_FILEHEADER
-     || ( headertype != EU07_FILEVERSION_REGION ) ) ) {
-        // wrong file type
-        return false;
-    }
-
-    return true;
-}
-
-// stores content of the class in file with specified name
-void
-basic_region::serialize( std::string const &Scenariofile ) const {
-
-    auto filename { Scenariofile };
-    while( filename[ 0 ] == '$' ) {
-        // trim leading $ char rainsted utility may add to the base name for modified .scn files
-        filename.erase( 0, 1 );
-    }
-    erase_extension( filename );
-    filename = Global.asCurrentSceneryPath + filename;
-    filename += EU07_FILEEXTENSION_REGION;
-
-    std::ofstream output { filename, std::ios::binary };
-
-    // region file version 1
-    // header: EU07SBT + version (0-255)
-    sn_utils::ls_uint32( output, EU07_FILEHEADER );
-    sn_utils::ls_uint32( output, EU07_FILEVERSION_REGION );
-    // sections
-    // TBD, TODO: build table of sections and file offsets, if we postpone section loading until they're within range
-    std::uint32_t sectioncount { 0 };
-    for( auto *section : m_sections ) {
-        if( section != nullptr ) {
-            ++sectioncount;
-        }
-    }
-    // section count, followed by section data
-    sn_utils::ls_uint32( output, sectioncount );
-    std::uint32_t sectionindex { 0 };
-    for( auto *section : m_sections ) {
-        // section data: section index, followed by length of section data, followed by section data
-        if( section != nullptr ) {
-            sn_utils::ls_uint32( output, sectionindex );
-            section->serialize( output ); }
-        ++sectionindex;
-    }
-}
-
-// restores content of the class from file with specified name. returns: true on success, false otherwise
-bool
-basic_region::deserialize( std::string const &Scenariofile ) {
-
-    auto filename { Scenariofile };
-    while( filename[ 0 ] == '$' ) {
-        // trim leading $ char rainsted utility may add to the base name for modified .scn files
-        filename.erase( 0, 1 );
-    }
-    erase_extension( filename );
-    filename = Global.asCurrentSceneryPath + filename;
-    filename += EU07_FILEEXTENSION_REGION;
-
-    if( false == FileExists( filename ) ) {
-		Global.file_binary_terrain_state = false;
-        return false;
-    }
-    // region file version 1
-    // file type and version check
-    std::ifstream input( filename, std::ios::binary );
-
-    uint32_t headermain { sn_utils::ld_uint32( input ) };
-    uint32_t headertype { sn_utils::ld_uint32( input ) };
-
-    if( ( headermain != EU07_FILEHEADER
-     || ( headertype != EU07_FILEVERSION_REGION ) ) ) {
-        // wrong file type
-        WriteLog( "Bad file: \"" + filename + "\" is of either unrecognized type or version" );
-        return false;
-    }
-    // sections
-    // TBD, TODO: build table of sections and file offsets, if we postpone section loading until they're within range
-    // section count
-    auto sectioncount { sn_utils::ld_uint32( input ) };
-    while( sectioncount-- ) {
-        // section index, followed by section data size, followed by section data
-        auto const sectionindex { sn_utils::ld_uint32( input ) };
-        auto const sectionsize { sn_utils::ld_uint32( input ) };
-        if( m_sections[ sectionindex ] == nullptr ) {
-            m_sections[ sectionindex ] = new basic_section();
-        }
-        m_sections[ sectionindex ]->deserialize( input );
-    }
-
-    return true;
 }
 
 // sends content of the class in legacy (text) format to provided stream

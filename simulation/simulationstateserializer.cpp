@@ -16,6 +16,7 @@ http://mozilla.org/MPL/2.0/.
 #include "simulation/simulationsounds.h"
 #include "simulation/simulationenvironment.h"
 #include "scene/scenenodegroups.h"
+#include "scene/scenerybinary.h"
 #include "rendering/particles.h"
 #include "world/Event.h"
 #include "world/MemCell.h"
@@ -29,12 +30,91 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/Logs.h"
 #include "editor/editorTerrainStreamer.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <limits>
+
 namespace simulation {
+
+namespace {
+// camera-following visual streaming: visual nodes are built only for region sections within
+// this radius (m) of the camera, and more are built as the camera moves into new sections.
+// should comfortably cover the model render range so nothing visibly pops in at the edge.
+constexpr double STREAM_RADIUS { 2000.0 };
+// per-frame time budget (ms) the driver spends streaming visual nodes. larger = the
+// surroundings fill in faster but the frame it runs on is longer; on a heavy scene (low fps)
+// a too-small budget is a tiny duty cycle, so streaming a million flora instances drags.
+constexpr int VISUAL_BUDGET_MS { 24 };
+
+// --- load profiler: where the load time actually goes, so we optimise the real bottleneck ---
+struct load_profile {
+    std::unordered_map<std::string, double> typetime;     // seconds building each node type (inside deserialize_node)
+    std::unordered_map<std::string, long>  typecount;     // how many of each node type
+    std::unordered_map<std::string, double> dispatchtime; // seconds per top-level token (node/event/trainset/...)
+    long   tokens { 0 };    // top-level getToken() dispatches (gauges the cParser scan cost)
+    double finalize { 0 };  // create_map_geometry + InitInstanceEvents
+    void reset() { typetime.clear(); typecount.clear(); dispatchtime.clear(); tokens = 0; finalize = 0; }
+    static void dump( std::unordered_map<std::string, double> const &M, char const *Tag, std::unordered_map<std::string, long> const *C ) {
+        std::vector<std::pair<std::string, double>> v( M.begin(), M.end() );
+        std::sort( v.begin(), v.end(), []( auto const &a, auto const &b ) { return a.second > b.second; } );
+        for( auto const &p : v ) {
+            if( p.second < 0.05 ) { break; }
+            WriteLog( std::string( "    " ) + Tag + " " + p.first + ": " + std::to_string( p.second ) + "s"
+                + ( C ? "  x" + std::to_string( ( *const_cast<std::unordered_map<std::string, long>*>( C ) )[ p.first ] ) : "" ) );
+        }
+    }
+    void log( char const *Phase ) {
+        double dtotal = finalize; for( auto const &p : dispatchtime ) { dtotal += p.second; }
+        WriteLog( "=== load profile [" + std::string( Phase ) + "]: dispatch " + std::to_string( dtotal )
+            + "s, getToken " + std::to_string( tokens ) + ", finalize " + std::to_string( finalize ) + "s ===" );
+        dump( dispatchtime, "[top]", nullptr );
+        dump( typetime, "[node]", &typecount );
+    }
+};
+load_profile g_profile;
+
+// RAII: add the elapsed time to Acc on scope exit (handles deserialize_node's many returns)
+struct scoped_accum {
+    std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
+    double &acc;
+    explicit scoped_accum( double &Acc ) : acc( Acc ) {}
+    ~scoped_accum() { acc += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count(); }
+};
+
+// fills Tobuild with the region-section indices within STREAM_RADIUS of Eye that are not yet
+// in Built. mirrors basic_region::section() indexing (clamped to the grid). returns count.
+std::size_t wanted_sections( glm::dvec3 const &Eye, std::unordered_set<int> const &Built, std::unordered_set<int> &Tobuild ) {
+    Tobuild.clear();
+    int const N { scene::EU07_REGIONSIDESECTIONCOUNT };
+    int const ccol { static_cast<int>( std::floor( Eye.x / scene::EU07_SECTIONSIZE + N / 2 ) ) };
+    int const crow { static_cast<int>( std::floor( Eye.z / scene::EU07_SECTIONSIZE + N / 2 ) ) };
+    int const span { static_cast<int>( std::ceil( STREAM_RADIUS / scene::EU07_SECTIONSIZE ) ) };
+    for( int r = crow - span; r <= crow + span; ++r ) {
+        for( int c = ccol - span; c <= ccol + span; ++c ) {
+            int const idx { std::clamp( r, 0, N - 1 ) * N + std::clamp( c, 0, N - 1 ) };
+            if( 0 == Built.count( idx ) ) { Tobuild.insert( idx ); }
+        }
+    }
+    return Tobuild.size();
+}
+} // anonymous namespace
+
+// region-section index enclosing a world position (row-major, clamped) -- matches
+// basic_region::section() so a node buckets into the same section it inserts into.
+int
+state_serializer::section_index( glm::dvec3 const &World ) {
+    int const N { scene::EU07_REGIONSIDESECTIONCOUNT };
+    int const col { static_cast<int>( std::floor( World.x / scene::EU07_SECTIONSIZE + N / 2 ) ) };
+    int const row { static_cast<int>( std::floor( World.z / scene::EU07_SECTIONSIZE + N / 2 ) ) };
+    return std::clamp( row, 0, N - 1 ) * N + std::clamp( col, 0, N - 1 );
+}
 
 std::shared_ptr<deserializer_state>
 state_serializer::deserialize_begin( std::string const &Scenariofile ) {
 
     crashreport_add_info("scenario", Scenariofile);
+    cParser::clearInfraSkipCache(); // fresh per-load cache of pure-visual leaf includes
 
     // drop any streamed editor terrain from a previously loaded scenery before the old region (and
     // its sections, which those chunks referenced) is destroyed below
@@ -46,29 +126,22 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
 
     simulation::State.init_scripting_interface();
 
-	// NOTE: for the time being import from text format is a given, since we don't have full binary serialization
-	std::shared_ptr<deserializer_state> state =
-	        std::make_shared<deserializer_state>(Scenariofile, cParser::buffer_FILE, Global.asCurrentSceneryPath, Global.bLoadTraction);
-
-    // TODO: check first for presence of serialized binary files
-    // if this fails, fall back on the legacy text format
-	state->scratchpad.name = Scenariofile;
-    if( ( true == Global.file_binary_terrain )
-     && ( Scenariofile != "$.scn" ) ) {
-        // compilation to binary file isn't supported for rainsted-created overrides
-        // NOTE: we postpone actual loading of the scene until we process time, season and weather data
-		state->scratchpad.binary.terrain = Region->is_scene( Scenariofile ) ;
-    }
-
-	if (false != state->scratchpad.binary.terrain)
-	{
-		Global.file_binary_terrain_state = true;
-		WriteLog("Default SBT present");
-    }
-	else
-	{
-		Global.file_binary_terrain_state = false;
-		WriteLog("Default SBT absent");
+    // open the scenario file. binary scenery twins (.scnb/.incb/.scmb) are handled
+    // transparently inside cParser: if a twin exists it is replayed instead of the
+    // text, otherwise the text is parsed and a twin compiled alongside it.
+    std::shared_ptr<deserializer_state> state =
+            std::make_shared<deserializer_state>( Scenariofile, cParser::buffer_FILE, Global.asCurrentSceneryPath, Global.bLoadTraction );
+    state->scenariofile = Scenariofile;
+    state->scratchpad.name = Scenariofile;
+    // first pass loads infrastructure (tracks/traction/events/memcells/sounds + directives);
+    // visual nodes are skipped by the reader and loaded in a second pass. this two-pass split
+    // is only valid when the top-level file is itself a replayable twin, because the visual
+    // pass is started via restartReplay() which needs a top-level reader. for a text/compile
+    // load (no top twin) we MUST stay in a single 'all' pass and load everything at once;
+    // otherwise visual nodes served by included twins (.incb) would be skipped in the infra
+    // pass and never rebuilt (restartReplay returns false), and all those models go missing.
+    if( true == state->input.isReplaying() ) {
+        state->input.setReplayPass( scene::scenery_load_pass::infrastructure );
     }
     scene::Groups.create();
 
@@ -120,19 +193,171 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
 	return state;
 }
 
+// Resolves the centre point for spawn-area-first visual streaming, sampled on the first driver
+// pass (the camera isn't positioned during load, especially ghostview). Prefers the player
+// vehicle, then the live camera, then the first consist, then the scenery's first camera
+// directive; waits a few frames if nothing is positioned yet. On success records the centre and
+// the resulting mode (ringall = build everything in one pass when there is no usable centre;
+// otherwise stream sections within range). Returns true while still waiting -- the caller should
+// retry next frame -- and false once the centre/mode has been decided.
+bool
+state_serializer::resolve_stream_centre( deserializer_state &State ) {
+    auto const iszero = []( glm::dvec3 const &V ) { return ( V.x == 0.0 ) && ( V.y == 0.0 ) && ( V.z == 0.0 ); };
+    glm::dvec3 eye = Global.pCamera.Pos;
+    char const *src = "camera";
+    if( true == iszero( eye ) ) {
+        auto *player = simulation::Vehicles.find( Global.local_start_vehicle );
+        if( player != nullptr ) { eye = player->GetPosition(); src = "player vehicle"; }
+    }
+    if( ( true == iszero( eye ) ) && ( false == simulation::Vehicles.sequence().empty() ) ) {
+        // no designated player (e.g. ghostview), but the scenery has consists -- centre on the
+        // first one; it sits on the network, near where the action is.
+        eye = simulation::Vehicles.sequence().front()->GetPosition();
+        src = "first vehicle";
+    }
+    if( true == iszero( eye ) ) { eye = Global.FreeCameraInit[ 0 ]; src = "camera directive"; }
+    if( ( true == iszero( eye ) ) && ( State.ringeye_waits < 120 ) ) {
+        ++State.ringeye_waits;
+        return true; // nothing positioned yet; try again next frame
+    }
+    State.ringeye = eye;
+    State.ringeye_valid = true;
+    // no spawn/camera to centre on (e.g. ghostview at the origin): camera-following is
+    // meaningless, so build every visual node in one pass. otherwise stream by section.
+    State.ringall = iszero( eye );
+    State.sectionmode = ( false == State.ringall );
+    WriteLog( std::string( "Progressive visual load: " )
+        + ( State.ringall ?
+            "no camera centre -- building all visual nodes in one pass" :
+            "streaming sections within " + std::to_string( static_cast<int>( STREAM_RADIUS ) ) + "m of the camera (from " + src + ")" ) );
+    return false;
+}
+
 // continues deserialization for given context, amount limited by time, returns true if needs to be called again
 bool
 state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state) {
 	cParser &Input = state->input;
 	scene::scratch_data &Scratchpad = state->scratchpad;
 
-    // deserialize content from the provided input
+    // reset the transform stack before each replay pass. the directives (origin/rotate/scale)
+    // are replayed in order, so resetting here reproduces the single-pass placement exactly;
+    // without it an unbalanced origin left on the stack would be applied again and shift nodes.
+    auto const resettransform = [ &Scratchpad ]() {
+        // a well-formed pass ends with a balanced (empty) transform stack; a leftover means an
+        // origin/scale was pushed but never popped -- e.g. a node whose binary marker span
+        // over-ran its terminator and skipped the following endorigin. warn rather than let it
+        // silently accumulate into the next pass.
+        if( false == Scratchpad.location.offset.empty() ) {
+            WriteLog( "Bad scenery: " + std::to_string( Scratchpad.location.offset.size() ) + " unbalanced origin(s) left on the stack at end of a load pass" );
+        }
+        Scratchpad.location.offset = {};
+        Scratchpad.location.scale = {};
+        Scratchpad.location.rotation = glm::vec3{}; };
+
+    // mirror the visual-streaming state so deserialize_model()/deserialize_node() can decide
+    // whether a node belongs to the section set being built this cycle (or, in ringall, build
+    // everything). inactive (builds everything) outside the visual phase.
+    m_ringactive = state->visualphase;
+    if( true == m_ringactive ) {
+        if( ( false == state->ringeye_valid ) && resolve_stream_centre( *state ) ) {
+            return true; // nothing positioned yet; try again next frame
+        }
+        m_ringall = state->ringall;
+        m_sectionmode = state->sectionmode;
+        m_shapes_built = state->shapes_built;
+        m_ringeye = state->ringeye;
+        m_tobuild = &state->tobuild;
+
+        // section streaming: each cycle replays the visual twin once, building the nodes whose
+        // section is wanted (within range of the centre) and skipping the rest in O(1). a new
+        // cycle starts whenever the camera has moved into sections not yet built. NOTE: capturing
+        // a per-node index to avoid these re-scans was tried but the capture itself (params/paths
+        // for a million nodes) cost more than the scans it saved -- a bake-time section index is
+        // the real fix; for now the plain scan at least finishes and shows the spawn.
+        if( true == state->sectionmode ) {
+            if( false == state->pass_active ) {
+                // centre on the spawn (player/first vehicle) until the game starts, then follow the
+                // live driver camera. NOT the live camera during the first pass -- it isn't
+                // positioned yet (reads (0,0,0)), which built empty sections and left the spawn bare.
+                glm::dvec3 const eye { ( false == state->initial_done ) ? state->ringeye : Global.pCamera.Pos };
+                if( 0 == wanted_sections( eye, state->built, state->tobuild ) ) {
+                    return true; // nothing new in range; stay alive for camera moves
+                }
+                Input.restartReplay( scene::scenery_load_pass::visual );
+                resettransform();
+                state->pass_active = true;
+            }
+        }
+    }
+
+    // stateful directives that build objects/lists; on the visual (second) pass they are
+    // skipped wholesale so their side effects (trainsets, events, cameras, ...) don't
+    // duplicate. transform/group directives (origin/rotate/scale/group) and idempotent
+    // setters are re-run, so deferred visual nodes get the correct placement.
+    static std::unordered_map<std::string, std::string> const visualskip {
+        { "trainset",    "endtrainset" },
+        { "event",       "endevent" },
+        { "camera",      "endcamera" },
+        { "light",       "endlight" },
+        { "description", "enddescription" },
+        { "test",        "endtest" },
+        { "sky",         "endsky" },
+        { "time",        "endtime" },
+        { "terrain",     "endterrain" },
+    };
+
+    // deserialize content from the provided input. generous budget until the spawn is built (the
+    // loading screen is up: infra pass + first visual pass, nothing rendering yet), then a modest
+    // budget once streaming in the driver, where a big slice would tank fps on a live scene.
+    int const budget { state->indexed ? VISUAL_BUDGET_MS : 200 };
 	auto timelast { std::chrono::steady_clock::now() };
     std::string token { Input.getToken<std::string>() };
     while( false == token.empty() ) {
+        ++g_profile.tokens; // profile: gauge the cParser scan cost
+
+        if( state->visualphase ) {
+            auto const skip = visualskip.find( token );
+            if( skip != visualskip.end() ) {
+                // consume the stateful directive without running its handler
+                skip_until( Input, skip->second );
+                token = Input.getToken<std::string>();
+                continue;
+            }
+            // fast section skip: a visual model node carries its local position in its v7
+            // marker, so we can section-test it and drop it in O(1) -- without deserialize_node
+            // decoding any of its tokens. this is what keeps the per-cycle replay cheap when a
+            // scenery has a million flora instances. (shapes/older twins have no marker position;
+            // they fall through to deserialize_node, which section-tests them itself.)
+            if( ( true == m_sectionmode ) && ( token == "node" ) ) {
+                double x, y, z, range;
+                if( true == Input.currentNodePosition( x, y, z, range ) ) {
+                    auto const world { transform( glm::dvec3{ x, y, z }, Scratchpad ) };
+                    // a model visible from beyond the stream radius (large/unlimited range_max) is
+                    // built once, up front, regardless of section -- otherwise it would vanish at
+                    // distance. the rest are indexed and built when their section comes into range.
+                    bool const eager { ( range < 0.0 ) || ( range > STREAM_RADIUS ) };
+                    if( ( true == m_indexing ) && ( false == eager ) ) { capture_node( Input, Scratchpad, world ); }
+                    bool const wanted {
+                        eager ?
+                            ( false == m_shapes_built ) :
+                            ( 0 != m_tobuild->count( section_index( world ) ) ) };
+                    if( ( false == wanted )
+                     && ( true == Input.skipReplayNode() ) ) {
+                        auto timenow = std::chrono::steady_clock::now();
+                        if( std::chrono::duration_cast<std::chrono::milliseconds>( timenow - timelast ).count() >= budget ) {
+                            Application.set_progress( Input.getProgress(), Input.getFullProgress() );
+                            return true;
+                        }
+                        token = Input.getToken<std::string>();
+                        continue;
+                    }
+                }
+            }
+        }
 
 		auto lookup = state->functionmap.find( token );
 		if( lookup != state->functionmap.end() ) {
+            scoped_accum const dispatchguard { g_profile.dispatchtime[ token ] };
             lookup->second();
         }
         else {
@@ -140,7 +365,7 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
         }
 
 		auto timenow = std::chrono::steady_clock::now();
-        if( std::chrono::duration_cast<std::chrono::milliseconds>( timenow - timelast ).count() >= 200 ) {
+        if( std::chrono::duration_cast<std::chrono::milliseconds>( timenow - timelast ).count() >= budget ) {
             Application.set_progress( Input.getProgress(), Input.getFullProgress() );
 			return true;
         }
@@ -153,20 +378,123 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
         deserialize_firstinit( Input, Scratchpad );
     }
 
-    scene::Groups.close();
+    // helper: make the scenario playable / persist the twin. the map, instance-bound events and
+    // twin flush are done once, after the first cycle (or the single build-all pass). the active
+    // group stack is left open on purpose in section mode -- later cycles keep inserting into it
+    // (update_map reads the persistent group map, not the stack, so it works either way).
+    auto const finalize = [ & ]( bool const Closegroups ) {
+        scoped_accum const fg { g_profile.finalize };
+        if( true == Closegroups ) { scene::Groups.close(); }
+        scene::Groups.update_map();
+        Region->create_map_geometry();
+        simulation::Events.InitInstanceEvents();
+        Input.flushBinaryTwin();
+        scene::scenerybinary_wait_all(); };
 
-	scene::Groups.update_map();
-	Region->create_map_geometry();
+    // first (infrastructure) pass finished: the scenario is now playable (tracks, events,
+    // signals, the player train are all loaded). hand control back so the loader can switch to
+    // the driver; the visual nodes stream in from the driver. the camera centre / mode are
+    // resolved later, on the first driver pass (the camera isn't positioned here yet). only
+    // possible when replaying a binary twin -- a text/compile load did everything in one pass.
+    if( ( false == state->visualphase )
+     && ( true == Input.restartReplay( scene::scenery_load_pass::visual ) ) ) {
+        state->visualphase = true;
+        resettransform();
+        g_profile.log( "infrastructure" );
+        g_profile.reset(); // measure the visual phase separately
+        WriteLog( "Progressive visual load: infrastructure ready, building spawn surroundings" );
+        // stay on the loading screen for the first (spawn) pass: it's budgeted generously there
+        // (nothing rendering) so the surroundings are built fast, instead of crawling in the driver
+        // at a small budget on a low-fps scene. control passes to the driver once the spawn is ready.
+        return true;
+    }
 
-	if( ( true == Global.file_binary_terrain )
-     && ( false == state->scratchpad.binary.terrain )
-	 && ( state->scenariofile != "$.scn" ) ) {
-		// if we didn't find usable binary version of the scenario files, create them now for future use
-		// as long as the scenario file wasn't rainsted-created base file override
-		Region->serialize( state->scenariofile );
-	}
+    // section streaming: a build cycle's replay pass just finished. mark its sections built so
+    // they aren't rebuilt, finalize once after the first cycle, and stay alive so the next call
+    // can pick up sections the camera has since moved into. the load never reports "done".
+    if( ( true == state->visualphase ) && ( true == state->sectionmode ) ) {
+        if( true == state->pass_active ) {
+            state->built.insert( std::begin( state->tobuild ), std::end( state->tobuild ) );
+            state->tobuild.clear();
+            state->pass_active = false;
+            state->shapes_built = true; // explicit shapes + eager models are built in the first pass
+            if( false == state->initial_done ) {
+                finalize( /*Closegroups*/ false ); // keep groups open for later cycles
+                state->initial_done = true;
+                state->indexed = true; // first (spawn) pass done -> switch to the modest driver budget
+                WriteLog( "Progressive visual load: spawn ready (" + std::to_string( simulation::Instances.sequence().size() ) + " instances)" );
+                g_profile.log( "visual first pass" );
+                g_profile.reset();
+                return false; // spawn built on the loading screen -> hand to the driver; stream the rest there
+            }
+        }
+        return true; // keep streaming alive; sections the camera enters are rebuilt as it moves
+    }
 
-	return false;
+    // build-all (no camera centre, e.g. ghostview): everything was built in this single pass.
+    finalize( /*Closegroups*/ true );
+    state->done = true;
+    g_profile.log( "visual build-all" );
+    return false;
+}
+
+int
+state_serializer::twin_id( deserializer_state &State, std::string const &File, std::string const &Path ) {
+    std::string key = Path + "|" + File;
+    auto const it = State.twinids.find( key );
+    if( it != State.twinids.end() ) { return it->second; }
+    int const id = static_cast<int>( State.twins.size() );
+    State.twins.emplace_back( File, Path );
+    State.twinids.emplace( std::move( key ), id );
+    return id;
+}
+
+void
+state_serializer::capture_node( cParser &Input, scene::scratch_data const &Scratchpad, glm::dvec3 const &World ) {
+    // record where the node lives and the context it needs, so rebuild_section() can place it
+    // identically later without re-scanning the twin. only small-range nodes are indexed; large/
+    // unlimited-range ("eager") ones are built once up front and never streamed again.
+    if( m_state == nullptr ) { return; }
+    visual_ref ref;
+    ref.twin = twin_id( *m_state, Input.currentReplayFile(), Input.currentReplayPath() );
+    ref.offset = Input.currentReplayOffset();
+    ref.has_offset = ( false == Scratchpad.location.offset.empty() );
+    if( true == ref.has_offset ) { ref.t_offset = Scratchpad.location.offset.top(); }
+    ref.has_scale = ( false == Scratchpad.location.scale.empty() );
+    if( true == ref.has_scale ) { ref.t_scale = Scratchpad.location.scale.top(); }
+    ref.t_rotation = Scratchpad.location.rotation;
+    ref.params = Input.currentReplayParams();
+    m_state->index[ section_index( World ) ].emplace_back( std::move( ref ) );
+}
+
+void
+state_serializer::rebuild_section( deserializer_state &State, int Section ) {
+    auto const it = State.index.find( Section );
+    if( it == State.index.end() ) { return; }
+    scene::scratch_data &Scratchpad = State.scratchpad;
+    for( auto &ref : it->second ) {
+        // reuse one parser per twin across the whole stream (re-opening an .inc is not free)
+        auto pit = State.rebuild_parsers.find( ref.twin );
+        if( pit == State.rebuild_parsers.end() ) {
+            auto const &tw = State.twins[ ref.twin ];
+            pit = State.rebuild_parsers.emplace(
+                ref.twin,
+                std::make_unique<cParser>( tw.first, cParser::buffer_FILE, tw.second, Global.bLoadTraction ) ).first;
+        }
+        cParser &cp = *pit->second;
+        cp.seekReplayNode( ref.offset );
+        cp.setReplayParams( ref.params );
+        // restore the transform context captured for this node
+        Scratchpad.location.offset = {};
+        if( true == ref.has_offset ) { Scratchpad.location.offset.push( ref.t_offset ); }
+        Scratchpad.location.scale = {};
+        if( true == ref.has_scale ) { Scratchpad.location.scale.push( ref.t_scale ); }
+        Scratchpad.location.rotation = ref.t_rotation;
+        auto const tok = cp.getToken<std::string>();
+        if( tok == "node" ) { deserialize_node( cp, Scratchpad ); }
+    }
+    // the section is built; release its index entries
+    std::vector<visual_ref>().swap( it->second );
 }
 
 void
@@ -367,16 +695,6 @@ state_serializer::deserialize_firstinit( cParser &Input, scene::scratch_data &Sc
 
     if( true == Scratchpad.initialized ) { return; }
 
-    if( true == Scratchpad.binary.terrain ) {
-        // at this stage it should be safe to import terrain from the binary scene file
-        // TBD: postpone loading furter and only load required blocks during the simulation?
-		if (false == Scratchpad.binary.terrain_included)
-		{
-			Region->deserialize(Scratchpad.name);
-		}
-			
-    }
-
     simulation::Paths.InitTracks();
     simulation::Traction.InitTraction();
     simulation::Events.InitEvents();
@@ -435,6 +753,9 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
         >> nodedata.name
         >> nodedata.type;
     if( nodedata.name == "none" ) { nodedata.name.clear(); }
+    // profile: attribute this node's build time to its type (see g_profile log at pass boundaries)
+    scoped_accum const profileguard { g_profile.typetime[ nodedata.type ] };
+    ++g_profile.typecount[ nodedata.type ];
     // type-based deserialization. not elegant but it'll do
     if( nodedata.type == "dynamic" ) {
 
@@ -506,37 +827,30 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
     else if( nodedata.type == "model" ) {
 
         if( nodedata.range_min < 0.0 ) {
-            // 3d terrain
-            if( false == Scratchpad.binary.terrain ) {
-                // if we're loading data from text .scn file convert and import
-                auto *instance = deserialize_model( Input, Scratchpad, nodedata );
-                // model import can potentially fail
-                if( instance == nullptr ) { return; }
-                // go through submodels, and import them as shapes
-                auto const cellcount = instance->TerrainCount() + 1; // zliczenie submodeli
-                for( auto i = 1; i < cellcount; ++i ) {
-                    auto *submodel = instance->TerrainSquare( i - 1 );
+            // 3d terrain: convert the model's submodels into region shapes
+            auto *instance = deserialize_model( Input, Scratchpad, nodedata );
+            // model import can potentially fail
+            if( instance == nullptr ) { return; }
+            // go through submodels, and import them as shapes
+            auto const cellcount = instance->TerrainCount() + 1; // zliczenie submodeli
+            for( auto i = 1; i < cellcount; ++i ) {
+                auto *submodel = instance->TerrainSquare( i - 1 );
+                simulation::Region->insert(
+                    scene::shape_node().convert( submodel ),
+                    Scratchpad,
+                    false );
+                // if there's more than one group of triangles in the cell they're held as children of the primary submodel
+                submodel = submodel->ChildGet();
+                while( submodel != nullptr ) {
                     simulation::Region->insert(
                         scene::shape_node().convert( submodel ),
                         Scratchpad,
                         false );
-                    // if there's more than one group of triangles in the cell they're held as children of the primary submodel
-                    submodel = submodel->ChildGet();
-                    while( submodel != nullptr ) {
-                        simulation::Region->insert(
-                            scene::shape_node().convert( submodel ),
-                            Scratchpad,
-                            false );
-                        submodel = submodel->NextGet();
-                    }
+                    submodel = submodel->NextGet();
                 }
-                // with the import done we can get rid of the source model
-                delete instance;
             }
-            else {
-                // if binary terrain file was present, we already have this data
-                skip_until( Input, "endmodel" );
-            }
+            // with the import done we can get rid of the source model
+            delete instance;
         }
         else {
             // regular instance of 3d mesh
@@ -568,11 +882,28 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
           || ( nodedata.type == "triangle_strip" )
           || ( nodedata.type == "triangle_fan" ) ) {
 
+        // origin-placed shapes (e.g. flora includes) carry their world position in the active
+        // origin, so they section-stream like models: indexed on the first pass, rebuilt per
+        // section after. absolute shapes (terrain, no origin) have no single position -> built
+        // once in the first pass. (m_rebuilding: chosen from the index -> build unconditionally.)
+        if( ( true == m_sectionmode ) && ( false == m_rebuilding ) && ( nullptr != m_tobuild ) ) {
+            if( false == Scratchpad.location.offset.empty() ) {
+                glm::dvec3 const world { Scratchpad.location.offset.top() };
+                if( true == m_indexing ) { capture_node( Input, Scratchpad, world ); }
+                if( 0 == m_tobuild->count( section_index( world ) ) ) {
+                    if( false == Input.skipReplayNode() ) { skip_until( Input, "endtri" ); }
+                    return;
+                }
+            }
+            else if( true == m_shapes_built ) {
+                if( false == Input.skipReplayNode() ) { skip_until( Input, "endtri" ); }
+                return;
+            }
+        }
+
         auto const skip {
-            // all shapes will be loaded from the binary version of the file
-            ( true == Scratchpad.binary.terrain )
             // crude way to detect fixed switch trackbed geometry
-         || ( ( true == Global.CreateSwitchTrackbeds )
+            ( ( true == Global.CreateSwitchTrackbeds )
            && ( Input.Name().size() >= 15 )
            && Input.Name().starts_with("scenery/zwr")
            && Input.Name().ends_with(".inc") ) };
@@ -593,17 +924,26 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
           || ( nodedata.type == "line_strip" )
           || ( nodedata.type == "line_loop" ) ) {
 
-        if( false == Scratchpad.binary.terrain ) {
+        // see the triangles branch: origin-placed lines section-stream, absolute ones build once.
+        if( ( true == m_sectionmode ) && ( false == m_rebuilding ) && ( nullptr != m_tobuild ) ) {
+            if( false == Scratchpad.location.offset.empty() ) {
+                glm::dvec3 const world { Scratchpad.location.offset.top() };
+                if( true == m_indexing ) { capture_node( Input, Scratchpad, world ); }
+                if( 0 == m_tobuild->count( section_index( world ) ) ) {
+                    if( false == Input.skipReplayNode() ) { skip_until( Input, "endline" ); }
+                    return;
+                }
+            }
+            else if( true == m_shapes_built ) {
+                if( false == Input.skipReplayNode() ) { skip_until( Input, "endline" ); }
+                return;
+            }
+        }
 
-            simulation::Region->insert(
-                scene::lines_node().import(
-                    Input, nodedata ),
-                Scratchpad );
-        }
-        else {
-            // all lines were already loaded from the binary version of the file
-            skip_until( Input, "endline" );
-        }
+        simulation::Region->insert(
+            scene::lines_node().import(
+                Input, nodedata ),
+            Scratchpad );
     }
     else if( nodedata.type == "memcell" ) {
 
@@ -791,22 +1131,9 @@ state_serializer::deserialize_trainset( cParser &Input, scene::scratch_data &Scr
 void 
 state_serializer::deserialize_terrain(cParser &Input, scene::scratch_data &Scratchpad)
 {
-	std::string line;
-	Input.getTokens(1);
-	Input >> line;
-	if (Global.file_binary_terrain && line.ends_with(".sbt"))
-	{  
-        Scratchpad.binary.terrain = Region->is_scene(line);
-		Global.file_binary_terrain_state = true;
-		Scratchpad.binary.terrain_included = true;
-		Scratchpad.terrain_name = line;
-		WriteLog("Included SBT file: " + line);
-		Region->deserialize(Scratchpad.terrain_name);
-
-    }
-
-    skip_until(Input, "endterrain");
-
+	// legacy directive; the SBT terrain blob has been retired and terrain now loads
+	// as ordinary scenery content, so the block is simply consumed.
+	skip_until(Input, "endterrain");
 }
 
 void
@@ -982,6 +1309,33 @@ state_serializer::deserialize_model( cParser &Input, scene::scratch_data &Scratc
         >> location.y
         >> location.z
         >> rotation.y;
+
+    // camera-following visual streaming: build this model only if its region section is in the
+    // set being built this cycle; otherwise skip the rest of its body in O(1) and let a later
+    // cycle (once the camera is near) pick it up. covers terrain models (range_min<0) too -- they
+    // also have X Y Z. most out-of-range models are already dropped O(1) at the dispatch loop via
+    // their v7 marker; this is the fallback for nodes that reached here (in-range, or no marker).
+    // use the marker position when present so this decision matches the dispatch one exactly.
+    // m_rebuilding: this node was chosen from the section index, so build it unconditionally.
+    if( ( true == m_sectionmode ) && ( false == m_rebuilding ) && ( nullptr != m_tobuild ) ) {
+        // models visible from beyond the stream radius build once (first cycle); the rest build
+        // when their section is in range. mirrors the dispatch-loop fast path exactly.
+        bool const eager { ( Nodedata.range_max < 0.0 ) || ( Nodedata.range_max > STREAM_RADIUS ) };
+        bool wanted;
+        if( true == eager ) {
+            wanted = ( false == m_shapes_built );
+        }
+        else {
+            glm::dvec3 modellocal { location };
+            double mx, my, mz, mr;
+            if( true == Input.currentNodePosition( mx, my, mz, mr ) ) { modellocal = glm::dvec3{ mx, my, mz }; }
+            wanted = ( 0 != m_tobuild->count( section_index( transform( modellocal, Scratchpad ) ) ) );
+        }
+        if( false == wanted ) {
+            if( false == Input.skipReplayNode() ) { skip_until( Input, "endmodel" ); }
+            return nullptr;
+        }
+    }
 
     auto *instance = new TAnimModel( Nodedata );
     instance->Angles( Scratchpad.location.rotation + rotation ); // dostosowanie do pochylania linii

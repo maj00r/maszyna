@@ -10,8 +10,21 @@ http://mozilla.org/MPL/2.0/.
 #include "stdafx.h"
 #include "utilities/parser.h"
 #include "utilities/Logs.h"
+#include "utilities/utilities.h"
+#include "utilities/Globals.h"
 
 #include "scene/scenenodegroups.h"
+#include "scene/scenerybinary.h"
+
+#include <charconv>
+#include <cmath>
+#include <filesystem>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+#include <unordered_set>
 
 /*
     MaSzyna EU07 locomotive simulator parser
@@ -46,11 +59,111 @@ inline bool startsWithBOM(const std::string &s)
 		&& static_cast<unsigned char>(s[1]) == 0xBB
 		&& static_cast<unsigned char>(s[2]) == 0xBF;
 }
+
+// true if the whole token is a finite decimal number; on success Value is set.
+// used to store numeric tokens as typed doubles in the binary twin instead of text.
+inline bool sniffNumber(const std::string &token, double &Value)
+{
+	if (token.empty())
+	{
+		return false;
+	}
+	const char *first = token.data();
+	const char *last = token.data() + token.size();
+	double value = 0.0;
+	auto const result = std::from_chars(first, last, value);
+	// require the entire token to be consumed and the value to be finite (reject
+	// "inf"/"nan"/overflow, and identifiers like "12abc" or "1.2.3")
+	if ((result.ec != std::errc()) || (result.ptr != last) || (false == std::isfinite(value)))
+	{
+		return false;
+	}
+	return (Value = value, true);
+}
+
+// shortest representation of a double that round-trips back to the same value,
+// used when serving a numeric twin entry to the (text-oriented) deserializer
+inline std::string formatNumber(double Value)
+{
+	char buffer[32];
+	auto const result = std::to_chars(buffer, buffer + sizeof(buffer), Value);
+	return std::string(buffer, result.ptr);
+}
+
+// classifies a scenery node by its `type` token (lower-cased) for v6 markers: sets Visual
+// and the node's terminator token. returns false for an unrecognized type. mapping
+// confirmed against the node deserializers.
+inline bool classifyNodeType(std::string const &Type, bool &Visual, std::string &Endtoken)
+{
+	struct entry { char const *type; bool visual; char const *end; };
+	static const entry table[] = {
+		{ "model",               true,  "endmodel" },
+		{ "triangles",           true,  "endtri" },
+		{ "triangle_strip",      true,  "endtri" },
+		{ "triangle_fan",        true,  "endtri" },
+		{ "lines",               true,  "endline" },
+		{ "line_strip",          true,  "endline" },
+		{ "line_loop",           true,  "endline" },
+		{ "track",               false, "endtrack" },
+		{ "traction",            false, "endtraction" },
+		{ "tractionpowersource", false, "end" },
+		{ "memcell",             false, "endmemcell" },
+		{ "eventlauncher",       false, "end" },
+		{ "sound",               false, "endsound" },
+		{ "dynamic",             false, "enddynamic" },
+	};
+	for (auto const &e : table) {
+		if (Type == e.type) { Visual = e.visual; Endtoken = e.end; return true; }
+	}
+	return false;
+}
+
+inline bool endsWithLower(const std::string &s, const char *suffix)
+{
+	const std::string suf(suffix);
+	return s.size() >= suf.size() && ToLower(s.substr(s.size() - suf.size())) == suf;
+}
+
+// scenery source files (and only these) get binary twins
+inline bool isSceneryFile(const std::string &name)
+{
+	// text scenery component files share one syntax (per wiki: SCN/SCM/CTR/INC).
+	// .eu7 is intentionally excluded: it is not a documented text format (it can be an
+	// editor/binary file), so tokenizing it into a twin would be wrong.
+	return endsWithLower(name, ".scn") || endsWithLower(name, ".inc")
+	    || endsWithLower(name, ".scm") || endsWithLower(name, ".ctr");
+}
+
+inline scene::scenery_file_kind sceneryKind(const std::string &name)
+{
+	if (endsWithLower(name, ".inc")) return scene::scenery_file_kind::inc;
+	if (endsWithLower(name, ".scm")) return scene::scenery_file_kind::scm;
+	return scene::scenery_file_kind::scn;
+}
+
+// the twin may be replayed only if it is at least as new as its source text, so that
+// editing a scenery file forces a recompile instead of replaying a stale twin
+inline bool twinIsFresh(const std::string &sourcefull, const std::string &twinfull)
+{
+	std::error_code ec;
+	auto const sourcetime = std::filesystem::last_write_time(sourcefull, ec);
+	if (ec)
+	{
+		// can't read the source time (e.g. packed/missing): trust the twin
+		return true;
+	}
+	auto const twintime = std::filesystem::last_write_time(twinfull, ec);
+	if (ec)
+	{
+		return false;
+	}
+	return (twintime >= sourcetime);
+}
 } // namespace
 
 // constructors
-cParser::cParser(std::string const &Stream, buffertype const Type, std::string Path, bool const Loadtraction, std::vector<std::string> Parameters, bool allowRandom)
-    : allowRandomIncludes(allowRandom), LoadTraction(Loadtraction), mPath(Path)
+cParser::cParser(std::string const &Stream, buffertype const Type, std::string Path, bool const Loadtraction, std::vector<std::string> Parameters, bool allowRandom, bool BakeOnly)
+    : allowRandomIncludes(allowRandom), LoadTraction(Loadtraction), mPath(Path), m_bakeonly(BakeOnly)
 {
 	// store to calculate sub-sequent includes from relative path
 	if (Type == buffertype::buffer_FILE)
@@ -62,13 +175,87 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 	{
 	case buffer_FILE:
 	{
-		Path.append(Stream);
-		mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
-		// content of *.inc files is potentially grouped together
-		if ((Stream.size() >= 4) && (ToLower(Stream.substr(Stream.size() - 4)) == ".inc"))
+		// bake-only: always compile this one file's twin from text, never touch scene
+		// groups and never replay; includes are recorded but not opened (the parallel
+		// baker compiles them separately)
+		if (m_bakeonly)
+		{
+			Path.append(Stream);
+			mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
+			if (false == mStream->fail())
+			{
+				m_compiling = true;
+				std::string twinrel = Stream;
+				erase_extension(twinrel);
+				twinrel += scene::scenerybinary_extension_for(Stream);
+				m_binarytwinpath = mPath + twinrel;
+				m_binarykind = sceneryKind(Stream);
+				m_writer = std::make_unique<scene::scenery_binary_writer>();
+			}
+			break;
+		}
+
+		// content of *.inc files is grouped together (same for text and binary replay)
+		if (endsWithLower(Stream, ".inc"))
 		{
 			mIncFile = true;
 			scene::Groups.create();
+		}
+
+		bool opened = false;
+		// scenery files (.scn/.inc/.scm) are backed by a binary twin: replay it if
+		// present, otherwise parse the text and compile a twin alongside it.
+		// rainsted-created '$' overrides are always parsed from text.
+		if (Global.file_binary_scenery && isSceneryFile(Stream) && (false == Stream.empty()) && (Stream[0] != '$'))
+		{
+			std::string twinrel = Stream;
+			erase_extension(twinrel);
+			twinrel += scene::scenerybinary_extension_for(Stream);
+			std::string const twinfull = mPath + twinrel;
+			std::string const sourcefull = mPath + Stream;
+
+			std::ifstream probe(twinfull, std::ios_base::binary);
+			bool replaying = false;
+			if (probe.good() && twinIsFresh(sourcefull, twinfull))
+			{
+				// slurp the whole twin once; the reader parses it by pointer and serves
+				// entries on demand (string tokens as views into this buffer)
+				std::ostringstream slurp;
+				slurp << probe.rdbuf();
+				m_twinbuf = std::move(slurp).str();
+				m_reader = std::make_unique<scene::scenery_binary_reader>();
+				if (m_reader->open(m_twinbuf))
+				{
+					m_replay = true;
+					mStream = std::make_shared<std::istringstream>(std::string());
+					replaying = true;
+					opened = true;
+				}
+				else
+				{
+					m_reader.reset();
+				}
+			}
+			if (false == replaying)
+			{
+				Path.append(Stream);
+				mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
+				if (false == mStream->fail())
+				{
+					// no usable twin: compile one while parsing the text
+					m_compiling = true;
+					m_binarytwinpath = twinfull;
+					m_binarykind = sceneryKind(Stream);
+					m_writer = std::make_unique<scene::scenery_binary_writer>();
+				}
+				opened = true;
+			}
+		}
+		if (false == opened)
+		{
+			// non-scenery file, or binary scenery disabled: plain text parse
+			Path.append(Stream);
+			mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
 		}
 		break;
 	}
@@ -82,17 +269,28 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 		break;
 	}
 	}
-	// calculate stream size
+	// slurp the whole source into memory and tokenize from the buffer; reading char
+	// by char from the stream (get()/peek()) goes through the virtual streambuf on
+	// every character, which dominates parse time on large sceneries.
 	if (mStream)
 	{
 		if (true == mStream->fail())
 		{
-			ErrorLog("Failed to open file \"" + Path + "\"");
+			// bake-only parsers run on worker threads; the logger is not thread-safe, so
+			// stay silent here (the driver checks ok() and simply skips a file it couldn't
+			// open). missing includes still surface during the normal text/replay load.
+			if (false == m_bakeonly)
+			{
+				ErrorLog("Failed to open file \"" + Path + "\"");
+			}
 		}
-		else
+		else if (false == m_replay)
 		{
-			mSize = mStream->rdbuf()->pubseekoff(0, std::ios_base::end);
-			mStream->rdbuf()->pubseekoff(0, std::ios_base::beg);
+			std::ostringstream slurp;
+			slurp << mStream->rdbuf();
+			m_buffer = std::move(slurp).str();
+			m_bufferpos = 0;
+			mSize = static_cast<std::streamoff>(m_buffer.size());
 			mLine = 1;
 		}
 	}
@@ -106,12 +304,67 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 // destructor
 cParser::~cParser()
 {
+	// fallback flush in case the twin wasn't explicitly finalized
+	flushBinaryTwin();
 
 	if (true == mIncFile)
 	{
 		// wrap up the node group holding content of processed file
 		scene::Groups.close();
 	}
+}
+
+void cParser::bakeFinishNode()
+{
+	// flush a node still open at end-of-file or one whose type was unrecognized
+	if (m_bakenode_active && m_writer)
+	{
+		m_writer->end_node(m_bakenode_visual, m_bakenode_haspos, m_bakenode_pos[0], m_bakenode_pos[1], m_bakenode_pos[2], m_bakenode_rangemax);
+	}
+	m_bakenode_active = false;
+}
+
+std::vector<std::string> cParser::bakeFile()
+{
+	// drain the file: every token is captured into the twin, include directives are
+	// recorded (their candidate filenames collected) but not opened
+	std::string token;
+	do { token = getToken<std::string>(); } while (false == token.empty());
+	bakeFinishNode();
+
+	// write the twin synchronously -- the parallel baker already runs one file per
+	// worker thread, so there is no point handing this to the async pool
+	if (m_compiling && m_writer && (false == m_twinwritten) && (m_bufferpos >= m_buffer.size()))
+	{
+		m_twinwritten = true;
+		std::ofstream output(m_binarytwinpath, std::ios_base::binary);
+		// errors are intentionally not logged here (worker thread); a missing/short twin
+		// is simply recompiled on the next normal load
+		(void)(output.good() && m_writer->write(output, m_binarykind));
+	}
+	return std::move(m_bakeincludes);
+}
+
+void cParser::flushBinaryTwin()
+{
+	// write the twin only once, only when compiling, and only if the source text was
+	// fully consumed -- an aborted parse must not leave a truncated twin to be replayed
+	if ((false == m_compiling) || (false == static_cast<bool>(m_writer)) || m_twinwritten)
+	{
+		return;
+	}
+	if (m_bufferpos < m_buffer.size())
+	{
+		// source not fully consumed (aborted parse): don't leave a truncated twin
+		return;
+	}
+	bakeFinishNode(); // close a node still open at end-of-file
+	m_twinwritten = true;
+
+	// hand the finished writer to the background pool; serialization and file I/O then
+	// overlap with the rest of the scene build instead of blocking it. ownership of the
+	// writer transfers to the task, so this cParser no longer touches it.
+	scene::scenerybinary_write_async(std::move(m_writer), m_binarytwinpath, m_binarykind);
 }
 
 template <> glm::vec3 cParser::getToken(bool const ToLower, char const *Break)
@@ -220,6 +473,13 @@ bool cParser::getTokens(unsigned int Count, bool ToLower, const char *Break)
 
 std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 {
+	// the token is produced in its ORIGINAL case; lower-casing (when requested) is applied
+	// to the consumer copy in readToken. this keeps the binary twin's captured tokens
+	// case-faithful regardless of how a given read is cased, which is what lets the
+	// headless/standalone bake tokenize correctly without knowing the grammar.
+	(void)ToLower;
+	m_lastquoted = false;
+
 	std::string token;
 	token.reserve(64);
 
@@ -227,9 +487,9 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 	char c = 0;
 
 
-	while (token.empty() && mStream->peek() != EOF) {
-		while (mStream->peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
-			c = static_cast<char>(mStream->get());
+	while (token.empty() && m_bufferpos < m_buffer.size()) {
+		while (m_bufferpos < m_buffer.size()) {
+			c = m_buffer[m_bufferpos++];
 			if (c == '\n') {
 				++mLine;
 			}
@@ -242,10 +502,10 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 				continue;
 			}
 
-			if (ToLower) c = toLowerChar(c);
 			token.push_back(c);
 
 			if (findQuotes(token)) {
+				m_lastquoted = true; // came from a quoted span; never lower-cased
 				continue; // glue quoted content
 			}
 			if (skipComments && trimComments(token)) {
@@ -266,7 +526,7 @@ void cParser::stripFirstTokenBOM(std::string& token, bool ToLower, const char* B
 	}
 
 	// if first "token" was standalone BOM, read the next real token (avoid recursion)
-	while (token.empty() && mStream->peek() != EOF) {
+	while (token.empty() && m_bufferpos < m_buffer.size()) {
 		readToken(token, ToLower, Break);
 		// readToken will not re-enter BOM stripping because mFirstToken is now false
 		break;
@@ -313,72 +573,166 @@ void cParser::skipIncludeBlock() {
 	} while (t != "end" && !t.empty());
 }
 
-void cParser::startIncludeFromParser(cParser& srcParser, bool ToLower, std::string includefile) {
-	replace_slashes(includefile);
+void cParser::processInclude(cParser& srcParser, bool ToLower) {
+	// the filename expression and parameters are part of the directive, not file
+	// content, so keep them out of this file's own captured token stream
+	bool const prevsuppress = m_capturesuppress;
+	m_capturesuppress = true;
+
+	std::vector<std::string> fileexpr;
+	std::string pick;
+	if (allowRandomIncludes) {
+		// capture the verbatim expression (incl. random-set brackets) and pick one
+		pick = deserialize_random_set_capture(srcParser, fileexpr);
+	}
+	else {
+		std::string filename;
+		srcParser.readToken(filename, ToLower);
+		std::replace(filename.begin(), filename.end(), '\\', '/');
+		fileexpr.emplace_back(filename);
+		pick = filename;
+	}
+	// consume the directive's parameter list (up to "end")
+	std::vector<std::string> params = readParameters(srcParser);
+
+	m_capturesuppress = prevsuppress;
+
+	// record the include reference verbatim so replay can re-randomize the choice
+	if (m_compiling && m_writer) {
+		m_writer->add_include(fileexpr, params);
+	}
+
+	if (m_bakeonly) {
+		// standalone/parallel bake: don't open the child here. record every candidate
+		// filename (a random set may list several) so the baker can compile each twin
+		// independently on its own worker thread.
+		for (auto const &token : fileexpr) {
+			if ((token != "[") && (token != "]") && (false == token.empty())) {
+				std::string candidate = token;
+				replace_slashes(candidate);
+				m_bakeincludes.emplace_back(std::move(candidate));
+			}
+		}
+		return;
+	}
+
+	// open the include for the live load with a freshly evaluated filename
+	replace_slashes(pick);
+	startIncludeDirect(std::move(pick), std::move(params));
+}
+
+std::map<std::string, bool> cParser::s_infraskip;
+
+bool cParser::infraRelevant() const {
+	return (m_replay && m_reader) ? m_reader->infra_relevant() : true;
+}
+
+void cParser::clearInfraSkipCache() { s_infraskip.clear(); }
+
+void cParser::startIncludeDirect(std::string includefile, std::vector<std::string> Params) {
 
 	const bool allowTraction =
 		(true == LoadTraction) ||
 		((false == contains(includefile, "tr/")) && (false == contains(includefile, "tra/")));
 
 	if (!allowTraction) {
-		// skip include block until "end" (original behavior in token-mode include)
-		skipIncludeBlock();
+		// traction loading disabled: the include is simply not opened
 		return;
 	}
 
-	const bool isTerrain = contains(includefile, "_ter.scm");
-	if (isTerrain && true == Global.file_binary_terrain_state) {
-		WriteLog("SBT found, ignoring: " + includefile);
-		readParameters(srcParser); // preserve original side-effect: still consume parameters
-		return;
-	}
-
-	if (Global.ParserLogIncludes) {
-		if (isTerrain) WriteLog("including terrain: " + includefile);
-		else {
-			// WriteLog("including: " + includefile);
+	// infrastructure pass: don't open a pure-visual leaf (e.g. a flora .incb) just to skip its
+	// content -- on a million-instance scenery that was ~200k wasted reopens. the first open of
+	// each file records whether it's infra-relevant; later opens of the same file are skipped.
+	bool const infrapass = (m_replaypass == scene::scenery_load_pass::infrastructure);
+	std::string skipkey;
+	if (infrapass) {
+		skipkey = mPath + includefile;
+		auto const it = s_infraskip.find(skipkey);
+		if ((it != s_infraskip.end()) && (true == it->second)) {
+			return; // known pure-visual leaf
 		}
 	}
 
+	if (Global.ParserLogIncludes) {
+		// WriteLog("including: " + includefile);
+	}
+
 	mIncludeParser = std::make_shared<cParser>(
-		includefile, /*buffer_FILE*/ static_cast<buffertype>(/*buffer_FILE*/ 0), mPath, LoadTraction, readParameters(srcParser)
+		includefile, buffer_FILE, mPath, LoadTraction, std::move(Params)
 	);
 	mIncludeParser->allowRandomIncludes = allowRandomIncludes;
 	mIncludeParser->autoclear(m_autoclear);
+	// the child inherits the current load pass so the whole include tree is filtered
+	// consistently (e.g. visuals-only on the second pass)
+	mIncludeParser->setReplayPass(m_replaypass);
 
-	if (mIncludeParser->mSize <= 0) {
+	// infrastructure pass: a pure-visual leaf twin has nothing to do here. record it (so the next
+	// of its thousands of reopens is skipped before even opening) and drop it now.
+	if (infrapass && mIncludeParser->m_replay) {
+		bool const relevant = mIncludeParser->infraRelevant();
+		s_infraskip[skipkey] = (false == relevant);
+		if (false == relevant) {
+			mIncludeParser = nullptr;
+			return;
+		}
+	}
+
+	// pass filtering (infra eager / visual deferred) relies on the per-node markers that
+	// only a binary twin carries. an un-baked (text) include has no markers, so it can't
+	// be split: it is loaded in full during the infrastructure pass. on the visual pass we
+	// must therefore NOT reopen it -- doing so would reprocess every node a second time
+	// (duplicates) and, for parameterized text includes, re-run their models against a
+	// parser whose parameters no longer apply, leaking a literal "(pN)" into the model
+	// loader (which then throws). drop it; its content already loaded on the first pass.
+	if ((m_replaypass == scene::scenery_load_pass::visual) && (false == mIncludeParser->m_replay)) {
+		mIncludeParser = nullptr;
+		return;
+	}
+
+	// a binary-twin replay child reports mSize 0 but is still valid
+	if (mIncludeParser->mSize <= 0 && (false == mIncludeParser->m_replay)) {
 		ErrorLog("Bad include: can't open file \"" + includefile + "\"");
 	}
 }
 
+void cParser::setReplayPass(scene::scenery_load_pass Pass)
+{
+	m_replaypass = Pass;
+	if (m_reader)
+	{
+		m_reader->set_pass(Pass);
+	}
+}
+
+bool cParser::restartReplay(scene::scenery_load_pass Pass)
+{
+	if ((false == m_replay) || (false == static_cast<bool>(m_reader)))
+	{
+		return false;
+	}
+	m_reader->open(m_twinbuf);
+	m_reader->set_pass(Pass);
+	m_replaypass = Pass;
+	m_replayexhausted = false;
+	mIncludeParser = nullptr;
+	return true;
+}
+
 bool cParser::handleIncludeIfPresent(std::string& token, bool ToLower, const char* Break) {
-	// token-mode include: token == "include"
+	// token-mode include: token == "include". NOTE: we only process the directive here
+	// and report it; readToken loops to fetch the next token. fetching it here (the old
+	// behaviour) recursed once per consecutive include, overflowing the stack on files
+	// with long runs of includes (e.g. signaling .scm) -- especially in bake-only mode
+	// where the child isn't opened to break the chain.
 	if (expandIncludes && token == "include") {
-		std::string includefile;
-		if (allowRandomIncludes)
-			includefile = deserialize_random_set(*this);
-		else
-			readToken(includefile, ToLower);
-
-		startIncludeFromParser(*this, ToLower, std::move(includefile));
-
-		// after processing include, return next token from current parser
-		readToken(token, ToLower, Break);
+		processInclude(*this, ToLower);
 		return true;
 	}
 
 	// line-mode HACK: Break == "\n\r" and line begins with "include"
 	if ((std::strcmp(Break, "\n\r") == 0) && token.compare(0, 7, "include") == 0) {
 		cParser includeparser(token.substr(7));
-		std::string includefile;
-		if (allowRandomIncludes)
-			includefile = deserialize_random_set(includeparser);
-		else
-			includeparser.readToken(includefile, ToLower);
-
-		startIncludeFromParser(includeparser, ToLower, std::move(includefile));
-
-		readToken(token, ToLower, Break);
+		processInclude(includeparser, ToLower);
 		return true;
 	}
 
@@ -387,25 +741,310 @@ bool cParser::handleIncludeIfPresent(std::string& token, bool ToLower, const cha
 
 void cParser::readToken(std::string &out, bool ToLower, const char *Break)
 {
-	if (mIncludeParser)
+	if (m_replay)
 	{
-		mIncludeParser->readToken(out, ToLower, Break);
-		if (out.empty())
+		// served from the binary twin; includes are entered transparently
+		readReplayToken(out, ToLower, Break);
+		return;
+	}
+
+	// include directives are handled iteratively: a run of consecutive includes loops
+	// here instead of recursing through readToken (which overflowed the stack on files
+	// with hundreds of back-to-back include lines).
+	for (;;)
+	{
+		bool fromOwn;
+		bool quoted = false;
+		if (mIncludeParser)
 		{
-			mIncludeParser = nullptr;
-			out = readTokenFromStream(ToLower, Break);
+			mIncludeParser->readToken(out, ToLower, Break);
+			if (out.empty())
+			{
+				mIncludeParser = nullptr;
+				out = readTokenFromStream(ToLower, Break);
+				quoted = m_lastquoted;
+				fromOwn = true;
+			}
+			else
+			{
+				fromOwn = false;
+			}
 		}
+		else
+		{
+			out = readTokenFromStream(ToLower, Break);
+			quoted = m_lastquoted;
+			fromOwn = true;
+		}
+
+		stripFirstTokenBOM(out, ToLower, Break);
+
+		// snapshot the original-case token (BOM stripped, before substitution) for the
+		// twin, then produce the consumer copy: only unquoted tokens are lower-cased
+		// (quoted spans keep their case, matching the legacy tokenizer)
+		std::string rawtoken;
+		bool rawquoted = false;
+		if (fromOwn)
+		{
+			rawtoken = out;
+			rawquoted = quoted;
+			if (ToLower && (false == quoted))
+			{
+				for (auto &ch : out) { ch = toLowerChar(ch); }
+			}
+		}
+
+		substituteParameters(out, ToLower);
+
+		if (handleIncludeIfPresent(out, ToLower, Break))
+		{
+			// the include directive was consumed; fetch the next token
+			continue;
+		}
+
+		// capture this file's own content into its twin. include directive tokens are
+		// excluded (handled above); child-include tokens (fromOwn == false) belong to the
+		// child's own twin.
+		if (m_compiling && m_writer && fromOwn
+		 && (false == m_capturesuppress) && (false == rawtoken.empty()))
+		{
+			bakeCaptureToken(rawtoken, rawquoted);
+		}
+		return;
+	}
+}
+
+void cParser::bakeBeginNode()
+{
+	// open a fresh node and reset the per-node tracking state
+	m_writer->begin_node();
+	m_bakenode_active = true;
+	m_bakenode_count = 0;
+	m_bakenode_visual = false;
+	m_bakenode_haspos = false;
+	m_bakenode_end.clear();
+}
+
+void cParser::bakeCaptureToken(std::string const &rawtoken, bool rawquoted)
+{
+	// v6: wrap each top-level node in a marker so the reader can serve/skip it per load
+	// pass. a node starts at the "node" keyword and ends at its type-specific terminator;
+	// nodes are never nested.
+	std::string const lowered = ::ToLower(rawtoken); // ::-qualified; the param `ToLower` shadows it
+	if ((false == m_bakenode_active) && (lowered == "node"))
+	{
+		bakeBeginNode();
+	}
+	else if (m_bakenode_active && m_bakenode_end.empty() && (lowered == "node"))
+	{
+		// previous node had an unrecognized type (no terminator found): close it just
+		// before this new node starts
+		bakeFinishNode();
+		bakeBeginNode();
+	}
+
+	// numeric tokens -> typed values; quoted strings preserve case at replay; other strings
+	// (names, paths, keywords, "(pN)") may be lower-cased per consumer
+	double value = 0.0;
+	if ((false == rawquoted) && sniffNumber(rawtoken, value))
+	{
+		m_writer->add_number(value);
 	}
 	else
 	{
-		out = readTokenFromStream(ToLower, Break);
+		m_writer->add_token(rawtoken, rawquoted);
 	}
 
-	stripFirstTokenBOM(out, ToLower, Break);
+	if (m_bakenode_active)
+	{
+		bakeTrackNodeEntry(rawtoken, lowered, value);
+	}
+}
 
-	substituteParameters(out, ToLower);
+void cParser::bakeTrackNodeEntry(std::string const &rawtoken, std::string const &lowered, double value)
+{
+	// called once per captured entry while a node is open. entries are 1-based from the
+	// "node" keyword: 1=node, 2=range_max, 3=range_min, 4=name, 5=type, then the body.
+	++m_bakenode_count;
 
-	handleIncludeIfPresent(out, ToLower, Break);
+	if (m_bakenode_count == 2)
+	{
+		// entry 2 is range_max (visibility range); kept in the model marker so the streamer
+		// builds far-but-large-range models eagerly. -1 (unlimited) when it isn't a plain
+		// number (e.g. an unresolved parameter).
+		double rmax;
+		m_bakenode_rangemax = (sniffNumber(rawtoken, rmax) ? rmax : -1.0);
+	}
+
+	if ((m_bakenode_count == 5) && m_bakenode_end.empty())
+	{
+		// entry 5 is the type token; it fixes the node's terminator and whether it is visual
+		classifyNodeType(lowered, m_bakenode_visual, m_bakenode_end);
+		// a model node's entries 6,7,8 are its local X,Y,Z -- record them in the marker so the
+		// camera-ring load can skip the node without reading its body. a shape (triangles/lines)
+		// has no fixed-index position, so it is walked to its first vertex instead.
+		bool const isshape =
+			(lowered == "triangles") || (lowered == "triangle_strip") || (lowered == "triangle_fan")
+		 || (lowered == "lines") || (lowered == "line_strip") || (lowered == "line_loop");
+		m_bakenode_haspos = (lowered == "model") || isshape;
+		m_bakenode_shape = isshape;
+		m_bakenode_posstate = 0;
+		m_bakenode_posidx = 0;
+	}
+	else if (m_bakenode_haspos && (false == m_bakenode_shape) && (m_bakenode_count >= 6) && (m_bakenode_count <= 8))
+	{
+		// model: entries 6,7,8 are X,Y,Z
+		m_bakenode_pos[m_bakenode_count - 6] = value;
+	}
+	else if (m_bakenode_shape && (m_bakenode_posstate < 3))
+	{
+		// walk a shape to its first vertex: 0=before material -> if "material" enter the block
+		// (1), else it is a shortcut material (start seeking numbers, 2); 1=skip until
+		// "endmaterial"; 2=skip the texture string, then take the 3 vertex numbers.
+		double sv;
+		if (m_bakenode_posstate == 0) { m_bakenode_posstate = (lowered == "material") ? 1 : 2; }
+		else if (m_bakenode_posstate == 1) { if (lowered == "endmaterial") { m_bakenode_posstate = 2; } }
+		else if (sniffNumber(rawtoken, sv)) { m_bakenode_pos[m_bakenode_posidx++] = sv; if (m_bakenode_posidx == 3) { m_bakenode_posstate = 3; } }
+	}
+	else if ((false == m_bakenode_end.empty()) && (lowered == m_bakenode_end))
+	{
+		// terminator captured: close the node
+		m_writer->end_node(m_bakenode_visual, m_bakenode_haspos, m_bakenode_pos[0], m_bakenode_pos[1], m_bakenode_pos[2], m_bakenode_rangemax);
+		m_bakenode_active = false;
+	}
+}
+
+void cParser::readReplayToken(std::string &out, bool ToLower, const char *Break)
+{
+	// drain an active child include first, exactly like the text path
+	if (mIncludeParser)
+	{
+		mIncludeParser->readToken(out, ToLower, Break);
+		if (false == out.empty())
+		{
+			return;
+		}
+		mIncludeParser = nullptr;
+	}
+
+	scene::scenery_entry_view entry;
+	while (m_reader && m_reader->next(entry))
+	{
+		if (entry.type == scene::scenery_entry_type::token)
+		{
+			// stored in original case: lower-case per the consumer (unquoted tokens only),
+			// then re-apply this file's include parameters, mirroring the text path
+			out.assign(entry.text);
+			if (ToLower) { for (auto &ch : out) { ch = toLowerChar(ch); } }
+			substituteParameters(out, ToLower);
+			return;
+		}
+		if (entry.type == scene::scenery_entry_type::qtoken)
+		{
+			// quoted token: case preserved verbatim
+			out.assign(entry.text);
+			substituteParameters(out, ToLower);
+			return;
+		}
+		if (entry.type == scene::scenery_entry_type::number)
+		{
+			// typed numeric entry: hand back its shortest round-tripping text form
+			// (no parameter substitution applies to a literal number)
+			out = formatNumber(entry.number);
+			return;
+		}
+		// include entry: re-evaluate the filename expression (re-randomizing any
+		// random set), then enter the child (its own twin or text) and serve its
+		// tokens; an empty/skipped child just advances to the next entry
+		std::vector<std::string> fileexpr;
+		fileexpr.reserve(entry.fileexpr.size());
+		for (auto const sv : entry.fileexpr) { fileexpr.emplace_back(sv); }
+		std::vector<std::string> params;
+		params.reserve(entry.params.size());
+		for (auto const sv : entry.params) { params.emplace_back(sv); }
+
+		std::size_t pos = 0;
+		std::string includefile = resolve_random_set(fileexpr, pos);
+		replace_slashes(includefile);
+		startIncludeDirect(std::move(includefile), std::move(params));
+		if (mIncludeParser)
+		{
+			mIncludeParser->readToken(out, ToLower, Break);
+			if (false == out.empty())
+			{
+				return;
+			}
+			mIncludeParser = nullptr;
+		}
+	}
+
+	m_replayexhausted = true;
+	out.clear();
+}
+
+bool cParser::skipReplayNode()
+{
+	// a node's entries are contiguous within a single file, served by the deepest active
+	// include child -- delegate down to whichever parser is actually replaying it
+	if (mIncludeParser) { return mIncludeParser->skipReplayNode(); }
+	if (m_replay && m_reader && m_reader->skip_to_node_end())
+	{
+		// any tokens already pulled into the lookahead deque belong to the node we just
+		// skipped past (or earlier) -- drop them so the next read starts at the next node
+		tokens.clear();
+		return true;
+	}
+	return false;
+}
+
+bool cParser::currentNodePosition(double &X, double &Y, double &Z, double &Range)
+{
+	// delegate to the deepest active include child (it serves the current node), like skip
+	if (mIncludeParser) { return mIncludeParser->currentNodePosition(X, Y, Z, Range); }
+	return (m_replay && m_reader && m_reader->node_position(X, Y, Z, Range));
+}
+
+std::string cParser::currentReplayFile()
+{
+	if (mIncludeParser) { return mIncludeParser->currentReplayFile(); }
+	return mFile;
+}
+
+std::string cParser::currentReplayPath()
+{
+	if (mIncludeParser) { return mIncludeParser->currentReplayPath(); }
+	return mPath;
+}
+
+std::size_t cParser::currentReplayOffset()
+{
+	if (mIncludeParser) { return mIncludeParser->currentReplayOffset(); }
+	return (m_reader ? m_reader->node_offset() : 0);
+}
+
+std::vector<std::string> cParser::currentReplayParams()
+{
+	if (mIncludeParser) { return mIncludeParser->currentReplayParams(); }
+	return parameters;
+}
+
+void cParser::seekReplayNode(std::size_t Offset)
+{
+	// rebuild serves a single self-contained node, so drop any open include child and rewind
+	// this twin's reader to the node's marker; the next getToken() decodes it
+	mIncludeParser = nullptr;
+	tokens.clear();
+	if (m_replay && m_reader)
+	{
+		m_reader->set_pass(scene::scenery_load_pass::all);
+		m_reader->seek_node(Offset);
+		m_replayexhausted = false;
+	}
+}
+
+void cParser::setReplayParams(std::vector<std::string> Params)
+{
+	parameters = std::move(Params);
 }
 
 std::vector<std::string> cParser::readParameters(cParser &Input)
@@ -423,12 +1062,13 @@ std::vector<std::string> cParser::readParameters(cParser &Input)
 }
 
 std::string cParser::readQuotes(char const Quote)
-{ // read the stream until specified char or stream end
+{ // read the buffer until specified char or end
 	std::string token;
 	char c{0};
 	bool escaped = false;
-	while (mStream->get(c))
+	while (m_bufferpos < m_buffer.size())
 	{ // get all chars until the quote mark
+		c = m_buffer[m_bufferpos++];
 		if (escaped)
 		{
 			escaped = false;
@@ -457,8 +1097,9 @@ void cParser::skipComment(std::string const &Endmark)
 	std::string input;
 	char c{0};
 	auto const endmarksize = Endmark.size();
-	while (mStream->get(c))
+	while (m_bufferpos < m_buffer.size())
 	{
+		c = m_buffer[m_bufferpos++];
 		if (c == '\n')
 		{
 			// update line counter
@@ -523,7 +1164,15 @@ void cParser::injectString(const std::string &str)
 
 int cParser::getProgress() const
 {
-	return static_cast<int>(mStream->rdbuf()->pubseekoff(0, std::ios_base::cur) * 100 / mSize);
+	if (m_replay)
+	{
+		return ( m_reader ? m_reader->progress() : 100 );
+	}
+	if (m_buffer.empty())
+	{
+		return 100;
+	}
+	return static_cast<int>(m_bufferpos * 100 / m_buffer.size());
 }
 
 int cParser::getFullProgress() const
@@ -595,3 +1244,76 @@ int cParser::LineMain() const
 {
 	return mIncludeParser ? -1 : mLine;
 }
+
+namespace scene
+{
+// Headless bake: drains the scenario through cParser so the existing include machinery
+// tokenizes and (re)compiles every reachable file's binary twin, with no deserializer,
+// scene, renderer or window involved. Because tokens are captured in original case
+// (v5 format), draining with a uniform case is correct.
+bool scenerybinary_bake_headless(std::string const &Scenariofile, std::string const &Path, bool Loadtraction)
+{
+	// parallel bake: discover the file graph by tokenizing each file in isolation (no
+	// scene state, no includes opened -- just their references collected) and compile
+	// each twin on a worker thread. each file is baked exactly once (deduped), so twin
+	// writes never race.
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::unordered_set<std::string> visited;
+	std::deque<std::string> queue;
+	std::size_t active = 0;
+	std::atomic<std::size_t> baked { 0 };
+
+	auto const enqueue = [ & ]( std::string const &File ) {
+		// only scenery component files get twins; dedupe so shared includes bake once
+		if ( ( false == isSceneryFile( File ) ) || File.empty() || ( File[ 0 ] == '$' ) ) { return; }
+		if ( visited.insert( File ).second ) { queue.push_back( File ); }
+	};
+	{ std::lock_guard<std::mutex> lock( mutex ); enqueue( Scenariofile ); }
+
+	unsigned const workercount = std::max( 2u, std::min( 16u, std::thread::hardware_concurrency() ) );
+	auto const worker = [ & ] {
+		for ( ;; )
+		{
+			std::string file;
+			{
+				std::unique_lock<std::mutex> lock( mutex );
+				cv.wait( lock, [ & ] { return ( false == queue.empty() ) || ( active == 0 ); } );
+				if ( queue.empty() )
+				{
+					if ( active == 0 ) { cv.notify_all(); return; }
+					continue;
+				}
+				file = std::move( queue.front() );
+				queue.pop_front();
+				++active;
+			}
+
+			std::vector<std::string> includes;
+			{
+				cParser parser( file, cParser::buffer_FILE, Path, Loadtraction, std::vector<std::string>(), false, /*BakeOnly*/ true );
+				if ( parser.ok() )
+				{
+					includes = parser.bakeFile();
+					++baked;
+				}
+			}
+
+			{
+				std::unique_lock<std::mutex> lock( mutex );
+				for ( auto const &inc : includes ) { enqueue( inc ); }
+				--active;
+				cv.notify_all();
+			}
+		}
+	};
+
+	std::vector<std::thread> workers;
+	workers.reserve( workercount );
+	for ( unsigned i = 0; i < workercount; ++i ) { workers.emplace_back( worker ); }
+	for ( auto &thread : workers ) { thread.join(); }
+
+	WriteLog( "Bake: compiled " + std::to_string( baked.load() ) + " binary scenery twins from \"" + Scenariofile + "\"" );
+	return ( baked.load() > 0 );
+}
+} // namespace scene
