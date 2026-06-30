@@ -18,6 +18,7 @@ http://mozilla.org/MPL/2.0/.
 #include "model/AnimModel.h"
 #include "model/Model3d.h"
 #include "editor/editorTerrainStreamer.hpp"
+#include "utilities/Globals.h"
 #include "utilities/Logs.h"
 
 #include <glad/glad.h>
@@ -409,11 +410,28 @@ void gather_submodel_triangles(TSubModel *Submodel, glm::dmat4 const &M, std::ve
 
 namespace
 {
-	// streamed terrain chunk grid: one chunk per 250 m scene cell, at this vertex resolution
+	// streamed terrain chunk grid: one chunk per 250 m scene cell, at this vertex resolution.
+	// 32 -> 2048 tris/chunk; a uniform full-res grid tiles seamlessly (no T-junction cracks) while
+	// keeping ~4x fewer triangles than 64. bump if a scenery needs finer terrain relief.
 	constexpr double kChunkSize = static_cast<double>(scene::EU07_CELLSIZE); // 250 m
-	constexpr int kChunkCells = 64;                                         // (kChunkCells+1)^2 vertices
-	// dedicated folder so baked chunks never clobber editor-authored ones; Faza 1 will page from here
-	std::string const kChunkDir = "terrain_chunks";
+	constexpr int kChunkCells = 32;                                         // (kChunkCells+1)^2 vertices
+
+	// per-scenery chunk folder so different maps don't collide on shared chunk_X_Z world coordinates
+	std::string chunk_dir()
+	{
+		std::string name = Global.SceneryFile;
+		auto const slash = name.find_last_of("/\\");
+		if (slash != std::string::npos)
+			name.erase(0, slash + 1);
+		while (!name.empty() && name.front() == '$')
+			name.erase(0, 1); // rainsted override prefix
+		auto const dot = name.find_last_of('.');
+		if (dot != std::string::npos)
+			name.erase(dot);
+		if (name.empty())
+			name = "default";
+		return "terrain_chunks/" + name;
+	}
 
 	int floor_div(double V, double Size) { return static_cast<int>(std::floor(V / Size)); }
 
@@ -476,6 +494,7 @@ void bake_finalize_chunks()
 	if (g_bake_tris.empty())
 		return;
 	auto const &tris = g_bake_tris;
+	std::string const dir = chunk_dir();
 
 	// bucket triangles by the 250 m chunk(s) their bounding box overlaps
 	std::map<std::pair<int, int>, std::vector<bake_tri const *>> buckets;
@@ -499,7 +518,7 @@ void bake_finalize_chunks()
 	{
 		int const cx = entry.first.first;
 		int const cz = entry.first.second;
-		if (terrain_streamer::chunk_file_exists(kChunkDir, cx, cz))
+		if (terrain_streamer::chunk_file_exists(dir, cx, cz))
 		{
 			++skipped; // generate-if-missing: leave existing chunk untouched
 			continue;
@@ -567,13 +586,13 @@ void bake_finalize_chunks()
 			if (auto const *m = GfxRenderer->Material(dominant))
 				matname = m->GetName();
 
-		terrain_streamer::save_height_grid(kChunkDir, cx, cz, heights, kChunkCells, matname);
+		terrain_streamer::save_height_grid(dir, cx, cz, heights, kChunkCells, matname);
 		++generated;
 	}
 
 	WriteLog("Terrain chunk bake: " + std::to_string(tris.size()) + " triangles -> generated "
 	         + std::to_string(generated) + ", skipped " + std::to_string(skipped)
-	         + " existing (dir " + kChunkDir + ")");
+	         + " existing (dir " + dir + ")");
 
 	g_bake_tris.clear();
 	g_bake_tris.shrink_to_fit();
@@ -583,17 +602,18 @@ void bake_activate_streaming(int Radius)
 {
 	if (EditorTerrain.active())
 		return; // an editorterrain scenery directive already owns the streamer
+	std::string const dir = chunk_dir();
 	std::error_code ec;
-	if (!std::filesystem::exists(kChunkDir, ec))
+	if (!std::filesystem::exists(dir, ec))
 		return; // no baked terrain for this scenery
 
-	EditorTerrain.directory(kChunkDir);
+	EditorTerrain.directory(dir);
 	EditorTerrain.configure(kChunkCells, static_cast<float>(kChunkSize / kChunkCells), Radius, 0.0f, std::string());
 	// no adaptive simplification: merging flat blocks into bigger quads leaves T-junction cracks
 	// (sub-metre slivers) where a large quad meets a neighbour's smaller quads. full-res chunks share
 	// identical edge vertices, so they tile seamlessly.
 	EditorTerrain.simplify(false, 0.0f);
 	EditorTerrain.active(true);
-	WriteLog("Terrain streaming activated from baked chunks (dir " + kChunkDir
+	WriteLog("Terrain streaming activated from baked chunks (dir " + dir
 	         + ", radius " + std::to_string(Radius) + ")");
 }

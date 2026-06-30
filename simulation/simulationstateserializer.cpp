@@ -29,6 +29,8 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/Logs.h"
 #include "editor/editorTerrainStreamer.hpp"
 
+#include <set>
+
 namespace simulation {
 
 std::shared_ptr<deserializer_state>
@@ -145,6 +147,40 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 	bake_finalize_chunks();
 	// page those chunks around the camera (8 chunks ~= 2 km, matching the renderer's section window)
 	bake_activate_streaming( 8 );
+
+	// one-shot scene-composition diagnostic: what is resident, to decide what to stream next
+	{
+		std::size_t instances = 0, uniquemodels = 0;
+		std::set<void *> models;
+		for( auto *m : simulation::Instances.sequence() ) {
+			if( m == nullptr ) continue;
+			++instances;
+			models.insert( m->Model() );
+		}
+		uniquemodels = models.size();
+
+		std::size_t sections = 0, cells = 0, shapes = 0, lines = 0, cellinstances = 0, traction = 0;
+		for( std::size_t i = 0; i < sq( scene::EU07_REGIONSIDESECTIONCOUNT ); ++i ) {
+			auto *sec = Region->get_section( i );
+			if( sec == nullptr ) continue;
+			++sections;
+			shapes += sec->m_shapes.size();
+			for( auto const &cell : sec->m_cells ) {
+				if( false == cell.m_active ) continue;
+				++cells;
+				shapes += cell.m_shapesopaque.size() + cell.m_shapestranslucent.size();
+				lines += cell.m_lines.size();
+				cellinstances += cell.m_instancesopaque.size() + cell.m_instancetranslucent.size();
+				traction += cell.m_traction.size();
+			}
+		}
+		WriteLog( "SCENE DIAG: model instances " + std::to_string( instances )
+		          + " (unique models " + std::to_string( uniquemodels ) + "), populated sections "
+		          + std::to_string( sections ) + ", active cells " + std::to_string( cells )
+		          + ", shapes " + std::to_string( shapes ) + ", lines " + std::to_string( lines )
+		          + ", cell-instances " + std::to_string( cellinstances )
+		          + ", traction " + std::to_string( traction ) );
+	}
 
 	return false;
 }
