@@ -28,6 +28,8 @@ http://mozilla.org/MPL/2.0/.
 #include <map>
 #include <limits>
 #include <string>
+#include <filesystem>
+#include <system_error>
 
 namespace
 {
@@ -415,9 +417,17 @@ namespace
 
 	int floor_div(double V, double Size) { return static_cast<int>(std::floor(V / Size)); }
 
+	// a source terrain triangle plus the material it was drawn with, so each chunk can record its
+	// dominant material name (.etc v2) and streamed terrain keeps its texture.
+	struct bake_tri
+	{
+		world_triangle t;
+		material_handle mat;
+	};
+
 	// terrain triangles accumulated across the whole scenario load, baked once at the end so a 250 m
 	// cell overlapped by several source nodes gets all of them (a per-node bake would miss the rest).
-	std::vector<world_triangle> g_bake_tris;
+	std::vector<bake_tri> g_bake_tris;
 
 	// world transform of a terrain model instance (matches the renderer / capture_terrain)
 	glm::dmat4 model_world_matrix(TAnimModel *Terrain)
@@ -441,37 +451,44 @@ void bake_reset()
 
 void bake_collect_shape(scene::shape_node const &Shape)
 {
+	material_handle const mat = Shape.data().material;
 	auto const &verts = Shape.data().vertices; // world-space GL_TRIANGLES
 	for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
-		g_bake_tris.push_back({glm::dvec3(verts[i].position),
-		                       glm::dvec3(verts[i + 1].position),
-		                       glm::dvec3(verts[i + 2].position)});
+		g_bake_tris.push_back({world_triangle{glm::dvec3(verts[i].position),
+		                                      glm::dvec3(verts[i + 1].position),
+		                                      glm::dvec3(verts[i + 2].position)},
+		                       mat});
 }
 
 void bake_collect_model(TAnimModel *Terrain)
 {
 	if (Terrain == nullptr || Terrain->pModel == nullptr)
 		return;
-	gather_submodel_triangles(Terrain->pModel->Root, model_world_matrix(Terrain), g_bake_tris);
+	std::vector<world_triangle> tris;
+	gather_submodel_triangles(Terrain->pModel->Root, model_world_matrix(Terrain), tris);
+	material_handle const mat = Terrain->pModel->Root ? Terrain->pModel->Root->GetMaterial() : null_handle;
+	for (auto const &t : tris)
+		g_bake_tris.push_back({t, mat});
 }
 
 void bake_finalize_chunks()
 {
 	if (g_bake_tris.empty())
 		return;
-	std::vector<world_triangle> const &tris = g_bake_tris;
+	auto const &tris = g_bake_tris;
 
 	// bucket triangles by the 250 m chunk(s) their bounding box overlaps
-	std::map<std::pair<int, int>, std::vector<world_triangle const *>> buckets;
-	for (auto const &t : tris)
+	std::map<std::pair<int, int>, std::vector<bake_tri const *>> buckets;
+	for (auto const &bt : tris)
 	{
+		auto const &t = bt.t;
 		double const minx = std::min({t[0].x, t[1].x, t[2].x});
 		double const maxx = std::max({t[0].x, t[1].x, t[2].x});
 		double const minz = std::min({t[0].z, t[1].z, t[2].z});
 		double const maxz = std::max({t[0].z, t[1].z, t[2].z});
 		for (int cx = floor_div(minx, kChunkSize); cx <= floor_div(maxx, kChunkSize); ++cx)
 			for (int cz = floor_div(minz, kChunkSize); cz <= floor_div(maxz, kChunkSize); ++cz)
-				buckets[{cx, cz}].push_back(&t);
+				buckets[{cx, cz}].push_back(&bt);
 	}
 
 	int generated = 0, skipped = 0;
@@ -504,7 +521,7 @@ void bake_finalize_chunks()
 				bool any = false;
 				for (auto const *tp : entry.second)
 				{
-					auto const &t = *tp;
+					auto const &t = tp->t;
 					double const minx = std::min({t[0].x, t[1].x, t[2].x});
 					double const maxx = std::max({t[0].x, t[1].x, t[2].x});
 					double const minz = std::min({t[0].z, t[1].z, t[2].z});
@@ -537,7 +554,20 @@ void bake_finalize_chunks()
 			if (!found[i])
 				heights[i] = mean;
 
-		terrain_streamer::save_height_grid(kChunkDir, cx, cz, heights, kChunkCells);
+		// dominant material in this chunk (most frequent across its triangles) -> texture name
+		std::map<material_handle, int> matcount;
+		for (auto const *tp : entry.second)
+			++matcount[tp->mat];
+		material_handle dominant = null_handle;
+		int domn = 0;
+		for (auto const &mc : matcount)
+			if (mc.second > domn) { domn = mc.second; dominant = mc.first; }
+		std::string matname;
+		if (dominant > null_handle && GfxRenderer != nullptr)
+			if (auto const *m = GfxRenderer->Material(dominant))
+				matname = m->GetName();
+
+		terrain_streamer::save_height_grid(kChunkDir, cx, cz, heights, kChunkCells, matname);
 		++generated;
 	}
 
@@ -547,4 +577,19 @@ void bake_finalize_chunks()
 
 	g_bake_tris.clear();
 	g_bake_tris.shrink_to_fit();
+}
+
+void bake_activate_streaming(int Radius)
+{
+	if (EditorTerrain.active())
+		return; // an editorterrain scenery directive already owns the streamer
+	std::error_code ec;
+	if (!std::filesystem::exists(kChunkDir, ec))
+		return; // no baked terrain for this scenery
+
+	EditorTerrain.directory(kChunkDir);
+	EditorTerrain.configure(kChunkCells, static_cast<float>(kChunkSize / kChunkCells), Radius, 0.0f, std::string());
+	EditorTerrain.active(true);
+	WriteLog("Terrain streaming activated from baked chunks (dir " + kChunkDir
+	         + ", radius " + std::to_string(Radius) + ")");
 }

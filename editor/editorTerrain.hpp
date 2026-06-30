@@ -43,6 +43,9 @@ void bake_reset();                              // drop any accumulated triangle
 void bake_collect_shape(scene::shape_node const &Shape); // append a triangle shape's world triangles
 void bake_collect_model(TAnimModel *Terrain);  // append an E3D terrain model's world triangles
 void bake_finalize_chunks();                   // bucket per 250 m cell and write missing chunk files
+// point the global terrain streamer at the baked chunk folder/grid and activate paging around the
+// camera. no-op if the streamer is already active (e.g. an editorterrain directive) or no chunks exist.
+void bake_activate_streaming(int Radius);
 
 // Editor-owned, editable terrain patch.
 //

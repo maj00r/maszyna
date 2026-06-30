@@ -86,10 +86,11 @@ class terrain_streamer
 	static std::string chunk_filename(std::string const &Dir, int Cx, int Cz);
 	// true if a chunk file already exists on disk (generate-if-missing guard)
 	static bool chunk_file_exists(std::string const &Dir, int Cx, int Cz);
-	// writes a 16-bit ETC1 chunk file straight from a raw (Cells+1)^2 height grid (row-major world Y),
-	// creating the directory if needed. mirrors save_heights() but takes no editor_terrain/GPU mesh.
+	// writes a 16-bit ETC2 chunk file straight from a raw (Cells+1)^2 height grid (row-major world Y),
+	// creating the directory if needed. mirrors save_heights() but takes no editor_terrain/GPU mesh and
+	// records the chunk's (dominant) material name so streamed terrain keeps its texture.
 	static void save_height_grid(std::string const &Dir, int Cx, int Cz,
-	                             std::vector<float> const &Heights, int Cells);
+	                             std::vector<float> const &Heights, int Cells, std::string const &Material);
 
   private:
 	// per-chunk state bits cached so we don't stat the filesystem repeatedly
@@ -102,7 +103,8 @@ class terrain_streamer
 	glm::dvec3 chunk_centre(int Cx, int Cz) const;
 	std::string chunk_path(int Cx, int Cz) const;
 	bool chunk_on_disk(chunk_key const &Key);                          // cached existence test
-	bool load_heights(int Cx, int Cz, std::vector<float> &Out) const;  // reads a 16-bit chunk file
+	// reads a 16-bit chunk file (ETC1 or ETC2); OutMaterial is the chunk material name (empty for ETC1)
+	bool load_heights(int Cx, int Cz, std::vector<float> &Out, std::string &OutMaterial) const;
 	void save_heights(int Cx, int Cz, editor_terrain const &Terrain);  // writes a 16-bit chunk file
 
 	bool m_active{false};

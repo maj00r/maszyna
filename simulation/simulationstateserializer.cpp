@@ -143,6 +143,8 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 
 	// all nodes parsed: bake streamed terrain heightmap chunks (.etc) for covered 250 m cells
 	bake_finalize_chunks();
+	// page those chunks around the camera (8 chunks ~= 2 km, matching the renderer's section window)
+	bake_activate_streaming( 8 );
 
 	return false;
 }
@@ -478,8 +480,6 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
             auto *instance = deserialize_model( Input, Scratchpad, nodedata );
             // model import can potentially fail
             if( instance == nullptr ) { return; }
-            // accumulate this terrain model's triangles for the end-of-load chunk bake
-            bake_collect_model( instance );
             // go through submodels, and import them as shapes
             auto const cellcount = instance->TerrainCount() + 1; // zliczenie submodeli
             for( auto i = 1; i < cellcount; ++i ) {
@@ -540,10 +540,10 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
 
         if( false == skip ) {
 
+            // import (consumes the triangle tokens), then accumulate for the terrain-chunk bake.
+            // Faza 1: terrain triangles are streamed as baked chunks, so they are NOT kept resident.
             auto shape = scene::shape_node().import( Input, nodedata );
-            // accumulate this terrain/static triangle surface for the end-of-load chunk bake
             bake_collect_shape( shape );
-            simulation::Region->insert( std::move( shape ), Scratchpad, true );
         }
         else {
             skip_until( Input, "endtri" );

@@ -58,17 +58,25 @@ bool terrain_streamer::chunk_on_disk(chunk_key const &Key)
 	return exists;
 }
 
-// 16-bit chunk file: 'ETC1' | uint16 cells | float baseY | float step | (cells+1)^2 * uint16
-// where worldY = baseY + raw * step (per-chunk auto-scaled to fit the height range losslessly-ish)
-bool terrain_streamer::load_heights(int Cx, int Cz, std::vector<float> &Out) const
+// 16-bit chunk file:
+//   ETC1: 'ETC1' | uint16 cells | float baseY | float step | (cells+1)^2 * uint16
+//   ETC2: 'ETC2' | uint16 cells | float baseY | float step | uint16 namelen | name | (cells+1)^2 * uint16
+// where worldY = baseY + raw * step (per-chunk auto-scaled to fit the height range losslessly-ish).
+// ETC2 additionally records the chunk's (dominant) material name so streamed terrain keeps its texture.
+bool terrain_streamer::load_heights(int Cx, int Cz, std::vector<float> &Out, std::string &OutMaterial) const
 {
+	OutMaterial.clear();
+
 	std::ifstream f(chunk_path(Cx, Cz), std::ios::binary);
 	if (!f)
 		return false;
 
 	char magic[4] = {};
 	f.read(magic, 4);
-	if (f.gcount() != 4 || magic[0] != 'E' || magic[1] != 'T' || magic[2] != 'C' || magic[3] != '1')
+	if (f.gcount() != 4 || magic[0] != 'E' || magic[1] != 'T' || magic[2] != 'C')
+		return false;
+	bool const v2 = (magic[3] == '2');
+	if (magic[3] != '1' && !v2)
 		return false;
 
 	std::uint16_t cells = 0;
@@ -78,6 +86,21 @@ bool terrain_streamer::load_heights(int Cx, int Cz, std::vector<float> &Out) con
 	f.read(reinterpret_cast<char *>(&step), sizeof(step));
 	if (!f || static_cast<int>(cells) != m_cells)
 		return false; // resolution changed since save: ignore and regenerate
+
+	if (v2)
+	{
+		std::uint16_t namelen = 0;
+		f.read(reinterpret_cast<char *>(&namelen), sizeof(namelen));
+		if (!f)
+			return false;
+		if (namelen > 0)
+		{
+			OutMaterial.resize(namelen);
+			f.read(OutMaterial.data(), namelen);
+			if (!f)
+				return false;
+		}
+	}
 
 	std::size_t const n = static_cast<std::size_t>(cells + 1) * (cells + 1);
 	Out.resize(n);
@@ -145,7 +168,8 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 
 			// only stream chunks that were actually authored (exist on disk); empty space stays empty
 			std::vector<float> loaded;
-			if (!chunk_on_disk(key) || !load_heights(key.first, key.second, loaded))
+			std::string material;
+			if (!chunk_on_disk(key) || !load_heights(key.first, key.second, loaded, material))
 				continue;
 
 			glm::dvec3 const centre = chunk_centre(key.first, key.second);
@@ -164,7 +188,8 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 			};
 
 			auto terrain = std::make_unique<editor_terrain>();
-			if (terrain->create(centre, m_cells, m_cellsize, m_texture, sampler))
+			std::string const &tex = material.empty() ? m_texture : material;
+			if (terrain->create(centre, m_cells, m_cellsize, tex, sampler))
 			{
 				if (m_auto_optimize)
 					terrain->optimize(m_simplify_error);
@@ -285,7 +310,7 @@ bool terrain_streamer::chunk_file_exists(std::string const &Dir, int Cx, int Cz)
 }
 
 void terrain_streamer::save_height_grid(std::string const &Dir, int Cx, int Cz,
-                                        std::vector<float> const &Heights, int Cells)
+                                        std::vector<float> const &Heights, int Cells, std::string const &Material)
 {
 	if (Heights.empty() || Cells < 1)
 		return;
@@ -304,12 +329,16 @@ void terrain_streamer::save_height_grid(std::string const &Dir, int Cx, int Cz,
 	if (!f)
 		return;
 
-	char const magic[4] = {'E', 'T', 'C', '1'};
+	char const magic[4] = {'E', 'T', 'C', '2'};
 	std::uint16_t const cells = static_cast<std::uint16_t>(Cells);
 	f.write(magic, 4);
 	f.write(reinterpret_cast<char const *>(&cells), sizeof(cells));
 	f.write(reinterpret_cast<char const *>(&minh), sizeof(minh));
 	f.write(reinterpret_cast<char const *>(&step), sizeof(step));
+	std::uint16_t const namelen = static_cast<std::uint16_t>(std::min<std::size_t>(Material.size(), 65535));
+	f.write(reinterpret_cast<char const *>(&namelen), sizeof(namelen));
+	if (namelen > 0)
+		f.write(Material.data(), namelen);
 	for (float const v : Heights)
 	{
 		std::uint16_t const raw = (step > 0.0f)
