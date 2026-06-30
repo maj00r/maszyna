@@ -111,6 +111,7 @@ class terrain_streamer
 	int m_cells{32};
 	float m_cellsize{2.0f};
 	int m_radius{2};            // chunks loaded around the camera (Chebyshev radius)
+	int m_loadbudget{6};        // max chunks built per frame (nearest first), to amortise the ramp
 	float m_baseheight{0.0f};
 	std::string m_texture;
 	bool m_auto_optimize{true};

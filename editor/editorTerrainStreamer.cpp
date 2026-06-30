@@ -157,46 +157,63 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 
 	chunk_key const camera = key_at(CameraPos.x, CameraPos.z);
 
-	// load any missing chunk inside the radius (one build per frame keeps the hitch small)
-	bool built = false;
-	for (int dz = -m_radius; dz <= m_radius && !built; ++dz)
-		for (int dx = -m_radius; dx <= m_radius && !built; ++dx)
+	// gather missing, on-disk chunks inside the radius and build the nearest ones first, a few per
+	// frame, so the world fills in from the camera outward (not from a far corner) without a big hitch
+	std::vector<chunk_key> wanted;
+	for (int dz = -m_radius; dz <= m_radius; ++dz)
+		for (int dx = -m_radius; dx <= m_radius; ++dx)
 		{
 			chunk_key const key{camera.first + dx, camera.second + dz};
 			if (m_chunks.count(key))
 				continue;
-
 			// only stream chunks that were actually authored (exist on disk); empty space stays empty
-			std::vector<float> loaded;
-			std::string material;
-			if (!chunk_on_disk(key) || !load_heights(key.first, key.second, loaded, material))
+			if (!chunk_on_disk(key))
 				continue;
-
-			glm::dvec3 const centre = chunk_centre(key.first, key.second);
-			double const size = chunk_world_size();
-			double const x0 = key.first * size, z0 = key.second * size; // chunk corner
-			int const cells = m_cells;
-			float const cs = m_cellsize;
-			editor_terrain::height_sampler sampler =
-			    [&loaded, x0, z0, cells, cs](double X, double Z, double &OutY) -> bool {
-				int ix = static_cast<int>(std::lround((X - x0) / cs));
-				int iz = static_cast<int>(std::lround((Z - z0) / cs));
-				ix = std::clamp(ix, 0, cells);
-				iz = std::clamp(iz, 0, cells);
-				OutY = loaded[static_cast<std::size_t>(iz) * (cells + 1) + ix];
-				return true;
-			};
-
-			auto terrain = std::make_unique<editor_terrain>();
-			std::string const &tex = material.empty() ? m_texture : material;
-			if (terrain->create(centre, m_cells, m_cellsize, tex, sampler))
-			{
-				if (m_auto_optimize)
-					terrain->optimize(m_simplify_error);
-				m_chunks.emplace(key, std::move(terrain));
-				built = true; // amortise: at most one new chunk per frame
-			}
+			wanted.push_back(key);
 		}
+	auto const dist2 = [&camera](chunk_key const &k) -> long long {
+		long long const dx = k.first - camera.first, dz = k.second - camera.second;
+		return dx * dx + dz * dz;
+	};
+	std::sort(wanted.begin(), wanted.end(),
+	          [&dist2](chunk_key const &a, chunk_key const &b) { return dist2(a) < dist2(b); });
+
+	int budget = m_loadbudget;
+	for (chunk_key const &key : wanted)
+	{
+		if (budget <= 0)
+			break;
+
+		std::vector<float> loaded;
+		std::string material;
+		if (!load_heights(key.first, key.second, loaded, material))
+			continue;
+
+		glm::dvec3 const centre = chunk_centre(key.first, key.second);
+		double const size = chunk_world_size();
+		double const x0 = key.first * size, z0 = key.second * size; // chunk corner
+		int const cells = m_cells;
+		float const cs = m_cellsize;
+		editor_terrain::height_sampler sampler =
+		    [&loaded, x0, z0, cells, cs](double X, double Z, double &OutY) -> bool {
+			int ix = static_cast<int>(std::lround((X - x0) / cs));
+			int iz = static_cast<int>(std::lround((Z - z0) / cs));
+			ix = std::clamp(ix, 0, cells);
+			iz = std::clamp(iz, 0, cells);
+			OutY = loaded[static_cast<std::size_t>(iz) * (cells + 1) + ix];
+			return true;
+		};
+
+		auto terrain = std::make_unique<editor_terrain>();
+		std::string const &tex = material.empty() ? m_texture : material;
+		if (terrain->create(centre, m_cells, m_cellsize, tex, sampler))
+		{
+			if (m_auto_optimize)
+				terrain->optimize(m_simplify_error);
+			m_chunks.emplace(key, std::move(terrain));
+			--budget;
+		}
+	}
 
 	// unload chunks that drifted outside the radius
 	for (auto it = m_chunks.begin(); it != m_chunks.end();)
