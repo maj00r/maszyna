@@ -15,10 +15,19 @@ http://mozilla.org/MPL/2.0/.
 #include "simulation/simulation.h"
 #include "rendering/renderer.h"
 #include "model/vertex.h"
+#include "model/AnimModel.h"
+#include "model/Model3d.h"
+#include "editor/editorTerrainStreamer.hpp"
+#include "utilities/Logs.h"
 
 #include <glad/glad.h>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <limits>
+#include <string>
 
 namespace
 {
@@ -337,4 +346,205 @@ glm::dvec3 editor_terrain::centre() const
 	if (!m_heights.empty())
 		y = m_heights[index(m_cells / 2, m_cells / 2)];
 	return glm::dvec3(m_x0 + c, y, m_z0 + c);
+}
+
+// ---------------------------------------------------------------------------
+// shared terrain geometry helpers (relocated from editormode.cpp) + startup bake
+// ---------------------------------------------------------------------------
+
+bool triangle_height_at(glm::dvec3 const &a, glm::dvec3 const &b, glm::dvec3 const &c,
+                        double const Px, double const Pz, double &OutY)
+{
+	double const ux = b.x - a.x, uz = b.z - a.z;
+	double const vx = c.x - a.x, vz = c.z - a.z;
+	double const wx = Px - a.x, wz = Pz - a.z;
+	double const den = ux * vz - vx * uz;
+	if (std::abs(den) < 1e-9)
+		return false; // degenerate or vertical triangle, no defined height
+	double const s = (wx * vz - vx * wz) / den;
+	double const t = (ux * wz - wx * uz) / den;
+	if (s < 0.0 || t < 0.0 || (s + t) > 1.0)
+		return false;
+	OutY = a.y + s * (b.y - a.y) + t * (c.y - a.y);
+	return true;
+}
+
+void gather_submodel_triangles(TSubModel *Submodel, glm::dmat4 const &M, std::vector<world_triangle> &Out)
+{
+	for (TSubModel *sub = Submodel; sub != nullptr; sub = sub->Next)
+	{
+		glm::dmat4 mlocal = M;
+		if ((sub->iFlags & 0xC000) && (sub->GetMatrix() != nullptr))
+			mlocal = M * glm::dmat4(glm::make_mat4(sub->GetMatrix()->readArray()));
+
+		if (sub->eType < TP_ROTATOR) // a drawable mesh, not a rotator/light/etc.
+		{
+			auto const handle = sub->m_geometry.handle;
+			if (handle.bank != 0 || handle.chunk != 0)
+			{
+				auto const &verts = GfxRenderer->Vertices(handle);
+				auto const &indices = GfxRenderer->Indices(handle);
+				auto const to_world = [&](gfx::basic_vertex const &v) {
+					return glm::dvec3(mlocal * glm::dvec4(glm::dvec3(v.position), 1.0));
+				};
+				if (false == indices.empty())
+				{
+					for (std::size_t i = 0; i + 2 < indices.size(); i += 3)
+						Out.push_back({to_world(verts[indices[i]]), to_world(verts[indices[i + 1]]), to_world(verts[indices[i + 2]])});
+				}
+				else
+				{
+					for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
+						Out.push_back({to_world(verts[i]), to_world(verts[i + 1]), to_world(verts[i + 2])});
+				}
+			}
+		}
+
+		if (sub->Child != nullptr)
+			gather_submodel_triangles(sub->Child, mlocal, Out); // children inherit this matrix
+	}
+}
+
+namespace
+{
+	// streamed terrain chunk grid: one chunk per 250 m scene cell, at this vertex resolution
+	constexpr double kChunkSize = static_cast<double>(scene::EU07_CELLSIZE); // 250 m
+	constexpr int kChunkCells = 64;                                         // (kChunkCells+1)^2 vertices
+	// dedicated folder so baked chunks never clobber editor-authored ones; Faza 1 will page from here
+	std::string const kChunkDir = "terrain_chunks";
+
+	int floor_div(double V, double Size) { return static_cast<int>(std::floor(V / Size)); }
+
+	// terrain triangles accumulated across the whole scenario load, baked once at the end so a 250 m
+	// cell overlapped by several source nodes gets all of them (a per-node bake would miss the rest).
+	std::vector<world_triangle> g_bake_tris;
+
+	// world transform of a terrain model instance (matches the renderer / capture_terrain)
+	glm::dmat4 model_world_matrix(TAnimModel *Terrain)
+	{
+		glm::dmat4 M(1.0);
+		M = glm::translate(M, Terrain->location());
+		glm::vec3 const angles = Terrain->Angles();
+		if (angles.y != 0.0f) M = glm::rotate(M, glm::radians(static_cast<double>(angles.y)), glm::dvec3(0.0, 1.0, 0.0));
+		if (angles.x != 0.0f) M = glm::rotate(M, glm::radians(static_cast<double>(angles.x)), glm::dvec3(1.0, 0.0, 0.0));
+		if (angles.z != 0.0f) M = glm::rotate(M, glm::radians(static_cast<double>(angles.z)), glm::dvec3(0.0, 0.0, 1.0));
+		glm::vec3 const scale = Terrain->Scale();
+		M = glm::scale(M, glm::dvec3(scale));
+		return M;
+	}
+}
+
+void bake_reset()
+{
+	g_bake_tris.clear();
+}
+
+void bake_collect_shape(scene::shape_node const &Shape)
+{
+	auto const &verts = Shape.data().vertices; // world-space GL_TRIANGLES
+	for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
+		g_bake_tris.push_back({glm::dvec3(verts[i].position),
+		                       glm::dvec3(verts[i + 1].position),
+		                       glm::dvec3(verts[i + 2].position)});
+}
+
+void bake_collect_model(TAnimModel *Terrain)
+{
+	if (Terrain == nullptr || Terrain->pModel == nullptr)
+		return;
+	gather_submodel_triangles(Terrain->pModel->Root, model_world_matrix(Terrain), g_bake_tris);
+}
+
+void bake_finalize_chunks()
+{
+	if (g_bake_tris.empty())
+		return;
+	std::vector<world_triangle> const &tris = g_bake_tris;
+
+	// bucket triangles by the 250 m chunk(s) their bounding box overlaps
+	std::map<std::pair<int, int>, std::vector<world_triangle const *>> buckets;
+	for (auto const &t : tris)
+	{
+		double const minx = std::min({t[0].x, t[1].x, t[2].x});
+		double const maxx = std::max({t[0].x, t[1].x, t[2].x});
+		double const minz = std::min({t[0].z, t[1].z, t[2].z});
+		double const maxz = std::max({t[0].z, t[1].z, t[2].z});
+		for (int cx = floor_div(minx, kChunkSize); cx <= floor_div(maxx, kChunkSize); ++cx)
+			for (int cz = floor_div(minz, kChunkSize); cz <= floor_div(maxz, kChunkSize); ++cz)
+				buckets[{cx, cz}].push_back(&t);
+	}
+
+	int generated = 0, skipped = 0;
+	double const step = kChunkSize / static_cast<double>(kChunkCells);
+	std::size_t const vcount = static_cast<std::size_t>(kChunkCells + 1) * (kChunkCells + 1);
+
+	for (auto const &entry : buckets)
+	{
+		int const cx = entry.first.first;
+		int const cz = entry.first.second;
+		if (terrain_streamer::chunk_file_exists(kChunkDir, cx, cz))
+		{
+			++skipped; // generate-if-missing: leave existing chunk untouched
+			continue;
+		}
+
+		double const x0 = cx * kChunkSize;
+		double const z0 = cz * kChunkSize;
+		std::vector<float> heights(vcount, 0.0f);
+		std::vector<char> found(vcount, 0);
+		double sum = 0.0;
+		std::size_t hits = 0;
+
+		for (int iz = 0; iz <= kChunkCells; ++iz)
+			for (int ix = 0; ix <= kChunkCells; ++ix)
+			{
+				double const X = x0 + ix * step;
+				double const Z = z0 + iz * step;
+				double best = -std::numeric_limits<double>::max();
+				bool any = false;
+				for (auto const *tp : entry.second)
+				{
+					auto const &t = *tp;
+					double const minx = std::min({t[0].x, t[1].x, t[2].x});
+					double const maxx = std::max({t[0].x, t[1].x, t[2].x});
+					double const minz = std::min({t[0].z, t[1].z, t[2].z});
+					double const maxz = std::max({t[0].z, t[1].z, t[2].z});
+					if (X < minx || X > maxx || Z < minz || Z > maxz)
+						continue;
+					double y;
+					if (triangle_height_at(t[0], t[1], t[2], X, Z, y) && (!any || y > best))
+					{
+						best = y;
+						any = true;
+					}
+				}
+				std::size_t const vi = static_cast<std::size_t>(iz) * (kChunkCells + 1) + ix;
+				if (any)
+				{
+					heights[vi] = static_cast<float>(best);
+					found[vi] = 1;
+					sum += best;
+					++hits;
+				}
+			}
+
+		if (hits == 0)
+			continue; // chunk's triangles didn't cover any grid vertex; nothing to save
+
+		// fill gaps (vertices outside the covered footprint) with the chunk mean to avoid spikes
+		float const mean = static_cast<float>(sum / static_cast<double>(hits));
+		for (std::size_t i = 0; i < vcount; ++i)
+			if (!found[i])
+				heights[i] = mean;
+
+		terrain_streamer::save_height_grid(kChunkDir, cx, cz, heights, kChunkCells);
+		++generated;
+	}
+
+	WriteLog("Terrain chunk bake: " + std::to_string(tris.size()) + " triangles -> generated "
+	         + std::to_string(generated) + ", skipped " + std::to_string(skipped)
+	         + " existing (dir " + kChunkDir + ")");
+
+	g_bake_tris.clear();
+	g_bake_tris.shrink_to_fit();
 }

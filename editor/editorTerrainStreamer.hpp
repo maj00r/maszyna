@@ -81,6 +81,16 @@ class terrain_streamer
 	// writes every resident, edited chunk to disk (without unloading) - used on save
 	void flush();
 
+	// --- format-only helpers (independent of any instance/config), used by the startup bake ---
+	// path of a chunk file inside the given directory
+	static std::string chunk_filename(std::string const &Dir, int Cx, int Cz);
+	// true if a chunk file already exists on disk (generate-if-missing guard)
+	static bool chunk_file_exists(std::string const &Dir, int Cx, int Cz);
+	// writes a 16-bit ETC1 chunk file straight from a raw (Cells+1)^2 height grid (row-major world Y),
+	// creating the directory if needed. mirrors save_heights() but takes no editor_terrain/GPU mesh.
+	static void save_height_grid(std::string const &Dir, int Cx, int Cz,
+	                             std::vector<float> const &Heights, int Cells);
+
   private:
 	// per-chunk state bits cached so we don't stat the filesystem repeatedly
 	enum chunk_flag : uint8_t

@@ -327,11 +327,6 @@ void cParser::startIncludeFromParser(cParser& srcParser, bool ToLower, std::stri
 	}
 
 	const bool isTerrain = contains(includefile, "_ter.scm");
-	if (isTerrain && true == Global.file_binary_terrain_state) {
-		WriteLog("SBT found, ignoring: " + includefile);
-		readParameters(srcParser); // preserve original side-effect: still consume parameters
-		return;
-	}
 
 	if (Global.ParserLogIncludes) {
 		if (isTerrain) WriteLog("including terrain: " + includefile);

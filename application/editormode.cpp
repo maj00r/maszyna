@@ -58,66 +58,7 @@ namespace
         return state == GLFW_PRESS;
     }
 
-    // tests whether the vertical line through (Px,Pz) passes over triangle abc; if so returns the
-    // surface height at that point through OutY. used by the "snap to ground" (END) feature.
-    inline bool triangle_height_at(glm::dvec3 const &a, glm::dvec3 const &b, glm::dvec3 const &c,
-                                   double const Px, double const Pz, double &OutY)
-    {
-        double const ux = b.x - a.x, uz = b.z - a.z;
-        double const vx = c.x - a.x, vz = c.z - a.z;
-        double const wx = Px - a.x, wz = Pz - a.z;
-        double const den = ux * vz - vx * uz;
-        if (std::abs(den) < 1e-9)
-            return false; // degenerate or vertical triangle, no defined height
-        double const s = (wx * vz - vx * wz) / den;
-        double const t = (ux * wz - wx * uz) / den;
-        if (s < 0.0 || t < 0.0 || (s + t) > 1.0)
-            return false;
-        OutY = a.y + s * (b.y - a.y) + t * (c.y - a.y);
-        return true;
-    }
-
-    using world_triangle = std::array<glm::dvec3, 3>;
-
-    // walks a model's submodel tree (mirroring the renderer's transform chain) and appends every
-    // mesh triangle, in world space, to Out. siblings are iterated to avoid deep recursion.
-    void gather_submodel_triangles(TSubModel *Submodel, glm::dmat4 const &M, std::vector<world_triangle> &Out)
-    {
-        for (TSubModel *sub = Submodel; sub != nullptr; sub = sub->Next)
-        {
-            glm::dmat4 mlocal = M;
-            if ((sub->iFlags & 0xC000) && (sub->GetMatrix() != nullptr))
-                mlocal = M * glm::dmat4(glm::make_mat4(sub->GetMatrix()->readArray()));
-
-            if (sub->eType < TP_ROTATOR) // a drawable mesh, not a rotator/light/etc.
-            {
-                auto const handle = sub->m_geometry.handle;
-                if (handle.bank != 0 || handle.chunk != 0)
-                {
-                    auto const &verts = GfxRenderer->Vertices(handle);
-                    auto const &indices = GfxRenderer->Indices(handle);
-                    auto const to_world = [&](gfx::basic_vertex const &v) {
-                        return glm::dvec3(mlocal * glm::dvec4(glm::dvec3(v.position), 1.0));
-                    };
-                    if (false == indices.empty())
-                    {
-                        for (std::size_t i = 0; i + 2 < indices.size(); i += 3)
-                            Out.push_back({to_world(verts[indices[i]]), to_world(verts[indices[i + 1]]), to_world(verts[indices[i + 2]])});
-                    }
-                    else
-                    {
-                        for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
-                            Out.push_back({to_world(verts[i]), to_world(verts[i + 1]), to_world(verts[i + 2])});
-                    }
-                }
-            }
-
-            if (sub->Child != nullptr)
-                gather_submodel_triangles(sub->Child, mlocal, Out); // children inherit this matrix
-        }
-    }
-
-} 
+}
 
 bool editor_mode::editormode_input::init()
 {

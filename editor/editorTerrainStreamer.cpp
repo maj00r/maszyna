@@ -273,6 +273,52 @@ void terrain_streamer::flush()
 		}
 }
 
+std::string terrain_streamer::chunk_filename(std::string const &Dir, int Cx, int Cz)
+{
+	return Dir + "/chunk_" + std::to_string(Cx) + "_" + std::to_string(Cz) + ".etc";
+}
+
+bool terrain_streamer::chunk_file_exists(std::string const &Dir, int Cx, int Cz)
+{
+	std::error_code ec;
+	return std::filesystem::exists(chunk_filename(Dir, Cx, Cz), ec);
+}
+
+void terrain_streamer::save_height_grid(std::string const &Dir, int Cx, int Cz,
+                                        std::vector<float> const &Heights, int Cells)
+{
+	if (Heights.empty() || Cells < 1)
+		return;
+
+	float minh = Heights[0], maxh = Heights[0];
+	for (float const v : Heights)
+	{
+		minh = std::min(minh, v);
+		maxh = std::max(maxh, v);
+	}
+	float const step = (maxh > minh) ? (maxh - minh) / 65535.0f : 0.0f;
+
+	std::error_code ec;
+	std::filesystem::create_directories(Dir, ec);
+	std::ofstream f(chunk_filename(Dir, Cx, Cz), std::ios::binary | std::ios::trunc);
+	if (!f)
+		return;
+
+	char const magic[4] = {'E', 'T', 'C', '1'};
+	std::uint16_t const cells = static_cast<std::uint16_t>(Cells);
+	f.write(magic, 4);
+	f.write(reinterpret_cast<char const *>(&cells), sizeof(cells));
+	f.write(reinterpret_cast<char const *>(&minh), sizeof(minh));
+	f.write(reinterpret_cast<char const *>(&step), sizeof(step));
+	for (float const v : Heights)
+	{
+		std::uint16_t const raw = (step > 0.0f)
+		                              ? static_cast<std::uint16_t>(std::lround((v - minh) / step))
+		                              : std::uint16_t{0};
+		f.write(reinterpret_cast<char const *>(&raw), sizeof(raw));
+	}
+}
+
 void terrain_streamer::remove_chunk(int Cx, int Cz)
 {
 	chunk_key const key{Cx, Cz};

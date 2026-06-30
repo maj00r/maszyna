@@ -12,13 +12,37 @@ http://mozilla.org/MPL/2.0/.
 #include <vector>
 #include <string>
 #include <functional>
+#include <array>
 #include <glm/glm.hpp>
 
 #include "utilities/Classes.h"      // material_handle
 #include "interfaces/ITexture.h"    // null_handle
 #include "rendering/geometrybank.h" // gfx::geometry_handle / geometrybank_handle
 
-namespace scene { class basic_section; }
+namespace scene { class basic_section; class shape_node; }
+class TSubModel;
+class TAnimModel;
+
+// a single mesh triangle in world space
+using world_triangle = std::array<glm::dvec3, 3>;
+
+// tests whether the vertical line through (Px,Pz) passes over triangle abc; if so returns the
+// surface height at that point through OutY.
+bool triangle_height_at(glm::dvec3 const &a, glm::dvec3 const &b, glm::dvec3 const &c,
+                        double const Px, double const Pz, double &OutY);
+
+// walks a model's submodel tree (mirroring the renderer's transform chain) and appends every mesh
+// triangle, in world space, to Out.
+void gather_submodel_triangles(TSubModel *Submodel, glm::dmat4 const &M, std::vector<world_triangle> &Out);
+
+// Startup terrain-chunk bake. Terrain in a scenery is spread across many nodes (triangle shapes
+// and/or E3D terrain models), so triangles are accumulated during the load and written out once at
+// the end (generate-if-missing), one .etc heightmap per 250 m cell. Bake-only: it never modifies the
+// region or activates streaming - it just produces files for later paging.
+void bake_reset();                              // drop any accumulated triangles (call at load start)
+void bake_collect_shape(scene::shape_node const &Shape); // append a triangle shape's world triangles
+void bake_collect_model(TAnimModel *Terrain);  // append an E3D terrain model's world triangles
+void bake_finalize_chunks();                   // bucket per 250 m cell and write missing chunk files
 
 // Editor-owned, editable terrain patch.
 //
