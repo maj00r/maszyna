@@ -25,6 +25,7 @@ http://mozilla.org/MPL/2.0/.
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <limits>
@@ -501,6 +502,7 @@ void bake_finalize_chunks()
 		return;
 	auto const &tris = g_bake_tris;
 	std::string const dir = chunk_dir();
+	auto const bake_start = std::chrono::steady_clock::now();
 
 	// bucket triangles by the 250 m chunk(s) their bounding box overlaps
 	std::map<std::pair<int, int>, std::vector<bake_tri const *>> buckets;
@@ -537,6 +539,32 @@ void bake_finalize_chunks()
 		double sum = 0.0;
 		std::size_t hits = 0;
 
+		// spatial acceleration: bin the chunk's triangles into a GxG grid by bounding box, so each
+		// sampled vertex only tests the few triangles in its bin instead of the whole bucket. without
+		// this the bake is O(verts * bucket-size) and freezes the first load of large, finely
+		// triangulated sceneries. a triangle covering a vertex always overlaps that vertex's bin, so
+		// binning by bbox preserves correctness.
+		constexpr int kBinGrid = 16;
+		double const binsize = kChunkSize / static_cast<double>(kBinGrid);
+		auto const binx = [&](double X) {
+			return std::clamp(static_cast<int>(std::floor((X - x0) / binsize)), 0, kBinGrid - 1);
+		};
+		auto const binz = [&](double Z) {
+			return std::clamp(static_cast<int>(std::floor((Z - z0) / binsize)), 0, kBinGrid - 1);
+		};
+		std::vector<std::vector<bake_tri const *>> bins(kBinGrid * kBinGrid);
+		for (auto const *tp : entry.second)
+		{
+			auto const &t = tp->t;
+			int const bx0 = binx(std::min({t[0].x, t[1].x, t[2].x}));
+			int const bx1 = binx(std::max({t[0].x, t[1].x, t[2].x}));
+			int const bz0 = binz(std::min({t[0].z, t[1].z, t[2].z}));
+			int const bz1 = binz(std::max({t[0].z, t[1].z, t[2].z}));
+			for (int bz = bz0; bz <= bz1; ++bz)
+				for (int bx = bx0; bx <= bx1; ++bx)
+					bins[bz * kBinGrid + bx].push_back(tp);
+		}
+
 		for (int iz = 0; iz <= kChunkCells; ++iz)
 			for (int ix = 0; ix <= kChunkCells; ++ix)
 			{
@@ -544,7 +572,7 @@ void bake_finalize_chunks()
 				double const Z = z0 + iz * step;
 				double best = -std::numeric_limits<double>::max();
 				bool any = false;
-				for (auto const *tp : entry.second)
+				for (auto const *tp : bins[binz(Z) * kBinGrid + binx(X)])
 				{
 					auto const &t = tp->t;
 					double const minx = std::min({t[0].x, t[1].x, t[2].x});
@@ -596,9 +624,12 @@ void bake_finalize_chunks()
 		++generated;
 	}
 
+	auto const bake_ms = std::chrono::duration<double, std::milli>(
+	                         std::chrono::steady_clock::now() - bake_start)
+	                         .count();
 	WriteLog("Terrain chunk bake: " + std::to_string(tris.size()) + " triangles -> generated "
 	         + std::to_string(generated) + ", skipped " + std::to_string(skipped)
-	         + " existing (dir " + dir + ")");
+	         + " existing in " + std::to_string(static_cast<int>(bake_ms)) + " ms (dir " + dir + ")");
 
 	g_bake_tris.clear();
 	g_bake_tris.shrink_to_fit();
