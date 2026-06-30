@@ -598,6 +598,11 @@ int eu07_application::run()
 		if (simulation::is_ready && EditorTerrain.active())
 			EditorTerrain.update(Global.pCamera.Pos);
 
+		// Faza 4b: page static section geometry around the camera. Radius (10) exceeds the terrain
+		// streamer's (8) so a section being unloaded here has no resident terrain chunk in its m_shapes.
+		if (simulation::is_ready && simulation::Region != nullptr)
+			simulation::Region->stream_section_geometry(Global.pCamera.Pos, 10);
+
 		m_taskqueue.update();
 		opengl_texture::reset_unit_cache();
 

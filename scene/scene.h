@@ -352,8 +352,17 @@ public:
 	// gfx renderer data
     gfx::geometrybank_handle m_geometrybank;
     bool m_geometrycreated { false };
+    // Faza 4b: whether this section's static geometry is currently paged in. Cleared when the pager
+    // unloads it (far from camera) and set when it pages it back from the on-disk section file.
+    bool m_geometry_resident { true };
 
     gfx::geometrybank_handle m_map_geometryhandle;
+
+    // Faza 4b: drop this section's resident static geometry (section + cell shapes and lines) so the
+    // renderer's geometry GC reclaims the GPU memory; the logical content (paths, traction, models,
+    // sounds, events, memory cells) is left untouched. Terrain chunks are managed by the terrain
+    // streamer and are already gone here (the pager's radius exceeds the terrain radius).
+    void free_static_geometry();
 };
 
 // top-level of scene spatial structure, holds collection of sections
@@ -441,11 +450,16 @@ public:
 	    update_poi_geometry();
     basic_section* get_section(size_t section)
 	    { return m_sections[section]; }
-	// Faza 4: serialize each populated section's static geometry to a per-section file on disk
+	// Faza 4a: serialize each populated section's static geometry to a per-section file on disk
 	// (generate-if-missing), so it can later be paged in/out around the camera instead of all kept
-	// resident. Bake-only - does not change what is resident yet.
+	// resident. Records which sections were baked (for the pager). Bake-only.
 	void
-	    bake_section_geometry() const;
+	    bake_section_geometry();
+	// Faza 4b: page section static geometry around the camera - unload baked sections that drift
+	// outside Radius (in section units) and reload those that come back in, a few per frame. Radius
+	// must exceed the terrain streamer's radius so a section being freed has no resident terrain.
+	void
+	    stream_section_geometry( glm::dvec3 const &Camera, int Radius );
 	gfx::geometrybank_handle
 	    get_map_poi_geometry() { return m_map_poipoints; }
 	glm::vec3 find_nearest_track_point(const glm::dvec3 &pos)
@@ -478,6 +492,11 @@ public:
 // members
     section_array m_sections;
     region_scratchpad m_scratchpad;
+
+    // Faza 4b: section-geometry paging state. m_baked_geometry_sections are the section indices that
+    // have an on-disk geometry file; m_resident_geometry_sections are those currently paged in.
+    std::unordered_set<std::size_t> m_baked_geometry_sections;
+    std::unordered_set<std::size_t> m_resident_geometry_sections;
 
 };
 

@@ -825,6 +825,21 @@ basic_section::deserialize( std::istream &Input ) {
     }
 }
 
+// Faza 4b: drop resident static geometry; keep logical content. The renderer's geometry GC reclaims
+// the now-unreferenced GPU banks. m_geometrycreated is cleared so a later page-in rebuilds geometry.
+void
+basic_section::free_static_geometry() {
+
+    m_shapes.clear();
+    m_geometrycreated = false;
+    for( auto &cell : m_cells ) {
+        cell.m_shapesopaque.clear();
+        cell.m_shapestranslucent.clear();
+        cell.m_lines.clear();
+        cell.m_geometrycreated = false;
+    }
+}
+
 // sends content of the class in legacy (text) format to provided stream
 void
 basic_section::export_as_text( std::ostream &Output ) const {
@@ -1066,9 +1081,10 @@ std::string section_geometry_dir() {
 
 // Faza 4 (4a): write each populated section's static geometry to its own file, generate-if-missing.
 // Runs at load end, before the first frame uploads (and drops) the CPU vertices, so the serialized
-// shapes still carry their geometry. Does not change what is resident yet - just produces the store.
+// shapes still carry their geometry. Records every populated section (they all have a file now and
+// start resident) so the pager can page them in/out. Does not change what is resident yet.
 void
-basic_region::bake_section_geometry() const {
+basic_region::bake_section_geometry() {
 
     std::string const dir { section_geometry_dir() };
     std::error_code ec;
@@ -1081,6 +1097,9 @@ basic_region::bake_section_geometry() const {
         auto const *section { m_sections[ i ] };
         if( section == nullptr ) { continue; }
         std::string const path { dir + "/sec_" + std::to_string( i ) + ".bin" };
+        // every populated section has (or now gets) a file, and is currently paged in
+        m_baked_geometry_sections.insert( i );
+        m_resident_geometry_sections.insert( i );
         if( std::filesystem::exists( path, ec ) ) { ++skipped; continue; }
         std::ofstream output { path, std::ios::binary | std::ios::trunc };
         if( !output ) { continue; }
@@ -1092,6 +1111,65 @@ basic_region::bake_section_geometry() const {
     WriteLog( "Section geometry bake: " + std::to_string( baked ) + " baked ("
               + std::to_string( bytes / 1024 ) + " KB), " + std::to_string( skipped )
               + " skipped in " + std::to_string( static_cast<int>( ms ) ) + " ms (dir " + dir + ")" );
+}
+
+// Faza 4 (4b): page section static geometry around the camera. Sections that drift outside Radius are
+// unloaded (GPU reclaimed by the GC) and those that come back are reloaded from their file, a few per
+// frame. Logic stays resident. Radius must exceed the terrain streamer's radius so a freed section has
+// no resident terrain in its m_shapes.
+void
+basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
+
+    if( m_baked_geometry_sections.empty() ) { return; }
+
+    int const ccol { std::clamp( static_cast<int>( std::floor( Camera.x / EU07_SECTIONSIZE + EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, EU07_REGIONSIDESECTIONCOUNT - 1 ) };
+    int const crow { std::clamp( static_cast<int>( std::floor( Camera.z / EU07_SECTIONSIZE + EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, EU07_REGIONSIDESECTIONCOUNT - 1 ) };
+
+    auto const in_range = [&]( std::size_t Index ) {
+        int const col = static_cast<int>( Index % EU07_REGIONSIDESECTIONCOUNT );
+        int const row = static_cast<int>( Index / EU07_REGIONSIDESECTIONCOUNT );
+        return ( std::abs( col - ccol ) <= Radius ) && ( std::abs( row - crow ) <= Radius );
+    };
+
+    // unload resident sections that left the radius
+    for( auto it = m_resident_geometry_sections.begin(); it != m_resident_geometry_sections.end(); ) {
+        if( false == in_range( *it ) ) {
+            auto *section { m_sections[ *it ] };
+            if( section != nullptr ) {
+                section->free_static_geometry();
+                section->m_geometry_resident = false;
+            }
+            it = m_resident_geometry_sections.erase( it );
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // page in baked sections inside the radius that aren't resident, nearest first, a few per frame
+    std::string const dir { section_geometry_dir() };
+    int budget { 4 };
+    for( int ring = 0; ring <= Radius && budget > 0; ++ring ) {
+        for( int dr = -ring; dr <= ring && budget > 0; ++dr ) {
+            for( int dc = -ring; dc <= ring && budget > 0; ++dc ) {
+                if( std::max( std::abs( dr ), std::abs( dc ) ) != ring ) { continue; } // only this ring's border
+                int const row = crow + dr, col = ccol + dc;
+                if( row < 0 || row >= EU07_REGIONSIDESECTIONCOUNT || col < 0 || col >= EU07_REGIONSIDESECTIONCOUNT ) { continue; }
+                std::size_t const idx { static_cast<std::size_t>( row ) * EU07_REGIONSIDESECTIONCOUNT + col };
+                if( 0 == m_baked_geometry_sections.count( idx ) ) { continue; }
+                if( 0 != m_resident_geometry_sections.count( idx ) ) { continue; }
+                std::ifstream input { dir + "/sec_" + std::to_string( idx ) + ".bin", std::ios::binary };
+                if( !input ) { continue; }
+                sn_utils::ld_uint32( input ); // skip the leading section-size field (see 4a note)
+                if( m_sections[ idx ] == nullptr ) { m_sections[ idx ] = new basic_section(); }
+                m_sections[ idx ]->deserialize( input );
+                m_sections[ idx ]->m_geometrycreated = false; // force GPU rebuild on next draw
+                m_sections[ idx ]->m_geometry_resident = true;
+                m_resident_geometry_sections.insert( idx );
+                --budget;
+            }
+        }
+    }
 }
 
 // potentially activates event handler with the same name as provided node, and within handler activation range
