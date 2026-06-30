@@ -689,11 +689,14 @@ void eu07_application::exit()
 
 	ui_layer::shutdown();
 
+	// stop and join the python task-queue workers BEFORE destroying the windows: a worker holds one
+	// of these windows' GL context current, and its shutdown detaches it (glfwMakeContextCurrent) -
+	// destroying the window first leaves that context dangling and crashes the worker on exit.
+	m_taskqueue.exit();
 	for (auto *window : m_windows)
 	{
 		glfwDestroyWindow(window);
 	}
-	m_taskqueue.exit();
 	glfwPollEvents(); // TODO: This fixes a segfault on Wayland when closing. Remove after updating glfw to 3.5.
 	glfwTerminate();
 
