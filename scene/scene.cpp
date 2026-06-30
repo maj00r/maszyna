@@ -1132,6 +1132,7 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
     };
 
     // unload resident sections that left the radius
+    std::uint32_t freed { 0 };
     for( auto it = m_resident_geometry_sections.begin(); it != m_resident_geometry_sections.end(); ) {
         if( false == in_range( *it ) ) {
             auto *section { m_sections[ *it ] };
@@ -1140,6 +1141,7 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
                 section->m_geometry_resident = false;
             }
             it = m_resident_geometry_sections.erase( it );
+            ++freed;
         }
         else {
             ++it;
@@ -1149,6 +1151,7 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
     // page in baked sections inside the radius that aren't resident, nearest first, a few per frame
     std::string const dir { section_geometry_dir() };
     int budget { 4 };
+    std::uint32_t loaded { 0 };
     for( int ring = 0; ring <= Radius && budget > 0; ++ring ) {
         for( int dr = -ring; dr <= ring && budget > 0; ++dr ) {
             for( int dc = -ring; dc <= ring && budget > 0; ++dc ) {
@@ -1167,8 +1170,15 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
                 m_sections[ idx ]->m_geometry_resident = true;
                 m_resident_geometry_sections.insert( idx );
                 --budget;
+                ++loaded;
             }
         }
+    }
+
+    if( freed != 0 || loaded != 0 ) {
+        WriteLog( "Section geometry pager: freed " + std::to_string( freed ) + ", loaded "
+                  + std::to_string( loaded ) + ", resident " + std::to_string( m_resident_geometry_sections.size() )
+                  + " / " + std::to_string( m_baked_geometry_sections.size() ) );
     }
 }
 
