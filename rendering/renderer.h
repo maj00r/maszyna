@@ -40,6 +40,9 @@ public:
     // NOTE: hands-on geometry management is exposed as a temporary measure; ultimately all visualization data should be generated/handled automatically by the renderer itself
     // creates a new geometry bank. returns: handle to the bank or NULL
     virtual auto Create_Bank() -> gfx::geometrybank_handle = 0;
+    // frees a bank's GPU resources (terrain streaming, on chunk unload). default: no-op. backends
+    // that hold GPU buffers override this; on Vulkan it is deferred past the frames in flight.
+    virtual void Release_Bank( gfx::geometrybank_handle const &Bank ) {}
     // creates a new indexed geometry chunk of specified type from supplied data, in specified bank. returns: handle to the chunk or NULL
     virtual auto Insert(gfx::index_array &Indices, gfx::vertex_array &Vertices, gfx::userdata_array &Userdata, gfx::geometrybank_handle const &Geometry, int const Type) -> gfx::geometry_handle = 0;
     // creates a new geometry chunk of specified type from supplied data, in specified bank. returns: handle to the chunk or NULL

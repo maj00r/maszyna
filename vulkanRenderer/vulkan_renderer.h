@@ -97,7 +97,9 @@ class vulkan_geometrybank : public gfx::geometry_bank {
   std::size_t draw_(gfx::geometry_handle const &Geometry,
                     gfx::stream_units const &Units,
                     unsigned int const Streams) override;
-  void release_() override {}
+  // frees all GPU buffers held by this bank. the caller must guarantee none are still referenced by
+  // a command buffer in flight (terrain streaming defers this past the frames in flight).
+  void release_() override;
 
   void upload(gfx::geometry_handle const &Geometry);
 
@@ -163,6 +165,11 @@ class vulkan_renderer : public gfx_renderer {
   gfx::geometrybank_handle Create_Bank() override {
     return m_geometry.register_bank(
         std::make_unique<vulkan_geometrybank>(&m_geo_ctx));
+  }
+  // defer the actual free: the bank's buffers may still be referenced by a command buffer in flight,
+  // so queue it and release once kMaxFramesInFlight frames have passed (see Render()).
+  void Release_Bank( gfx::geometrybank_handle const &Bank ) override {
+    m_pending_bank_release.push_back( { Bank, m_frame_counter } );
   }
   gfx::geometry_handle Insert(gfx::index_array &Indices,
                               gfx::vertex_array &Vertices,
@@ -573,6 +580,11 @@ class vulkan_renderer : public gfx_renderer {
 
   gfx::geometrybank_manager m_geometry;
   material_manager m_material_manager;
+
+  // deferred geometry-bank frees (terrain chunk unloads): {bank, frame queued}. released once the
+  // GPU is guaranteed done with them, i.e. more than kMaxFramesInFlight frames later.
+  std::vector<std::pair<gfx::geometrybank_handle, uint64_t>> m_pending_bank_release;
+  uint64_t m_frame_counter = 0;
 
   // GPU textures indexed by (handle - 1); handle 0 (null) maps to the white
   // default. Loaded on demand by Fetch_Texture, deduped by filename.

@@ -1860,6 +1860,18 @@ vulkan_geometrybank::~vulkan_geometrybank() {
   }
 }
 
+void vulkan_geometrybank::release_() {
+  if (m_ctx == nullptr || m_ctx->device == VK_NULL_HANDLE) return;
+  for (auto &g : m_gpu) {
+    if (g.vbuf) vkDestroyBuffer(m_ctx->device, g.vbuf, nullptr);
+    if (g.vmem) vkFreeMemory(m_ctx->device, g.vmem, nullptr);
+    if (g.ibuf) vkDestroyBuffer(m_ctx->device, g.ibuf, nullptr);
+    if (g.imem) vkFreeMemory(m_ctx->device, g.imem, nullptr);
+    g = {};
+  }
+  m_gpu.clear();
+}
+
 namespace {
 bool make_device_buffer(const vulkan_geometry_context &ctx, const void *data,
                         VkDeviceSize size, VkBufferUsageFlags usage,
@@ -3858,6 +3870,18 @@ void vulkan_renderer::draw_scene(bool translucent_pass, const glm::dvec3 &campos
 }
 
 bool vulkan_renderer::Render() {
+  ++m_frame_counter;
+  // free terrain chunk banks queued for release once they've outlived the frames in flight, so the
+  // GPU is guaranteed no longer reading their buffers (safe vkDestroyBuffer)
+  for (auto it = m_pending_bank_release.begin(); it != m_pending_bank_release.end();) {
+    if (m_frame_counter - it->second > kMaxFramesInFlight) {
+      m_geometry.release_bank(it->first);
+      it = m_pending_bank_release.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   // Resolve any queued control-pick request (on mouse click) before the frame.
   Update_Pick_Control();
 

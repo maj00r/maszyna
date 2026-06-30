@@ -275,8 +275,14 @@ void editor_terrain::destroy()
 			}
 		}
 	}
+	// release this chunk's dedicated GPU bank (deferred past frames-in-flight on Vulkan). the bank is
+	// never drawn again - a chunk re-entering the radius builds a fresh one - so nothing re-uploads.
+	if (m_bank.bank != 0 && GfxRenderer != nullptr)
+		GfxRenderer->Release_Bank(m_bank);
+
 	m_section = nullptr;
 	m_geometry = gfx::geometry_handle{0, 0};
+	m_bank = gfx::geometrybank_handle{0, 0};
 	m_cells = 0; // mark invalid
 	m_heights.clear();
 }

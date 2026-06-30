@@ -203,6 +203,12 @@ public:
 // methods:
     // performs a resource sweep
     void update();
+    // frees the GPU resources of a specific bank now (used by terrain streaming when a chunk leaves
+    // the radius; its dedicated bank is never drawn again, so there's nothing to re-upload)
+    void release_bank( gfx::geometrybank_handle const &Bank ) {
+        if( ( Bank.bank != 0 ) && ( Bank.bank <= m_geometrybanks.size() ) ) {
+            m_geometrybanks[ Bank.bank - 1 ].first->release();
+            m_geometrybanks[ Bank.bank - 1 ].second = std::chrono::steady_clock::time_point(); } }
     // registers a new geometry bank. returns: handle to the bank
     auto register_bank(std::unique_ptr<geometry_bank> bank) -> gfx::geometrybank_handle;
     // creates a new geometry chunk of specified type from supplied data, in specified bank. returns: handle to the chunk or NULL

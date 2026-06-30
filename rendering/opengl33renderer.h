@@ -57,6 +57,8 @@ class opengl33_renderer : public gfx_renderer {
     // creates a new geometry bank. returns: handle to the bank or NULL
     gfx::geometrybank_handle
         Create_Bank() override;
+    // GL buffer deletion is safe even if recently used (the driver defers), so free immediately
+    void Release_Bank( gfx::geometrybank_handle const &Bank ) override { m_geometry.release_bank( Bank ); }
     // creates a new indexed geometry chunk of specified type from supplied data, in specified bank. returns: handle to the chunk or NULL
 	gfx::geometry_handle Insert(gfx::index_array &Indices, gfx::vertex_array &Vertices, gfx::userdata_array &Userdata, gfx::geometrybank_handle const &Geometry, int const Type) override;
     // creates a new geometry chunk of specified type from supplied data, in specified bank. returns: handle to the chunk or NULL
