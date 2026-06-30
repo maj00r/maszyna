@@ -51,11 +51,15 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/utilities.h"
 #include "model/Texture.h"
 #include <thread>
+#include <cstring>
 
 #define PyGetFloat(param) PyFloat_FromDouble(param)
 #define PyGetInt(param) PyLong_FromLong(param)
 #define PyGetBool(param) param ? Py_True : Py_False
-#define PyGetString(param) PyUnicode_FromString(param)
+// Decode with replacement so non-UTF-8 bytes (e.g. cp1252 Polish text in scenery scripts) never make
+// this return nullptr - Python 3's PyUnicode_FromString rejects invalid UTF-8 (Python 2's
+// PyString_FromString accepted any bytes), which previously crashed PyDict_SetItemString on a null.
+#define PyGetString(param) PyUnicode_DecodeUTF8(param, static_cast<Py_ssize_t>(std::strlen(param)), "replace")
 
 // python rendertarget
 struct python_rt
