@@ -11,6 +11,7 @@ http://mozilla.org/MPL/2.0/.
 #include "editor/editorTerrainStreamer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -178,6 +179,11 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 	std::sort(wanted.begin(), wanted.end(),
 	          [&dist2](chunk_key const &a, chunk_key const &b) { return dist2(a) < dist2(b); });
 
+	// time-budget the per-frame builds: a full-res chunk costs a few ms (mesh + GPU upload), so a fixed
+	// count spikes frame time when several enter the radius at once (FPS dips while moving). cap the
+	// time spent here instead - at least one chunk progresses, the rest wait for following frames.
+	auto const t_start = std::chrono::steady_clock::now();
+	constexpr double kBudgetMs = 3.0;
 	int budget = m_loadbudget;
 	for (chunk_key const &key : wanted)
 	{
@@ -212,6 +218,9 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 				terrain->optimize(m_simplify_error);
 			m_chunks.emplace(key, std::move(terrain));
 			--budget;
+			// stop once this frame's streaming time budget is spent (one build already guaranteed)
+			if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count() > kBudgetMs)
+				break;
 		}
 	}
 
