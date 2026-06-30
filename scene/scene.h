@@ -441,6 +441,11 @@ public:
 	    update_poi_geometry();
     basic_section* get_section(size_t section)
 	    { return m_sections[section]; }
+	// Faza 4: serialize each populated section's static geometry to a per-section file on disk
+	// (generate-if-missing), so it can later be paged in/out around the camera instead of all kept
+	// resident. Bake-only - does not change what is resident yet.
+	void
+	    bake_section_geometry() const;
 	gfx::geometrybank_handle
 	    get_map_poi_geometry() { return m_map_poipoints; }
 	glm::vec3 find_nearest_track_point(const glm::dvec3 &pos)

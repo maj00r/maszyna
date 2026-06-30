@@ -22,6 +22,10 @@ http://mozilla.org/MPL/2.0/.
 #include "rendering/renderer.h"
 #include "widgets/map_objects.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+
 namespace scene {
 
 std::map<std::string, basic_node *> Hierarchy;
@@ -1043,6 +1047,51 @@ basic_region::basic_region() {
 basic_region::~basic_region() {
 
     for( auto *section : m_sections ) { if( section != nullptr ) { delete section; } }
+}
+
+namespace {
+// per-scenery folder for streamed section geometry, mirroring the terrain chunk layout, so different
+// maps don't collide on section indices.
+std::string section_geometry_dir() {
+    std::string name = Global.SceneryFile;
+    auto const slash = name.find_last_of( "/\\" );
+    if( slash != std::string::npos ) { name.erase( 0, slash + 1 ); }
+    while( !name.empty() && name.front() == '$' ) { name.erase( 0, 1 ); } // rainsted override prefix
+    auto const dot = name.find_last_of( '.' );
+    if( dot != std::string::npos ) { name.erase( dot ); }
+    if( name.empty() ) { name = "default"; }
+    return "section_geometry/" + name;
+}
+} // namespace
+
+// Faza 4 (4a): write each populated section's static geometry to its own file, generate-if-missing.
+// Runs at load end, before the first frame uploads (and drops) the CPU vertices, so the serialized
+// shapes still carry their geometry. Does not change what is resident yet - just produces the store.
+void
+basic_region::bake_section_geometry() const {
+
+    std::string const dir { section_geometry_dir() };
+    std::error_code ec;
+    std::filesystem::create_directories( dir, ec );
+
+    auto const t0 { std::chrono::steady_clock::now() };
+    std::uint32_t baked { 0 }, skipped { 0 };
+    std::uintmax_t bytes { 0 };
+    for( std::size_t i = 0; i < m_sections.size(); ++i ) {
+        auto const *section { m_sections[ i ] };
+        if( section == nullptr ) { continue; }
+        std::string const path { dir + "/sec_" + std::to_string( i ) + ".bin" };
+        if( std::filesystem::exists( path, ec ) ) { ++skipped; continue; }
+        std::ofstream output { path, std::ios::binary | std::ios::trunc };
+        if( !output ) { continue; }
+        section->serialize( output );
+        bytes += static_cast<std::uintmax_t>( output.tellp() );
+        ++baked;
+    }
+    auto const ms { std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() };
+    WriteLog( "Section geometry bake: " + std::to_string( baked ) + " baked ("
+              + std::to_string( bytes / 1024 ) + " KB), " + std::to_string( skipped )
+              + " skipped in " + std::to_string( static_cast<int>( ms ) ) + " ms (dir " + dir + ")" );
 }
 
 // potentially activates event handler with the same name as provided node, and within handler activation range

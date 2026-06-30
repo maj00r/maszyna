@@ -148,6 +148,9 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 	// page those chunks around the camera (8 chunks ~= 2 km, matching the renderer's section window)
 	bake_activate_streaming( 8 );
 
+	// Faza 4 (4a): persist per-section static geometry to disk for later paging (generate-if-missing)
+	Region->bake_section_geometry();
+
 	// one-shot scene-composition diagnostic: what is resident, to decide what to stream next
 	{
 		std::size_t instances = 0, uniquemodels = 0;
