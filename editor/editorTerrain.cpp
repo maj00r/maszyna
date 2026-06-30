@@ -589,6 +589,10 @@ void bake_activate_streaming(int Radius)
 
 	EditorTerrain.directory(kChunkDir);
 	EditorTerrain.configure(kChunkCells, static_cast<float>(kChunkSize / kChunkCells), Radius, 0.0f, std::string());
+	// no adaptive simplification: merging flat blocks into bigger quads leaves T-junction cracks
+	// (sub-metre slivers) where a large quad meets a neighbour's smaller quads. full-res chunks share
+	// identical edge vertices, so they tile seamlessly.
+	EditorTerrain.simplify(false, 0.0f);
 	EditorTerrain.active(true);
 	WriteLog("Terrain streaming activated from baked chunks (dir " + kChunkDir
 	         + ", radius " + std::to_string(Radius) + ")");
