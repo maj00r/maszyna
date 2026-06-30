@@ -467,6 +467,42 @@ namespace
 		M = glm::scale(M, glm::dvec3(scale));
 		return M;
 	}
+
+	// like gather_submodel_triangles, but tags each triangle with its own submodel's material - a 3d
+	// terrain model's geometry lives in child submodels each with a different ground texture, so the
+	// root material (often none) must not be used for the whole model.
+	void gather_submodel_bake_tris(TSubModel *Submodel, glm::dmat4 const &M, std::vector<bake_tri> &Out)
+	{
+		for (TSubModel *sub = Submodel; sub != nullptr; sub = sub->Next)
+		{
+			glm::dmat4 mlocal = M;
+			if ((sub->iFlags & 0xC000) && (sub->GetMatrix() != nullptr))
+				mlocal = M * glm::dmat4(glm::make_mat4(sub->GetMatrix()->readArray()));
+
+			if (sub->eType < TP_ROTATOR)
+			{
+				auto const handle = sub->m_geometry.handle;
+				if (handle.bank != 0 || handle.chunk != 0)
+				{
+					material_handle const mat = sub->GetMaterial();
+					auto const &verts = GfxRenderer->Vertices(handle);
+					auto const &indices = GfxRenderer->Indices(handle);
+					auto const to_world = [&](gfx::basic_vertex const &v) {
+						return glm::dvec3(mlocal * glm::dvec4(glm::dvec3(v.position), 1.0));
+					};
+					if (false == indices.empty())
+						for (std::size_t i = 0; i + 2 < indices.size(); i += 3)
+							Out.push_back({world_triangle{to_world(verts[indices[i]]), to_world(verts[indices[i + 1]]), to_world(verts[indices[i + 2]])}, mat});
+					else
+						for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
+							Out.push_back({world_triangle{to_world(verts[i]), to_world(verts[i + 1]), to_world(verts[i + 2])}, mat});
+				}
+			}
+
+			if (sub->Child != nullptr)
+				gather_submodel_bake_tris(sub->Child, mlocal, Out);
+		}
+	}
 }
 
 void bake_reset()
@@ -474,26 +510,45 @@ void bake_reset()
 	g_bake_tris.clear();
 }
 
-void bake_collect_shape(scene::shape_node const &Shape)
+bool bake_collect_shape(scene::shape_node const &Shape)
 {
-	material_handle const mat = Shape.data().material;
 	auto const &verts = Shape.data().vertices; // world-space GL_TRIANGLES
+	if (verts.size() < 3)
+		return false;
+
+	// classify: a ground surface is (mostly) horizontal; upright nodes (fences, walls) must not be
+	// folded into the flat terrain heightmap (that stole their texture and dropped the geometry).
+	// area-weighted so a few big ground triangles outvote many small upright ones and vice versa.
+	double horiz_area = 0.0, total_area = 0.0;
+	for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
+	{
+		glm::dvec3 const a(verts[i].position), b(verts[i + 1].position), c(verts[i + 2].position);
+		glm::dvec3 const n = glm::cross(b - a, c - a);
+		double const len = glm::length(n);
+		if (len <= 0.0)
+			continue;
+		total_area += len; // 2x area, but only ratios matter
+		if (std::abs(n.y) / len > 0.5) // surface tilted < 60 deg from horizontal
+			horiz_area += len;
+	}
+	if (total_area <= 0.0 || horiz_area < 0.5 * total_area)
+		return false; // upright / non-ground: caller keeps it resident
+
+	material_handle const mat = Shape.data().material;
 	for (std::size_t i = 0; i + 2 < verts.size(); i += 3)
 		g_bake_tris.push_back({world_triangle{glm::dvec3(verts[i].position),
 		                                      glm::dvec3(verts[i + 1].position),
 		                                      glm::dvec3(verts[i + 2].position)},
 		                       mat});
+	return true;
 }
 
 void bake_collect_model(TAnimModel *Terrain)
 {
 	if (Terrain == nullptr || Terrain->pModel == nullptr)
 		return;
-	std::vector<world_triangle> tris;
-	gather_submodel_triangles(Terrain->pModel->Root, model_world_matrix(Terrain), tris);
-	material_handle const mat = Terrain->pModel->Root ? Terrain->pModel->Root->GetMaterial() : null_handle;
-	for (auto const &t : tris)
-		g_bake_tris.push_back({t, mat});
+	// per-submodel materials: terrain meshes carry their ground texture on child submodels
+	gather_submodel_bake_tris(Terrain->pModel->Root, model_world_matrix(Terrain), g_bake_tris);
 }
 
 void bake_finalize_chunks()

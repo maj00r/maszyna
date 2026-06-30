@@ -576,10 +576,12 @@ state_serializer::deserialize_node( cParser &Input, scene::scratch_data &Scratch
 
         if( false == skip ) {
 
-            // import (consumes the triangle tokens), then accumulate for the terrain-chunk bake.
-            // Faza 1: terrain triangles are streamed as baked chunks, so they are NOT kept resident.
+            // import (consumes the triangle tokens). ground surfaces are streamed as baked terrain
+            // chunks (not kept resident); upright geometry (fences/walls) stays in the scene normally.
             auto shape = scene::shape_node().import( Input, nodedata );
-            bake_collect_shape( shape );
+            if( false == bake_collect_shape( shape ) ) {
+                simulation::Region->insert( std::move( shape ), Scratchpad, true );
+            }
         }
         else {
             skip_until( Input, "endtri" );

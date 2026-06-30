@@ -40,7 +40,11 @@ void gather_submodel_triangles(TSubModel *Submodel, glm::dmat4 const &M, std::ve
 // the end (generate-if-missing), one .etc heightmap per 250 m cell. Bake-only: it never modifies the
 // region or activates streaming - it just produces files for later paging.
 void bake_reset();                              // drop any accumulated triangles (call at load start)
-void bake_collect_shape(scene::shape_node const &Shape); // append a triangle shape's world triangles
+// If the shape is a (near-)horizontal ground surface, its triangles are accumulated for the terrain
+// bake and true is returned (the caller should NOT keep it resident - it streams as a chunk). If it
+// is upright geometry (fence/wall/etc.) nothing is collected and false is returned, so the caller
+// keeps drawing it normally instead of folding its texture into a flat terrain chunk.
+bool bake_collect_shape(scene::shape_node const &Shape);
 void bake_collect_model(TAnimModel *Terrain);  // append an E3D terrain model's world triangles
 void bake_finalize_chunks();                   // bucket per 250 m cell and write missing chunk files
 // point the global terrain streamer at the baked chunk folder/grid and activate paging around the
