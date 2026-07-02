@@ -216,6 +216,15 @@ void terrain_streamer::update(glm::dvec3 const &CameraPos)
 		{
 			if (m_auto_optimize)
 				terrain->optimize(m_simplify_error);
+			else
+			{
+				// perfectly flat chunk: collapse the mesh (2048 -> 2 tris). safe against the cracks
+				// that forced full-res rendering: a uniform-height chunk's edge is a straight line, so
+				// it stays coplanar with the neighbour's full-res edge vertices.
+				auto const [lo, hi] = std::minmax_element(loaded.begin(), loaded.end());
+				if (*hi - *lo < 0.001f)
+					terrain->optimize(0.01f);
+			}
 			m_chunks.emplace(key, std::move(terrain));
 			--budget;
 			// stop once this frame's streaming time budget is spent (one build already guaranteed)
