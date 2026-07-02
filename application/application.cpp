@@ -602,6 +602,9 @@ int eu07_application::run()
 		// streamer's (8) so a section being unloaded here has no resident terrain chunk in its m_shapes.
 		if (simulation::is_ready && simulation::Region != nullptr)
 			simulation::Region->stream_section_geometry(Global.pCamera.Pos, 10);
+		// Faza 4c: page section model instances around the camera (destroy far / recreate near)
+		if (simulation::is_ready && simulation::Region != nullptr)
+			simulation::State.stream_section_models(Global.pCamera.Pos, 12);
 
 		m_taskqueue.update();
 		opengl_texture::reset_unit_cache();

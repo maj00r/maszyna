@@ -46,7 +46,18 @@ public:
 	// create new eventlauncher from node stirng
 	TEventLauncher * create_eventlauncher(std::string const &src, std::string const &name, const glm::dvec3 &position);
 
+	// Faza 4c (model streaming): write each populated section's model instances to a per-section text
+	// file (generate-if-missing) at load end, so they can be paged in/out around the camera.
+	void bake_section_models();
+	// page section model instances around the camera: destroy those in sections that leave Radius
+	// (freeing their smoke sources / Hierarchy / instance-table entries) and recreate those that come
+	// back from the section's model file. only ungrouped instances are paged (grouped stay resident).
+	void stream_section_models( glm::dvec3 const &Camera, int Radius );
+
 private:
+	// Faza 4c: model-paging bookkeeping (section index -> baked/resident), mirrors the geometry pager.
+	std::unordered_set<std::size_t> m_baked_model_sections;
+	std::unordered_set<std::size_t> m_resident_model_sections;
 // methods
     // restores class data from provided stream
     void deserialize_area( cParser &Input, scene::scratch_data &Scratchpad );

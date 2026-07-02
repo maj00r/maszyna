@@ -58,6 +58,10 @@ public:
     // stores class data in specified file, in legacy (text) format
     void
         export_as_text( std::string const &Scenariofile ) const;
+    // Faza 4c: page section model instances around the camera (forwards to the serializer)
+    void
+        stream_section_models( glm::dvec3 const &Camera, int Radius ) {
+            m_serializer.stream_section_models( Camera, Radius ); }
 
 private:
 // members

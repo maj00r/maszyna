@@ -105,6 +105,11 @@ public:
     particle_sequence const &
         sequence() const {
             return m_particles; }
+    // true if this source is attached to the given scene model (used to drop its sources when the
+    // model is paged out, so the manager never dereferences a destroyed owner)
+    bool
+        owned_by( TAnimModel const *Node ) const {
+            return ( m_ownertype == owner_type::node ) && ( m_owner.node == Node ); }
 
 private:
 // types
@@ -184,6 +189,10 @@ public:
     // updates state of all owned emitters
     void
         update();
+    // removes every particle source attached to the given model (called when the model is paged out,
+    // so the manager doesn't keep a dangling owner pointer). returns: number of sources removed
+    std::size_t
+        erase( TAnimModel const *Node );
     // data access
     source_sequence &
         sequence() {

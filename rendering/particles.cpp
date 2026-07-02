@@ -460,6 +460,19 @@ particle_manager::update() {
     }
 }
 
+std::size_t
+particle_manager::erase( TAnimModel const *Node ) {
+
+    if( Node == nullptr ) { return 0; }
+    auto const before { m_sources.size() };
+    m_sources.erase(
+        std::remove_if(
+            m_sources.begin(), m_sources.end(),
+            [Node]( smoke_source const &Source ) { return Source.owned_by( Node ); } ),
+        m_sources.end() );
+    return before - m_sources.size();
+}
+
 smoke_source *
 particle_manager::find( std::string const &Template ) {
 

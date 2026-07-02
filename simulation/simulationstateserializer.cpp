@@ -30,6 +30,10 @@ http://mozilla.org/MPL/2.0/.
 #include "editor/editorTerrainStreamer.hpp"
 
 #include <set>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <chrono>
 
 namespace simulation {
 
@@ -150,6 +154,8 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 
 	// Faza 4 (4a): persist per-section static geometry to disk for later paging (generate-if-missing)
 	Region->bake_section_geometry();
+	// Faza 4c: persist per-section model instances to disk for later paging (generate-if-missing)
+	bake_section_models();
 
 	// one-shot scene-composition diagnostic: what is resident, to decide what to stream next
 	{
@@ -1380,6 +1386,156 @@ TEventLauncher *state_serializer::create_eventlauncher(const std::string &src, c
 	simulation::Region->insert(launcher);
 
 	return launcher;
+}
+
+namespace {
+// per-scenery folder for baked model text (same naming scheme as the geometry pager)
+std::string section_models_dir() {
+	std::string name = Global.SceneryFile;
+	auto const slash = name.find_last_of( "/\\" );
+	if( slash != std::string::npos ) { name.erase( 0, slash + 1 ); }
+	while( !name.empty() && name.front() == '$' ) { name.erase( 0, 1 ); }
+	auto const dot = name.find_last_of( '.' );
+	if( dot != std::string::npos ) { name.erase( dot ); }
+	if( name.empty() ) { name = "default"; }
+	return "section_models/" + name;
+}
+// ungrouped model instances held by a section's cells (grouped ones stay resident so groups stay intact)
+void gather_section_models( scene::basic_section *Section, std::vector<TAnimModel *> &Out ) {
+	if( Section == nullptr ) { return; }
+	// an instance with both opaque and translucent pieces sits in both cell lists - dedup so we never
+	// serialize or (worse) destroy the same model twice
+	std::unordered_set<TAnimModel *> seen;
+	for( auto &cell : Section->m_cells ) {
+		for( auto *m : cell.m_instancesopaque ) {
+			if( m != nullptr && seen.insert( m ).second ) { Out.push_back( m ); } }
+		for( auto *m : cell.m_instancetranslucent ) {
+			if( m != nullptr && seen.insert( m ).second ) { Out.push_back( m ); } }
+	}
+}
+} // namespace
+
+// Faza 4c: write each populated section's ungrouped model instances to a per-section text file at
+// load end (generate-if-missing), so the pager can recreate them after unloading. Records every
+// section that has models (they start resident).
+void
+state_serializer::bake_section_models() {
+
+	if( simulation::Region == nullptr ) { return; }
+	std::string const dir { section_models_dir() };
+	std::error_code ec;
+	std::filesystem::create_directories( dir, ec );
+
+	auto const t0 { std::chrono::steady_clock::now() };
+	std::uint32_t baked { 0 }, skipped { 0 }, models { 0 };
+	for( std::size_t i = 0; i < sq( scene::EU07_REGIONSIDESECTIONCOUNT ); ++i ) {
+		auto *section { simulation::Region->get_section( i ) };
+		if( section == nullptr ) { continue; }
+		std::vector<TAnimModel *> sectionmodels;
+		gather_section_models( section, sectionmodels );
+		if( sectionmodels.empty() ) { continue; }
+		m_baked_model_sections.insert( i );
+		m_resident_model_sections.insert( i );
+		models += static_cast<std::uint32_t>( sectionmodels.size() );
+		std::string const path { dir + "/sec_" + std::to_string( i ) + ".scm" };
+		if( std::filesystem::exists( path, ec ) ) { ++skipped; continue; }
+		std::ofstream f { path, std::ios::trunc };
+		if( !f ) { continue; }
+		for( auto *m : sectionmodels ) { m->export_as_text( f ); }
+		++baked;
+	}
+	auto const ms { std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() };
+	WriteLog( "Section model bake: " + std::to_string( baked ) + " sections (" + std::to_string( models )
+	          + " models), " + std::to_string( skipped ) + " skipped in " + std::to_string( static_cast<int>( ms ) )
+	          + " ms (dir " + dir + ")" );
+}
+
+// Faza 4c: page model instances around the camera. Sections leaving Radius have their ungrouped
+// models destroyed (smoke sources, Hierarchy entry and instance-table entry removed); sections
+// coming back have them recreated from the section's model file, a couple per frame.
+void
+state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) {
+
+	if( m_baked_model_sections.empty() || simulation::Region == nullptr ) { return; }
+
+	int const ccol { std::clamp( static_cast<int>( std::floor( Camera.x / scene::EU07_SECTIONSIZE + scene::EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, scene::EU07_REGIONSIDESECTIONCOUNT - 1 ) };
+	int const crow { std::clamp( static_cast<int>( std::floor( Camera.z / scene::EU07_SECTIONSIZE + scene::EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, scene::EU07_REGIONSIDESECTIONCOUNT - 1 ) };
+	auto const in_range = [&]( std::size_t Index ) {
+		int const col = static_cast<int>( Index % scene::EU07_REGIONSIDESECTIONCOUNT );
+		int const row = static_cast<int>( Index / scene::EU07_REGIONSIDESECTIONCOUNT );
+		return ( std::abs( col - ccol ) <= Radius ) && ( std::abs( row - crow ) <= Radius );
+	};
+
+	// destroy models of sections that left the radius
+	std::uint32_t freed { 0 };
+	for( auto it = m_resident_model_sections.begin(); it != m_resident_model_sections.end(); ) {
+		if( false == in_range( *it ) ) {
+			std::vector<TAnimModel *> models;
+			gather_section_models( simulation::Region->get_section( *it ), models );
+			for( auto *m : models ) {
+				Particles.erase( m );                                // drop smoke sources first (owner dies)
+				scene::Hierarchy.erase( m->uuid.to_string() );       // drop name lookup entry
+				simulation::State.delete_model( m );                 // region erase + instance-table purge (frees it)
+			}
+			freed += static_cast<std::uint32_t>( models.size() );
+			it = m_resident_model_sections.erase( it );
+		}
+		else {
+			++it;
+		}
+	}
+
+	// recreate models of sections that came back inside the radius, a couple per frame (re-parse is costly)
+	std::string const dir { section_models_dir() };
+	int budget { 2 };
+	std::uint32_t loaded { 0 };
+	for( auto const idx : m_baked_model_sections ) {
+		if( budget <= 0 ) { break; }
+		if( false == in_range( idx ) ) { continue; }
+		if( 0 != m_resident_model_sections.count( idx ) ) { continue; }
+
+		std::ifstream f { dir + "/sec_" + std::to_string( idx ) + ".scm" };
+		if( f ) {
+			std::stringstream ss;
+			ss << f.rdbuf();
+			std::string const src { ss.str() };
+			cParser parser( src );
+			scene::scratch_data scratch;
+			std::string token;
+			while( false == ( token = parser.getToken<std::string>() ).empty() ) {
+				if( token != "node" ) { continue; }
+				scene::node_data nodedata;
+				parser.getTokens( 2 );
+				parser >> nodedata.range_max >> nodedata.range_min;
+				parser.getTokens( 2 );
+				std::string name, type;
+				parser >> name >> type;
+				nodedata.name = name;
+				nodedata.type = type;
+				if( type != "model" ) { continue; }
+				auto *instance { deserialize_model( parser, scratch, nodedata ) };
+				if( instance == nullptr ) { continue; }
+				if( instance->Model() != nullptr ) {
+					for( auto const &smokesource : instance->Model()->smoke_sources() ) {
+						Particles.insert( smokesource.first, instance, smokesource.second );
+					}
+				}
+				simulation::Instances.insert( instance );
+				scene::Groups.insert( scene::Groups.handle(), instance );
+				simulation::Region->insert( instance );
+				scene::Hierarchy[ instance->uuid.to_string() ] = instance;
+			}
+		}
+		m_resident_model_sections.insert( idx );
+		++loaded;
+		--budget;
+	}
+
+	if( freed != 0 || loaded != 0 ) {
+		WriteLog( "Section model pager: destroyed " + std::to_string( freed ) + ", recreated section-loads "
+		          + std::to_string( loaded ) + ", resident sections " + std::to_string( m_resident_model_sections.size() )
+		          + " / " + std::to_string( m_baked_model_sections.size() ) );
+	}
 }
 
 } // simulation
