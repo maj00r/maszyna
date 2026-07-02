@@ -365,6 +365,12 @@ public:
 	    mark_dirty() { m_dirty = true; }
 	bool
 	    dirty() const { return m_dirty; }
+	// marks the node as referenced by a long-lived pointer (event target, turntable binding, ...).
+	// pinned nodes are excluded from paging: destroying them would leave those pointers dangling
+	void
+	    pin() { m_pinned = true; }
+	bool
+	    pinned() const { return m_pinned; }
 
     std::string node_type;
 
@@ -377,6 +383,7 @@ public:
     bool m_visible { true }; // visibility flag
     std::string m_name;
 	bool m_dirty { false };
+	bool m_pinned { false }; // referenced by a long-lived pointer; excluded from paging
     UID uuid;
 
 private:

@@ -1409,13 +1409,15 @@ std::string section_models_dir() {
 void gather_section_models( scene::basic_section *Section, std::vector<TAnimModel *> &Out ) {
 	if( Section == nullptr ) { return; }
 	// an instance with both opaque and translucent pieces sits in both cell lists - dedup so we never
-	// serialize or (worse) destroy the same model twice
+	// serialize or (worse) destroy the same model twice. pinned models (event targets, turntable
+	// bindings) are excluded: long-lived pointers reference them, destroying them crashes on the next
+	// event run (tomaszewo: semaphore light events fired by AI trains wrote to freed models)
 	std::unordered_set<TAnimModel *> seen;
 	for( auto &cell : Section->m_cells ) {
 		for( auto *m : cell.m_instancesopaque ) {
-			if( m != nullptr && seen.insert( m ).second ) { Out.push_back( m ); } }
+			if( m != nullptr && false == m->pinned() && seen.insert( m ).second ) { Out.push_back( m ); } }
 		for( auto *m : cell.m_instancetranslucent ) {
-			if( m != nullptr && seen.insert( m ).second ) { Out.push_back( m ); } }
+			if( m != nullptr && false == m->pinned() && seen.insert( m ).second ) { Out.push_back( m ); } }
 	}
 }
 } // namespace
@@ -1435,6 +1437,16 @@ state_serializer::bake_section_models() {
 	std::string const dir { section_models_dir() };
 	std::error_code ec;
 	std::filesystem::create_directories( dir, ec );
+
+	// format v2: files exclude pinned (event-referenced) models. older files include them, and
+	// recreating a model that never died would duplicate it - wipe and re-bake on version mismatch
+	std::string const marker { dir + "/format_v2" };
+	if( false == std::filesystem::exists( marker, ec ) ) {
+		for( auto const &entry : std::filesystem::directory_iterator( dir, ec ) ) {
+			if( entry.path().extension() == ".scm" ) { std::filesystem::remove( entry.path(), ec ); }
+		}
+		std::ofstream { marker };
+	}
 
 	auto const t0 { std::chrono::steady_clock::now() };
 	std::uint32_t baked { 0 }, skipped { 0 }, models { 0 };

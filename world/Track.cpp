@@ -3471,6 +3471,10 @@ path_table::InitTracks() {
             // obrotnicę też łączymy na starcie z innymi torami
             // szukamy modelu o tej samej nazwie
             auto *instance = simulation::Instances.find( trackname );
+            if( instance != nullptr ) {
+                // the track keeps this pointer for its lifetime; the model must never be paged out
+                instance->pin();
+            }
             // wiązanie toru z modelem obrotnicy
             track->RaAssign(
                 instance,

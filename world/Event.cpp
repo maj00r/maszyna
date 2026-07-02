@@ -2030,6 +2030,10 @@ visible_event::init() {
             m_ignored = true; // deaktywacja
             ErrorLog( "Bad event: \"" + m_name + "\" (type: " + type() + ") can't find item \"" + std::get<std::string>( target ) + "\"" );
         }
+        else {
+            // the event keeps this pointer for its lifetime; the node must never be paged out
+            targetnode->pin();
+        }
     }
 }
 

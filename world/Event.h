@@ -749,6 +749,10 @@ basic_event::init_targets( TableType_ &Repository, std::string const &Targettype
             if( Logerrors )
                 ErrorLog( "Bad event: \"" + m_name + "\" (type: " + type() + ") can't find " + Targettype +" \"" + std::get<std::string>( target ) + "\"" );
         }
+        else {
+            // the event keeps this pointer for its lifetime; the node must never be paged out
+            std::get<scene::basic_node *>( target )->pin();
+        }
     }
 }
 
