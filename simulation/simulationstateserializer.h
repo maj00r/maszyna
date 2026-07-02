@@ -63,6 +63,15 @@ private:
 	// (a section can hold hundreds of models; re-parsing them all in one frame froze the frame loop).
 	// entries whose section left the radius before they surfaced are dropped at drain time.
 	std::deque<std::pair<std::size_t, std::string>> m_pending_model_creates;
+	// per-model destruction queue, drained under the same per-frame budget. destroying a large
+	// scenery's out-of-range sections at once (~660k models on tomaszewo) stalled for minutes: the
+	// teardown ran O(N) table/group scans per model. queued models are torn down in batches through
+	// the bulk paths (basic_table::purge_batch, node_groups::detach_many). a section that re-enters
+	// the radius while its models are still queued simply cancels those entries (models never died).
+	std::deque<std::pair<std::size_t, TAnimModel *>> m_pending_model_destroys;
+	std::unordered_map<std::size_t, std::uint32_t> m_destroy_backlog; // section -> entries still queued
+	// tears down up to BudgetMs worth of queued models (everything when BudgetMs <= 0)
+	void drain_model_destroys( double BudgetMs );
 // methods
     // restores class data from provided stream
     void deserialize_area( cParser &Input, scene::scratch_data &Scratchpad );

@@ -156,6 +156,11 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 	Region->bake_section_geometry();
 	// Faza 4c: persist per-section model instances to disk for later paging (generate-if-missing)
 	bake_section_models();
+	// initial model page-out, still on the loading screen: queue every out-of-range section and
+	// drain the whole backlog now (unbudgeted). doing this lazily on the first game frame stalled
+	// or killed large sceneries - tomaszewo starts with ~660k out-of-range model instances
+	stream_section_models( Global.pCamera.Pos, 12 );
+	drain_model_destroys( 0.0 );
 
 	// one-shot scene-composition diagnostic: what is resident, to decide what to stream next
 	{
@@ -1471,20 +1476,21 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 		return std::max( std::abs( col - ccol ), std::abs( row - crow ) );
 	};
 
-	// destroy models of sections that left the radius (with one section of hysteresis, so hovering
-	// on a section boundary doesn't destroy/recreate the same content every few frames)
-	std::uint32_t freed { 0 };
+	// queue models of sections that left the radius for destruction (one section of hysteresis, so
+	// hovering on a section boundary doesn't destroy/recreate the same content every few frames).
+	// actual teardown happens in drain_model_destroys under a per-frame time budget
+	std::uint32_t queueddestroys { 0 };
 	for( auto it = m_resident_model_sections.begin(); it != m_resident_model_sections.end(); ) {
 		if( chebyshev( *it ) > Radius + 1 ) {
 			std::vector<TAnimModel *> models;
 			gather_section_models( simulation::Region->get_section( *it ), models );
 			for( auto *m : models ) {
-				Particles.erase( m );                                // drop smoke sources first (owner dies)
-				scene::Hierarchy.erase( m->uuid.to_string() );       // drop name lookup entry
-				scene::Groups.detach( m );                           // drop group-list entry (editor/save walk these)
-				simulation::State.delete_model( m );                 // region erase + instance-table purge (frees it)
+				m_pending_model_destroys.emplace_back( *it, m );
 			}
-			freed += static_cast<std::uint32_t>( models.size() );
+			if( false == models.empty() ) {
+				m_destroy_backlog[ *it ] = static_cast<std::uint32_t>( models.size() );
+			}
+			queueddestroys += static_cast<std::uint32_t>( models.size() );
 			it = m_resident_model_sections.erase( it );
 		}
 		else {
@@ -1500,6 +1506,20 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 	for( auto const idx : m_baked_model_sections ) {
 		if( chebyshev( idx ) > Radius ) { continue; }
 		if( 0 != m_resident_model_sections.count( idx ) ) { continue; }
+
+		// if this section's models are still waiting in the destroy queue they never died - cancel
+		// the queued teardown instead of re-reading the file (fast boundary crossings become free)
+		auto const backlog { m_destroy_backlog.find( idx ) };
+		if( backlog != m_destroy_backlog.end() ) {
+			m_pending_model_destroys.erase(
+			    std::remove_if(
+			        m_pending_model_destroys.begin(), m_pending_model_destroys.end(),
+			        [idx]( auto const &entry ) { return entry.first == idx; } ),
+			    m_pending_model_destroys.end() );
+			m_destroy_backlog.erase( backlog );
+			m_resident_model_sections.insert( idx );
+			continue;
+		}
 
 		std::ifstream f { dir + "/sec_" + std::to_string( idx ) + ".scm" };
 		if( f ) {
@@ -1518,6 +1538,9 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 		m_resident_model_sections.insert( idx );
 		++queuedsections;
 	}
+
+	// tear down queued far-section models under a time budget
+	drain_model_destroys( 1.5 );
 
 	// drain the instantiation queue: at least one model per frame, more while the time budget lasts
 	std::uint32_t created { 0 };
@@ -1561,12 +1584,47 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 		      && ( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() < kBudgetMs ) );
 	}
 
-	if( freed != 0 || queuedsections != 0 ) {
-		WriteLog( "Section model pager: destroyed " + std::to_string( freed ) + ", queued sections "
+	if( queueddestroys != 0 || queuedsections != 0 ) {
+		WriteLog( "Section model pager: queued destroys " + std::to_string( queueddestroys )
+		          + " (backlog " + std::to_string( m_pending_model_destroys.size() ) + "), queued sections "
 		          + std::to_string( queuedsections ) + " (backlog " + std::to_string( m_pending_model_creates.size() )
 		          + "), resident sections " + std::to_string( m_resident_model_sections.size() )
 		          + " / " + std::to_string( m_baked_model_sections.size() ) );
 	}
+}
+
+// tears down queued paged-out models. per-model bookkeeping (smoke sources, name lookup, region
+// cells) is cheap; the O(N)-per-item paths (instance table purge, group detach) run once per batch
+// through their bulk variants. BudgetMs <= 0 drains everything (used once at load end).
+void
+state_serializer::drain_model_destroys( double BudgetMs ) {
+
+	if( m_pending_model_destroys.empty() ) { return; }
+
+	auto const t0 { std::chrono::steady_clock::now() };
+	std::unordered_set<TAnimModel *> batch;
+	std::unordered_set<scene::basic_node *> batchnodes;
+
+	do {
+		auto const [sectionidx, m] { m_pending_model_destroys.front() };
+		m_pending_model_destroys.pop_front();
+
+		Particles.erase( m );                          // drop smoke sources (owner is about to die)
+		scene::Hierarchy.erase( m->uuid.to_string() ); // drop name lookup entry
+		simulation::Region->erase( m );                // unlink from region cells (needs location, pre-delete)
+		batch.insert( m );
+		batchnodes.insert( m );
+
+		auto const backlog { m_destroy_backlog.find( sectionidx ) };
+		if( backlog != m_destroy_backlog.end() && --( backlog->second ) == 0 ) {
+			m_destroy_backlog.erase( backlog );
+		}
+	} while( ( false == m_pending_model_destroys.empty() )
+	      && ( ( BudgetMs <= 0.0 )
+	        || ( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() < BudgetMs ) ) );
+
+	scene::Groups.detach_many( batchnodes );  // one pass per affected group
+	simulation::Instances.purge_batch( batch ); // one table pass; deletes the objects
 }
 
 } // simulation

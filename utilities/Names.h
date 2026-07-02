@@ -10,6 +10,7 @@ http://mozilla.org/MPL/2.0/.
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 template <typename Type_>
@@ -76,6 +77,19 @@ public:
 				delete *it;
 				*it = nullptr;
 				return;
+			}
+		}
+	}
+	// deletes every item present in the provided set in a single pass. purge() is O(N) per item,
+	// which degenerates to O(N^2) for bulk removal (e.g. the model pager unloading a large scenery
+	// section); this stays O(N) total. slots are nulled in place, like purge().
+	void purge_batch (std::unordered_set<Type_ *> const &Items)
+	{
+		if (Items.empty()) { return; }
+		for (auto it = m_items.begin(); it != m_items.end(); it++) {
+			if ((*it != nullptr) && (Items.count(*it) != 0)) {
+				delete *it;
+				*it = nullptr;
 			}
 		}
 	}

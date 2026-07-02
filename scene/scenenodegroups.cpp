@@ -253,6 +253,31 @@ node_groups::insert( scene::group_handle const Group, scene::basic_node *Node ) 
     }
 }
 
+// bulk detach: one pass per affected group instead of one per node
+void
+node_groups::detach_many( std::unordered_set<scene::basic_node *> const &Nodes ) {
+
+    if( Nodes.empty() ) { return; }
+    // group handles of the affected nodes (usually just one or two editor groups)
+    std::unordered_set<scene::group_handle> groups;
+    for( auto *node : Nodes ) {
+        if( node != nullptr && node->group() != null_handle ) {
+            groups.insert( node->group() );
+            node->group( null_handle );
+        }
+    }
+    for( auto const grouphandle : groups ) {
+        auto const lookup { m_groupmap.find( grouphandle ) };
+        if( lookup == m_groupmap.end() ) { continue; }
+        auto &nodesequence { lookup->second.nodes };
+        nodesequence.erase(
+            std::remove_if(
+                std::begin( nodesequence ), std::end( nodesequence ),
+                [&Nodes]( scene::basic_node *node ) { return Nodes.count( node ) != 0; } ),
+            std::end( nodesequence ) );
+    }
+}
+
 // removes provided node from its group (if any), so group lists never hold dangling pointers
 void
 node_groups::detach( scene::basic_node *Node ) {

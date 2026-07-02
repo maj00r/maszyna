@@ -9,6 +9,8 @@ http://mozilla.org/MPL/2.0/.
 
 #pragma once
 
+#include <unordered_set>
+
 #include "scene/scenenode.h"
 #include "widgets/map_objects.h"
 
@@ -50,6 +52,11 @@ public:
     // the model pager) so group lists never hold dangling pointers for the editor/save paths
     void
         detach( scene::basic_node *Node );
+    // bulk detach: one list pass per affected group instead of one per node. detach() is O(group
+    // size) per node, which degenerates badly when unloading thousands of nodes from one big
+    // editor-authored group (tomaszewo tree groups hold 100k+ nodes)
+    void
+        detach_many( std::unordered_set<scene::basic_node *> const &Nodes );
     // grants direct access to specified group
     scene::basic_group &
         group( scene::group_handle const Group ) {

@@ -430,46 +430,32 @@ basic_cell::insert( TMemCell *Memorycell ) {
 void
 basic_cell::erase( TAnimModel *Instance ) {
 
-    auto const flags = Instance->Flags();
-    auto alpha =
-        ( Instance->Material() != nullptr ?
-            Instance->Material()->textures_alpha :
-            0x30300030 );
-
-    if( alpha & flags & 0x2F2F002F ) {
-        // instance has translucent pieces
-        m_instancetranslucent.erase(
-            std::remove_if(
-                std::begin( m_instancetranslucent ), std::end( m_instancetranslucent ),
-                [=]( TAnimModel *instance ) {
-                    return instance == Instance; } ),
-            std::end( m_instancetranslucent ) );
-    }
-    alpha ^= 0x0F0F000F; // odwrócenie flag tekstur, aby wyłapać nieprzezroczyste
-    if( alpha & flags & 0x1F1F001F ) {
-        // instance has opaque pieces
-        m_instancesopaque.erase(
-            std::remove_if(
-                std::begin( m_instancesopaque ), std::end( m_instancesopaque ),
-                [=]( TAnimModel *instance ) {
-                    return instance == Instance; } ),
-            std::end( m_instancesopaque ) );
-        // also remove from the per-(pModel, skins) instance bucket if present
-        if( Instance->m_instanceable && Instance->Model() != nullptr ) {
-            instance_bucket_key key;
-            key.pModel = Instance->Model();
-            auto const *mat = Instance->Material();
-            if( mat != nullptr ) {
-                for( int i = 0; i < 5; ++i ) { key.skins[i] = mat->replacable_skins[i]; }
-            }
-            auto bucket = m_instancebuckets_opaque.find( key );
-            if( bucket != m_instancebuckets_opaque.end() ) {
-                bucket->second.erase(
-                    std::remove( std::begin( bucket->second ), std::end( bucket->second ), Instance ),
-                    std::end( bucket->second ) );
-                if( bucket->second.empty() ) {
-                    m_instancebuckets_opaque.erase( bucket );
-                }
+    // NOTE: don't gate the list removal on the instance's CURRENT material alpha flags (as insert()
+    // does) - texture loads can reclassify the material between insert and erase, which would leave
+    // a dangling pointer in the list the flags no longer select. scan both lists unconditionally.
+    m_instancetranslucent.erase(
+        std::remove(
+            std::begin( m_instancetranslucent ), std::end( m_instancetranslucent ), Instance ),
+        std::end( m_instancetranslucent ) );
+    m_instancesopaque.erase(
+        std::remove(
+            std::begin( m_instancesopaque ), std::end( m_instancesopaque ), Instance ),
+        std::end( m_instancesopaque ) );
+    // also remove from the per-(pModel, skins) instance bucket if present
+    if( Instance->m_instanceable && Instance->Model() != nullptr ) {
+        instance_bucket_key key;
+        key.pModel = Instance->Model();
+        auto const *mat = Instance->Material();
+        if( mat != nullptr ) {
+            for( int i = 0; i < 5; ++i ) { key.skins[i] = mat->replacable_skins[i]; }
+        }
+        auto bucket = m_instancebuckets_opaque.find( key );
+        if( bucket != m_instancebuckets_opaque.end() ) {
+            bucket->second.erase(
+                std::remove( std::begin( bucket->second ), std::end( bucket->second ), Instance ),
+                std::end( bucket->second ) );
+            if( bucket->second.empty() ) {
+                m_instancebuckets_opaque.erase( bucket );
             }
         }
     }
