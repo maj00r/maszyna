@@ -58,6 +58,11 @@ private:
 	// Faza 4c: model-paging bookkeeping (section index -> baked/resident), mirrors the geometry pager.
 	std::unordered_set<std::size_t> m_baked_model_sections;
 	std::unordered_set<std::size_t> m_resident_model_sections;
+	// per-model instantiation queue: (section index, node source string) from sections that paged in,
+	// drained a few ms per frame so a fast-moving camera causes pop-in instead of multi-second stalls
+	// (a section can hold hundreds of models; re-parsing them all in one frame froze the frame loop).
+	// entries whose section left the radius before they surfaced are dropped at drain time.
+	std::deque<std::pair<std::size_t, std::string>> m_pending_model_creates;
 // methods
     // restores class data from provided stream
     void deserialize_area( cParser &Input, scene::scratch_data &Scratchpad );

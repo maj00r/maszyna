@@ -1422,6 +1422,11 @@ void
 state_serializer::bake_section_models() {
 
 	if( simulation::Region == nullptr ) { return; }
+	// the serializer persists across scenery loads; drop the previous scenery's paging state
+	m_baked_model_sections.clear();
+	m_resident_model_sections.clear();
+	m_pending_model_creates.clear();
+
 	std::string const dir { section_models_dir() };
 	std::error_code ec;
 	std::filesystem::create_directories( dir, ec );
@@ -1460,16 +1465,17 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 
 	int const ccol { std::clamp( static_cast<int>( std::floor( Camera.x / scene::EU07_SECTIONSIZE + scene::EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, scene::EU07_REGIONSIDESECTIONCOUNT - 1 ) };
 	int const crow { std::clamp( static_cast<int>( std::floor( Camera.z / scene::EU07_SECTIONSIZE + scene::EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, scene::EU07_REGIONSIDESECTIONCOUNT - 1 ) };
-	auto const in_range = [&]( std::size_t Index ) {
+	auto const chebyshev = [&]( std::size_t Index ) {
 		int const col = static_cast<int>( Index % scene::EU07_REGIONSIDESECTIONCOUNT );
 		int const row = static_cast<int>( Index / scene::EU07_REGIONSIDESECTIONCOUNT );
-		return ( std::abs( col - ccol ) <= Radius ) && ( std::abs( row - crow ) <= Radius );
+		return std::max( std::abs( col - ccol ), std::abs( row - crow ) );
 	};
 
-	// destroy models of sections that left the radius
+	// destroy models of sections that left the radius (with one section of hysteresis, so hovering
+	// on a section boundary doesn't destroy/recreate the same content every few frames)
 	std::uint32_t freed { 0 };
 	for( auto it = m_resident_model_sections.begin(); it != m_resident_model_sections.end(); ) {
-		if( false == in_range( *it ) ) {
+		if( chebyshev( *it ) > Radius + 1 ) {
 			std::vector<TAnimModel *> models;
 			gather_section_models( simulation::Region->get_section( *it ), models );
 			for( auto *m : models ) {
@@ -1486,25 +1492,47 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 		}
 	}
 
-	// recreate models of sections that came back inside the radius, a couple per frame (re-parse is costly)
+	// queue models of sections that came back inside the radius. the file is only read and split
+	// into per-node source strings here; instantiation is drained below under a per-frame time
+	// budget (a section can hold hundreds of models - re-parsing them all at once stalls the frame)
 	std::string const dir { section_models_dir() };
-	int budget { 2 };
-	std::uint32_t loaded { 0 };
+	std::uint32_t queuedsections { 0 };
 	for( auto const idx : m_baked_model_sections ) {
-		if( budget <= 0 ) { break; }
-		if( false == in_range( idx ) ) { continue; }
+		if( chebyshev( idx ) > Radius ) { continue; }
 		if( 0 != m_resident_model_sections.count( idx ) ) { continue; }
 
 		std::ifstream f { dir + "/sec_" + std::to_string( idx ) + ".scm" };
 		if( f ) {
-			std::stringstream ss;
-			ss << f.rdbuf();
-			std::string const src { ss.str() };
+			std::string line, nodesrc;
+			while( std::getline( f, line ) ) {
+				if( line.rfind( "node", 0 ) == 0 ) {
+					if( false == nodesrc.empty() ) { m_pending_model_creates.emplace_back( idx, std::move( nodesrc ) ); }
+					nodesrc = line + "\n";
+				}
+				else if( false == nodesrc.empty() ) {
+					nodesrc += line + "\n";
+				}
+			}
+			if( false == nodesrc.empty() ) { m_pending_model_creates.emplace_back( idx, std::move( nodesrc ) ); }
+		}
+		m_resident_model_sections.insert( idx );
+		++queuedsections;
+	}
+
+	// drain the instantiation queue: at least one model per frame, more while the time budget lasts
+	std::uint32_t created { 0 };
+	if( false == m_pending_model_creates.empty() ) {
+		auto const t0 { std::chrono::steady_clock::now() };
+		constexpr double kBudgetMs { 2.0 };
+		do {
+			auto const [sectionidx, src] { std::move( m_pending_model_creates.front() ) };
+			m_pending_model_creates.pop_front();
+			// the section left the radius before this entry surfaced; its content is no longer wanted
+			if( 0 == m_resident_model_sections.count( sectionidx ) ) { continue; }
+
 			cParser parser( src );
 			scene::scratch_data scratch;
-			std::string token;
-			while( false == ( token = parser.getToken<std::string>() ).empty() ) {
-				if( token != "node" ) { continue; }
+			if( parser.getToken<std::string>() == "node" ) { // leading "node" token
 				scene::node_data nodedata;
 				parser.getTokens( 2 );
 				parser >> nodedata.range_max >> nodedata.range_min;
@@ -1513,28 +1541,30 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 				parser >> name >> type;
 				nodedata.name = name;
 				nodedata.type = type;
-				if( type != "model" ) { continue; }
-				auto *instance { deserialize_model( parser, scratch, nodedata ) };
-				if( instance == nullptr ) { continue; }
-				if( instance->Model() != nullptr ) {
-					for( auto const &smokesource : instance->Model()->smoke_sources() ) {
-						Particles.insert( smokesource.first, instance, smokesource.second );
+				if( type == "model" ) {
+					auto *instance { deserialize_model( parser, scratch, nodedata ) };
+					if( instance != nullptr ) {
+						if( instance->Model() != nullptr ) {
+							for( auto const &smokesource : instance->Model()->smoke_sources() ) {
+								Particles.insert( smokesource.first, instance, smokesource.second );
+							}
+						}
+						simulation::Instances.insert( instance );
+						scene::Groups.insert( scene::Groups.handle(), instance );
+						simulation::Region->insert( instance );
+						scene::Hierarchy[ instance->uuid.to_string() ] = instance;
+						++created;
 					}
 				}
-				simulation::Instances.insert( instance );
-				scene::Groups.insert( scene::Groups.handle(), instance );
-				simulation::Region->insert( instance );
-				scene::Hierarchy[ instance->uuid.to_string() ] = instance;
 			}
-		}
-		m_resident_model_sections.insert( idx );
-		++loaded;
-		--budget;
+		} while( ( false == m_pending_model_creates.empty() )
+		      && ( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() < kBudgetMs ) );
 	}
 
-	if( freed != 0 || loaded != 0 ) {
-		WriteLog( "Section model pager: destroyed " + std::to_string( freed ) + ", recreated section-loads "
-		          + std::to_string( loaded ) + ", resident sections " + std::to_string( m_resident_model_sections.size() )
+	if( freed != 0 || queuedsections != 0 ) {
+		WriteLog( "Section model pager: destroyed " + std::to_string( freed ) + ", queued sections "
+		          + std::to_string( queuedsections ) + " (backlog " + std::to_string( m_pending_model_creates.size() )
+		          + "), resident sections " + std::to_string( m_resident_model_sections.size() )
 		          + " / " + std::to_string( m_baked_model_sections.size() ) );
 	}
 }

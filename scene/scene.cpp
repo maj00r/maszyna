@@ -1125,16 +1125,17 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
     int const ccol { std::clamp( static_cast<int>( std::floor( Camera.x / EU07_SECTIONSIZE + EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, EU07_REGIONSIDESECTIONCOUNT - 1 ) };
     int const crow { std::clamp( static_cast<int>( std::floor( Camera.z / EU07_SECTIONSIZE + EU07_REGIONSIDESECTIONCOUNT / 2 ) ), 0, EU07_REGIONSIDESECTIONCOUNT - 1 ) };
 
-    auto const in_range = [&]( std::size_t Index ) {
+    auto const chebyshev = [&]( std::size_t Index ) {
         int const col = static_cast<int>( Index % EU07_REGIONSIDESECTIONCOUNT );
         int const row = static_cast<int>( Index / EU07_REGIONSIDESECTIONCOUNT );
-        return ( std::abs( col - ccol ) <= Radius ) && ( std::abs( row - crow ) <= Radius );
+        return std::max( std::abs( col - ccol ), std::abs( row - crow ) );
     };
 
-    // unload resident sections that left the radius
+    // unload resident sections that left the radius (one section of hysteresis avoids load/free
+    // thrash while hovering on a section boundary)
     std::uint32_t freed { 0 };
     for( auto it = m_resident_geometry_sections.begin(); it != m_resident_geometry_sections.end(); ) {
-        if( false == in_range( *it ) ) {
+        if( chebyshev( *it ) > Radius + 1 ) {
             auto *section { m_sections[ *it ] };
             if( section != nullptr ) {
                 section->free_static_geometry();
@@ -1148,9 +1149,11 @@ basic_region::stream_section_geometry( glm::dvec3 const &Camera, int Radius ) {
         }
     }
 
-    // page in baked sections inside the radius that aren't resident, nearest first, a few per frame
+    // page in baked sections inside the radius that aren't resident, nearest first. one section per
+    // frame: a section file can be several MB and deserializes synchronously - loading several in one
+    // frame stalled the frame loop during fast camera movement
     std::string const dir { section_geometry_dir() };
-    int budget { 4 };
+    int budget { 1 };
     std::uint32_t loaded { 0 };
     for( int ring = 0; ring <= Radius && budget > 0; ++ring ) {
         for( int dr = -ring; dr <= ring && budget > 0; ++dr ) {
