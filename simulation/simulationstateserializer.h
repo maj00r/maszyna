@@ -69,9 +69,20 @@ private:
 	// the bulk paths (basic_table::purge_batch, node_groups::detach_many). a section that re-enters
 	// the radius while its models are still queued simply cancels those entries (models never died).
 	std::deque<std::pair<std::size_t, TAnimModel *>> m_pending_model_destroys;
-	std::unordered_map<std::size_t, std::uint32_t> m_destroy_backlog; // section -> entries still queued
+	// section -> (entries still queued, entries originally queued). a section is cancel-eligible on
+	// re-entry only while nothing was drained yet (remaining == original); once partially drained the
+	// already-unlinked part can't be resurrected, so the remainder is force-drained and the section
+	// reloads from its file
+	std::unordered_map<std::size_t, std::pair<std::uint32_t, std::uint32_t>> m_destroy_backlog;
+	// teardown batch accumulated across frames. the bulk passes (instance-table purge, group detach)
+	// are O(table)/O(group) per call - running them once per frame while draining re-scanned ~763k
+	// entries every frame on tomaszewo. they now run once per ~4k models (or when the queue empties)
+	std::unordered_set<TAnimModel *> m_destroy_batch;
+	std::unordered_set<scene::basic_node *> m_destroy_batch_nodes;
 	// tears down up to BudgetMs worth of queued models (everything when BudgetMs <= 0)
 	void drain_model_destroys( double BudgetMs );
+	// runs the deferred bulk teardown passes and deletes the batched models
+	void flush_model_destroy_batch();
 // methods
     // restores class data from provided stream
     void deserialize_area( cParser &Input, scene::scratch_data &Scratchpad );

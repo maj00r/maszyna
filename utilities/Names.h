@@ -11,6 +11,8 @@ http://mozilla.org/MPL/2.0/.
 
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
+#include <vector>
 #include <string>
 
 template <typename Type_>
@@ -26,11 +28,22 @@ public:
     // adds provided item to the collection. returns: true if there's no duplicate with the same name, false otherwise
     bool
         insert( Type_ *Item, std::string itemname ) {
-            m_items.emplace_back( Item );
+            // reuse a slot nulled by purge_batch when one is available: with heavy item churn (the
+            // model pager recreates thousands of paged items) an append-only container grows without
+            // bound and every full-container scan gets slower with it
+            std::size_t itemhandle;
+            if( false == m_freeslots.empty() ) {
+                itemhandle = m_freeslots.back();
+                m_freeslots.pop_back();
+                m_items[ itemhandle ] = Item;
+            }
+            else {
+                m_items.emplace_back( Item );
+                itemhandle = m_items.size() - 1;
+            }
             if( ( true == itemname.empty() ) || ( itemname == "none" ) ) {
                 return true;
             }
-            auto const itemhandle { m_items.size() - 1 };
             // add item name to the map
             auto mapping = m_itemmap.emplace( itemname, itemhandle );
             if( true == mapping.second ) {
@@ -82,14 +95,21 @@ public:
 	}
 	// deletes every item present in the provided set in a single pass. purge() is O(N) per item,
 	// which degenerates to O(N^2) for bulk removal (e.g. the model pager unloading a large scenery
-	// section); this stays O(N) total. slots are nulled in place, like purge().
+	// section); this stays O(N) total. freed slots are recycled by insert(), and their name-map
+	// entries removed (a recycled slot must not be reachable through a stale name)
 	void purge_batch (std::unordered_set<Type_ *> const &Items)
 	{
 		if (Items.empty()) { return; }
-		for (auto it = m_items.begin(); it != m_items.end(); it++) {
-			if ((*it != nullptr) && (Items.count(*it) != 0)) {
-				delete *it;
-				*it = nullptr;
+		for (std::size_t idx = 0; idx < m_items.size(); ++idx) {
+			auto *item = m_items[idx];
+			if ((item != nullptr) && (Items.count(item) != 0)) {
+				auto lookup = m_itemmap.find(item->name());
+				if ((lookup != m_itemmap.end()) && (lookup->second == idx)) {
+					m_itemmap.erase(lookup);
+				}
+				delete item;
+				m_items[idx] = nullptr;
+				m_freeslots.push_back(idx);
 			}
 		}
 	}
@@ -109,6 +129,7 @@ protected:
 // members
     type_sequence m_items;
     index_map m_itemmap;
+    std::vector<std::size_t> m_freeslots; // slots nulled by purge_batch, recycled by insert()
 
 public:
     // data access
