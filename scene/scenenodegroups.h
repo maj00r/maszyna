@@ -46,6 +46,10 @@ public:
     // places provided event in specified group
     void
         insert( scene::group_handle const Group, basic_event *Event );
+    // removes provided node from its group (if any). called before the node is destroyed (e.g. by
+    // the model pager) so group lists never hold dangling pointers for the editor/save paths
+    void
+        detach( scene::basic_node *Node );
     // grants direct access to specified group
     scene::basic_group &
         group( scene::group_handle const Group ) {

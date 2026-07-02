@@ -1475,6 +1475,7 @@ state_serializer::stream_section_models( glm::dvec3 const &Camera, int Radius ) 
 			for( auto *m : models ) {
 				Particles.erase( m );                                // drop smoke sources first (owner dies)
 				scene::Hierarchy.erase( m->uuid.to_string() );       // drop name lookup entry
+				scene::Groups.detach( m );                           // drop group-list entry (editor/save walk these)
 				simulation::State.delete_model( m );                 // region erase + instance-table purge (frees it)
 			}
 			freed += static_cast<std::uint32_t>( models.size() );

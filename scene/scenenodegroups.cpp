@@ -253,6 +253,24 @@ node_groups::insert( scene::group_handle const Group, scene::basic_node *Node ) 
     }
 }
 
+// removes provided node from its group (if any), so group lists never hold dangling pointers
+void
+node_groups::detach( scene::basic_node *Node ) {
+
+    if( Node == nullptr ) { return; }
+    auto const grouphandle { Node->group() };
+    if( grouphandle == null_handle ) { return; }
+
+    auto const lookup { m_groupmap.find( grouphandle ) };
+    if( lookup != m_groupmap.end() ) {
+        auto &nodesequence { lookup->second.nodes };
+        nodesequence.erase(
+            std::remove( std::begin( nodesequence ), std::end( nodesequence ), Node ),
+            std::end( nodesequence ) );
+    }
+    Node->group( null_handle );
+}
+
 // places provided event in specified group
 void
 node_groups::insert( scene::group_handle const Group, basic_event *Event ) {
