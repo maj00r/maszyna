@@ -1394,6 +1394,17 @@ TTrack *state_serializer::create_track(const std::string &src, const std::string
 	scene::Groups.insert(scene::Groups.handle(), path);
 	simulation::Region->insert_and_register(path);
 
+	// tracks are baked into their section's geometry bank, which is built once (on first render).
+	// if that already happened, append the new track's mesh so it renders now; otherwise it will be
+	// included when the section builds.
+	auto &section = simulation::Region->section( path->location() );
+	if( section.m_geometrycreated ) {
+		if( section.m_geometrybank == null_handle ) {
+			section.m_geometrybank = GfxRenderer->Create_Bank();
+		}
+		path->create_geometry( section.m_geometrybank );
+	}
+
 	return path;
 }
 

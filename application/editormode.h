@@ -103,7 +103,11 @@ class editor_mode : public application_mode
 	void redo_last();
 	void handle_brush_mouse_hold(int Action, int Button);
 	void apply_rotation_for_new_node(scene::basic_node *node, int rotation_mode, float fixed_rotation_value);
-	// creates a straight track of the given length ahead of the editor camera (initial track tool)
+	// track tool: create a track (type/params from the track panel) starting at a point, along a direction
+	void create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir);
+	// builds a track node from bezier control offsets and commits it (create_track + select)
+	void commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length);
+	// convenience: track ahead of the editor camera (hotkey)
 	void create_straight_track_ahead(double length = 50.0);
 	// members
 	state_backup m_statebackup; // helper, cached variables to be restored on mode exit

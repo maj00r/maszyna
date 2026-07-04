@@ -100,6 +100,28 @@ class nodebank_panel : public ui_panel
 	std::shared_ptr<std::string> m_selectedtemplate;
 };
 
+// track-laying tool: pick a track type and parameters, then place tracks by clicking in the scene
+class track_panel : public ui_panel
+{
+
+  public:
+	enum track_type
+	{
+		STRAIGHT,
+		ARC,
+		TRANSITION,
+		SWITCH
+	};
+	track_type type = STRAIGHT;
+	float length = 50.0f;   // [m]
+	float radius = 300.0f;  // [m], used by ARC/TRANSITION
+	bool curve_left = true; // ARC/TRANSITION curve direction
+	bool place_active = false; // when set, a left click in the scene lays a track
+
+	track_panel(std::string const &Name, bool const Isopen) : ui_panel(Name, Isopen) {}
+	void render() override;
+};
+
 class functions_panel : public ui_panel
 {
 

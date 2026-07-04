@@ -631,6 +631,48 @@ void functions_panel::update(scene::basic_node const *Node)
 	auto const &camera{Global.pCamera};
 }
 
+void track_panel::render()
+{
+	if (false == is_open)
+	{
+		return;
+	}
+
+	auto flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoCollapse | (size.x > 0 ? ImGuiWindowFlags_NoResize : 0);
+	if (size.x > 0)
+	{
+		ImGui::SetNextWindowSize(ImVec2S(size.x, size.y));
+	}
+	if (size_min.x > 0)
+	{
+		ImGui::SetNextWindowSizeConstraints(ImVec2S(size_min.x, size_min.y), ImVec2(size_max.x, size_max.y));
+	}
+	auto const panelname{(title.empty() ? m_name : title) + "###" + m_name};
+	if (true == ImGui::Begin(panelname.c_str(), nullptr, flags))
+	{
+		const char *types[] = {"Prosty", "Luk", "Krzywa przejsciowa", "Rozjazd"};
+		ImGui::Combo("Typ toru", (int *)&type, types, IM_ARRAYSIZE(types));
+
+		ImGui::DragFloat("Dlugosc [m]", &length, 1.0f, 1.0f, 2000.0f, "%.1f");
+		if (type == ARC || type == TRANSITION)
+		{
+			ImGui::DragFloat("Promien [m]", &radius, 1.0f, 20.0f, 5000.0f, "%.1f");
+			if (ImGui::RadioButton("w lewo", curve_left)) { curve_left = true; }
+			ImGui::SameLine();
+			if (ImGui::RadioButton("w prawo", !curve_left)) { curve_left = false; }
+		}
+		if (type == TRANSITION)
+		{
+			ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Krzywa przejsciowa: przyblizenie (bezier), nie pelna klotoida.");
+		}
+
+		ImGui::Separator();
+		ImGui::Checkbox("Stawiaj tor (klik w scenie)", &place_active);
+		ImGui::TextWrapped("Wlacz i kliknij w scenie w miejscu startu toru. Tor biegnie w kierunku patrzenia kamery.");
+	}
+	ImGui::End();
+}
+
 void functions_panel::render()
 {
 

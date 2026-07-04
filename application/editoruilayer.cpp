@@ -25,7 +25,14 @@ editor_ui::editor_ui()
 	add_external_panel(&m_nodebankpanel);
 	add_external_panel(&m_functionspanel);
 	add_external_panel(&m_brushobjects);
+	add_external_panel(&m_trackpanel);
 }
+
+bool editor_ui::track_place_active() const { return m_trackpanel.place_active; }
+int editor_ui::track_type() const { return m_trackpanel.type; }
+float editor_ui::track_length() const { return m_trackpanel.length; }
+float editor_ui::track_radius() const { return m_trackpanel.radius; }
+bool editor_ui::track_curve_left() const { return m_trackpanel.curve_left; }
 
 // updates state of UI elements
 void editor_ui::update()

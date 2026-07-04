@@ -165,37 +165,85 @@ void editor_mode::apply_rotation_for_new_node(scene::basic_node *node, int rotat
     }
 }
 
-void editor_mode::create_straight_track_ahead(double length)
+void editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length)
 {
-    // horizontal camera forward from yaw (TCamera::RaLook: Angle.y = atan2(-x, -z))
-    glm::dvec3 const forward{ -std::sin((double)Camera.Angle.y), 0.0, -std::cos((double)Camera.Angle.y) };
-    glm::dvec3 const center{ Camera.Pos.x + forward.x * 20.0, 0.0, Camera.Pos.z + forward.z * 20.0 };
-    glm::dvec3 const p1 = center - forward * (length * 0.5);
-    glm::dvec3 const p2 = center + forward * (length * 0.5);
-
     static int counter = 0;
-    std::string const name = "editor_track_" + std::to_string(counter++);
+    std::string const name = "editor_track_" + std::to_string( counter++ );
 
-    // build a straight track node: control vectors zero and radius zero => straight segment
+    // track node; geometry is the bezier p1 -> p1+cv1 -> p2+cv2 -> p2 (cv are offsets), radius only
+    // drives mesh density / physics (see TTrack::Load)
     std::ostringstream src;
     src << std::fixed << std::setprecision(3)
         << "node -1 0 " << name << " track normal " << length
         << " 1.435 0.25 20.0 20 0 flat vis Rail_screw_used1 4.0 TpBpS-new2 0.2 0.5 1.1\n"
         << p1.x << ' ' << p1.y << ' ' << p1.z << " 0.0\n"
-        << "0.0 0.0 0.0\n"
-        << "0.0 0.0 0.0\n"
+        << cv1.x << ' ' << cv1.y << ' ' << cv1.z << '\n'
+        << cv2.x << ' ' << cv2.y << ' ' << cv2.z << '\n'
         << p2.x << ' ' << p2.y << ' ' << p2.z << " 0.0\n"
-        << "0.0\n"
+        << radius << '\n'
         << "endtrack\n";
 
     TTrack *track = simulation::State.create_track( src.str(), name );
     if( track == nullptr ) {
-        ErrorLog( "editor: failed to create straight track" );
+        ErrorLog( "editor: failed to create track" );
         return;
     }
     m_node = track;
     ui()->set_node( track );
-    WriteLog( "editor: created straight track \"" + name + "\"" );
+    WriteLog( "editor: created track \"" + name + "\"" );
+}
+
+void editor_mode::create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir)
+{
+    // horizontal unit tangent
+    glm::dvec3 T{ dir.x, 0.0, dir.z };
+    double const tl = glm::length( T );
+    T = ( tl > 1e-6 ) ? T / tl : glm::dvec3{ 0.0, 0.0, -1.0 };
+
+    double const length = (double)ui()->track_length();
+    int const type = ui()->track_type();
+
+    if( type == track_panel::STRAIGHT ) {
+        commit_track( start, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, start + T * length, 0.0, length );
+        return;
+    }
+
+    // ARC / TRANSITION: circular arc approximated by a cubic bezier
+    double const R = std::max( 1.0, (double)ui()->track_radius() );
+    bool const left = ui()->track_curve_left();
+    double theta = length / R;              // sweep angle
+    theta = std::min( theta, M_PI * 0.9 );  // keep a single bezier accurate (< 180 deg)
+
+    // rotation about the vertical axis
+    auto const rotY = []( glm::dvec3 const &v, double a ) {
+        double const c = std::cos( a ), s = std::sin( a );
+        return glm::dvec3{ v.x * c + v.z * s, v.y, -v.x * s + v.z * c };
+    };
+    // derive the arc centre from the SAME rotation used for the sweep, so endpoint and its
+    // tangent stay consistent (otherwise the bezier control points don't match the endpoints)
+    double const turn = left ? 1.0 : -1.0;
+    double const ang = turn * theta;
+    glm::dvec3 const N = rotY( T, turn * M_PI_2 ); // unit normal toward the arc centre
+    glm::dvec3 const center = start + N * R;
+    glm::dvec3 const p2 = center + rotY( start - center, ang );
+    glm::dvec3 const Tend = rotY( T, ang );
+    double const h = R * ( 4.0 / 3.0 ) * std::tan( theta / 4.0 );
+
+    if( type == track_panel::TRANSITION ) {
+        // rough easement: straight-tangent entry (short handle), full curve handle on exit
+        commit_track( start, T * ( h * 0.5 ), -Tend * h, p2, R, length );
+        return;
+    }
+    // ARC
+    commit_track( start, T * h, -Tend * h, p2, R, length );
+}
+
+void editor_mode::create_straight_track_ahead(double length)
+{
+    // horizontal camera forward from yaw (TCamera::RaLook: Angle.y = atan2(-x, -z))
+    glm::dvec3 const forward{ -std::sin( (double)Camera.Angle.y ), 0.0, -std::cos( (double)Camera.Angle.y ) };
+    glm::dvec3 const start{ Camera.Pos.x + forward.x * 20.0, 0.0, Camera.Pos.z + forward.z * 20.0 };
+    create_track_at( start, forward );
 }
 
 void editor_mode::start_focus(scene::basic_node *node, double duration)
@@ -1603,6 +1651,20 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
         {
             mouseHold = true;
             m_node = nullptr;
+
+            // track-laying tool: a click lays a track starting at the cursor, running along the camera heading
+            if (ui()->track_place_active())
+            {
+                GfxRenderer->Pick_Node_Callback(
+                    [this](scene::basic_node * /*node*/) {
+                        glm::dvec3 start = glm::dvec3{ Camera.Pos } + clamp_mouse_offset_to_max( GfxRenderer->Mouse_Position() );
+                        start.y = 0.0; // lay on ground level for now
+                        glm::dvec3 const forward{ -std::sin( (double)Camera.Angle.y ), 0.0, -std::cos( (double)Camera.Angle.y ) };
+                        create_track_at( start, forward );
+                    });
+                m_input.mouse.button(Button, Action);
+                return;
+            }
 
             // delegate node picking behaviour depending on current panel mode
             GfxRenderer->Pick_Node_Callback(

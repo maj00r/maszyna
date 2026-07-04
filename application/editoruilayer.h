@@ -37,6 +37,12 @@ class editor_ui : public ui_layer
 	nodebank_panel::edit_mode mode();
 	float getSpacing();
 	void toggleBrushSettings(bool isVisible);
+	// track-laying tool state (see track_panel)
+	bool track_place_active() const;
+	int track_type() const;
+	float track_length() const;
+	float track_radius() const;
+	bool track_curve_left() const;
 
   private:
 	// members
@@ -44,5 +50,6 @@ class editor_ui : public ui_layer
 	functions_panel m_functionspanel{"Functions", true};
 	nodebank_panel m_nodebankpanel{"Node Bank", true};
 	brush_object_list m_brushobjects{"Brush properties", false};
+	track_panel m_trackpanel{"Tory", true};
 	scene::basic_node *m_node{nullptr}; // currently bound scene node, if any
 };
