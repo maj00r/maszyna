@@ -12,6 +12,8 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/parser.h"
 #include "scene/scene.h"
 
+class TTrack;
+
 namespace simulation {
 
 struct deserializer_state {
@@ -45,6 +47,8 @@ public:
 	TAnimModel * create_model(std::string const &src, std::string const &name, const glm::dvec3 &position);
 	// create new eventlauncher from node stirng
 	TEventLauncher * create_eventlauncher(std::string const &src, std::string const &name, const glm::dvec3 &position);
+	// create new track/path from a track-node string (geometry is defined by the node's control points)
+	TTrack * create_track(std::string const &src, std::string const &name);
 
 private:
 // methods

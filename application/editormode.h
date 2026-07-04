@@ -103,6 +103,8 @@ class editor_mode : public application_mode
 	void redo_last();
 	void handle_brush_mouse_hold(int Action, int Button);
 	void apply_rotation_for_new_node(scene::basic_node *node, int rotation_mode, float fixed_rotation_value);
+	// creates a straight track of the given length ahead of the editor camera (initial track tool)
+	void create_straight_track_ahead(double length = 50.0);
 	// members
 	state_backup m_statebackup; // helper, cached variables to be restored on mode exit
 	editormode_input m_input;

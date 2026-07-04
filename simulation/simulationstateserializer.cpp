@@ -1370,6 +1370,33 @@ TEventLauncher *state_serializer::create_eventlauncher(const std::string &src, c
 	return launcher;
 }
 
+TTrack *state_serializer::create_track(const std::string &src, const std::string &name) {
+	cParser parser(src);
+	parser.getTokens(); // "node"
+	parser.getTokens(2); // ranges
+
+	scene::node_data nodedata;
+	parser >> nodedata.range_max >> nodedata.range_min;
+
+	parser.getTokens(2); // name, type
+	nodedata.name = name;
+	nodedata.type = "track";
+
+	scene::scratch_data scratch;
+
+	// geometry is fully defined by the node's control points, so no separate placement offset
+	TTrack *path = deserialize_path(parser, scratch, nodedata);
+	if (!path)
+		return nullptr;
+
+	// mirror the loader's track insertion (see deserialize_node, nodedata.type == "track")
+	simulation::Paths.insert(path);
+	scene::Groups.insert(scene::Groups.handle(), path);
+	simulation::Region->insert_and_register(path);
+
+	return path;
+}
+
 } // simulation
 
   //---------------------------------------------------------------------------

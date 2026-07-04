@@ -43,6 +43,9 @@ public:
 	// create eventlauncher from node string
 	TEventLauncher *
 	    create_eventlauncher(const std::string &src, const std::string &name, const glm::dvec3 &position);
+	// create track/path from a track-node string (geometry defined by the node's control points)
+	TTrack *
+	    create_track(const std::string &src, const std::string &name);
 	// delete TAnimModel instance
 	void
 	    delete_model(TAnimModel *model);

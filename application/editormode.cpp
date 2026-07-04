@@ -22,6 +22,9 @@ http://mozilla.org/MPL/2.0/.
 #include "rendering/renderer.h"
 #include "model/AnimModel.h"
 #include "model/Model3d.h"
+#include "world/Track.h"
+#include <sstream>
+#include <iomanip>
 #include "utilities/Float3d.h"
 #include "scene/scene.h"
 
@@ -160,6 +163,39 @@ void editor_mode::apply_rotation_for_new_node(scene::basic_node *node, int rotat
         const vec3 rotation{0.0f, fixed_rotation_value, 0.0f};
         m_editor.rotate(node, rotation, 0);
     }
+}
+
+void editor_mode::create_straight_track_ahead(double length)
+{
+    // horizontal camera forward from yaw (TCamera::RaLook: Angle.y = atan2(-x, -z))
+    glm::dvec3 const forward{ -std::sin((double)Camera.Angle.y), 0.0, -std::cos((double)Camera.Angle.y) };
+    glm::dvec3 const center{ Camera.Pos.x + forward.x * 20.0, 0.0, Camera.Pos.z + forward.z * 20.0 };
+    glm::dvec3 const p1 = center - forward * (length * 0.5);
+    glm::dvec3 const p2 = center + forward * (length * 0.5);
+
+    static int counter = 0;
+    std::string const name = "editor_track_" + std::to_string(counter++);
+
+    // build a straight track node: control vectors zero and radius zero => straight segment
+    std::ostringstream src;
+    src << std::fixed << std::setprecision(3)
+        << "node -1 0 " << name << " track normal " << length
+        << " 1.435 0.25 20.0 20 0 flat vis Rail_screw_used1 4.0 TpBpS-new2 0.2 0.5 1.1\n"
+        << p1.x << ' ' << p1.y << ' ' << p1.z << " 0.0\n"
+        << "0.0 0.0 0.0\n"
+        << "0.0 0.0 0.0\n"
+        << p2.x << ' ' << p2.y << ' ' << p2.z << " 0.0\n"
+        << "0.0\n"
+        << "endtrack\n";
+
+    TTrack *track = simulation::State.create_track( src.str(), name );
+    if( track == nullptr ) {
+        ErrorLog( "editor: failed to create straight track" );
+        return;
+    }
+    m_node = track;
+    ui()->set_node( track );
+    WriteLog( "editor: created straight track \"" + name + "\"" );
 }
 
 void editor_mode::start_focus(scene::basic_node *node, double duration)
@@ -1421,6 +1457,7 @@ void editor_mode::on_key(int const Key, int const Scancode, int const Action, in
         case GLFW_KEY_W: m_gizmo_op = gizmo_operation::rotate; break;
         case GLFW_KEY_E: m_gizmo_op = gizmo_operation::scale; break;
         case GLFW_KEY_R: m_gizmo_local = !m_gizmo_local; break;
+        case GLFW_KEY_T: create_straight_track_ahead(); break; // initial track tool: straight track ahead of camera
         default: handled = false; break;
         }
         if (handled)
