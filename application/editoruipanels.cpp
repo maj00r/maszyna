@@ -654,6 +654,10 @@ void track_panel::render()
 		ImGui::Combo("Typ toru", (int *)&type, types, IM_ARRAYSIZE(types));
 
 		ImGui::DragFloat("Dlugosc [m]", &length, 1.0f, 1.0f, 2000.0f, "%.1f");
+		if (type == STRAIGHT)
+		{
+			ImGui::DragInt("Ciecia prostej", &cuts, 0.1f, 0, 20);
+		}
 		if (type == TRANSITION)
 		{
 			ImGui::DragFloat("Promien poczatkowy [m] (0=prosta)", &radius_start, 1.0f, 0.0f, 5000.0f, "%.1f");

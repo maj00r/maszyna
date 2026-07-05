@@ -433,13 +433,20 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
     lbl << std::fixed << std::setprecision( 0 );
 
     if( el.type == track_panel::STRAIGHT ) {
-        glm::dvec3 const end = pos + dir * el.length;
-        if( emit ) {
-            lbl << "Prosty L=" << el.length;
-            m_pending_track_label = lbl.str();
-            made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, el.length );
+        // one niweleta straight can be cut into several collinear track pieces
+        int const pieces = 1 + std::max( 0, el.cuts );
+        double const step = el.length / pieces;
+        for( int i = 0; i < pieces; ++i ) {
+            glm::dvec3 const end = pos + dir * step;
+            if( emit ) {
+                std::ostringstream plbl;
+                plbl << std::fixed << std::setprecision( 0 ) << "Prosty L=" << step;
+                m_pending_track_label = plbl.str();
+                made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, step );
+                if( made != nullptr ) { el.tracks.push_back( made ); }
+            }
+            pos = end;
         }
-        pos = end;
     }
     else if( el.type == track_panel::ARC ) {
         double const R = std::max( 1.0, el.radius );
@@ -454,6 +461,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
             lbl << "Luk R=" << R << " L=" << el.length;
             m_pending_track_label = lbl.str();
             made = commit_track( pos, dir * h, -Tend * h, end, R, el.length );
+            if( made != nullptr ) { el.tracks.push_back( made ); }
         }
         pos = end;
         dir = Tend;
@@ -484,6 +492,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
             lbl << "KP " << el.radius0 << "->" << el.radius << " L=" << el.length;
             m_pending_track_label = lbl.str();
             made = commit_track( pos, dir * h, -idir * h, ipos, rmesh, el.length );
+            if( made != nullptr ) { el.tracks.push_back( made ); }
         }
         pos = ipos;
         dir = idir;
@@ -515,7 +524,8 @@ void editor_mode::regenerate_chain(int index)
     }
 
     for( auto &el : ch.elements ) {
-        if( el.track != nullptr ) { delete_track( el.track ); el.track = nullptr; }
+        for( auto *t : el.tracks ) { delete_track( t ); }
+        el.tracks.clear();
     }
     ch.joints.clear();
 
@@ -523,7 +533,7 @@ void editor_mode::regenerate_chain(int index)
     glm::dvec3 dir = hnorm( ch.direction );
     ch.joints.push_back( pos );
     for( auto &el : ch.elements ) {
-        el.track = march_element( el, pos, dir, true );
+        march_element( el, pos, dir, true );
         ch.joints.push_back( pos );
     }
     ch.endtangent = dir;
@@ -2081,8 +2091,10 @@ void editor_mode::on_key(int const Key, int const Scancode, int const Action, in
                     auto &ch = m_chains[ c ];
                     if( ch.anchor == track ) { ch.anchor = nullptr; }
                     for( size_t e = 0; e < ch.elements.size(); ++e ) {
-                        if( ch.elements[ e ].track == track ) {
-                            ch.elements[ e ].track = nullptr;
+                        auto &trs = ch.elements[ e ].tracks;
+                        auto it = std::find( trs.begin(), trs.end(), track );
+                        if( it != trs.end() ) {
+                            trs.erase( it ); // this piece is going away
                             ch.elements.erase( ch.elements.begin() + e );
                             regenerate_chain( (int)c );
                             break;
@@ -2223,6 +2235,24 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                             glm::dvec3 rpos = ch.origin, rdir = hnorm( ch.direction );
                             for( int e = 0; e < runstart; ++e ) { march_element( ch.elements[ e ], rpos, rdir, false ); }
                             glm::dvec3 const newdir = hnorm( glm::dvec3{ target.x - rpos.x, 0.0, target.z - rpos.z } );
+                            // when the run is followed by [ARC][straight...], solve the arc as a
+                            // fillet between the rotated line and the DOWNSTREAM LINE, which stays
+                            // fixed (vector untouched); curve parameters (radius) are preserved
+                            int runend = eidx;
+                            while( runend + 1 < (int)ch.elements.size() && ch.elements[ runend + 1 ].type == track_panel::STRAIGHT ) { ++runend; }
+                            bool const hasfillet =
+                                ( runend + 2 < (int)ch.elements.size()
+                               && ch.elements[ runend + 1 ].type == track_panel::ARC
+                               && ch.elements[ runend + 2 ].type == track_panel::STRAIGHT );
+                            glm::dvec3 q{ 0.0 }, d2{ 0.0 }, ffar{ 0.0 };
+                            if( hasfillet ) {
+                                // downstream line captured from the PRE-EDIT march (it must not move)
+                                glm::dvec3 cpos = ch.origin, cdir2 = hnorm( ch.direction );
+                                for( int e = 0; e <= runend + 1; ++e ) { march_element( ch.elements[ e ], cpos, cdir2, false ); }
+                                q = cpos; d2 = cdir2;
+                                ffar = q + d2 * ch.elements[ runend + 2 ].length;
+                            }
+
                             if( runstart == 0 ) {
                                 if( ch.anchor == nullptr ) { ch.direction = newdir; }
                             }
@@ -2241,6 +2271,36 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                             glm::dvec3 pos2 = ch.origin, dir2 = hnorm( ch.direction );
                             for( int e = 0; e < eidx; ++e ) { march_element( ch.elements[ e ], pos2, dir2, false ); }
                             el.length = std::max( 1.0, glm::dot( glm::dvec3{ target.x - pos2.x, 0.0, target.z - pos2.z }, dir2 ) );
+
+                            if( hasfillet ) {
+                                auto &arc = ch.elements[ runend + 1 ];
+                                auto &next = ch.elements[ runend + 2 ];
+                                // line 1: run start (pivot) + new direction; line 2: fixed q/d2
+                                glm::dvec3 apos = ch.origin, adir = hnorm( ch.direction );
+                                for( int e = 0; e < runstart; ++e ) { march_element( ch.elements[ e ], apos, adir, false ); }
+                                double const det = d2.x * adir.z - adir.x * d2.z;
+                                double const cosang3 = std::clamp( glm::dot( adir, d2 ), -1.0, 1.0 );
+                                double const theta3 = std::acos( cosang3 );
+                                if( std::abs( det ) > 1e-6 && theta3 > 1e-3 ) {
+                                    // corner = intersection of the two lines
+                                    glm::dvec3 const w = q - apos;
+                                    double const denom = adir.x * ( -d2.z ) - ( -d2.x ) * adir.z;
+                                    double const a = ( w.x * ( -d2.z ) - ( -d2.x ) * w.z ) / denom;
+                                    glm::dvec3 const corner = apos + adir * a;
+                                    double const R = std::max( 1.0, arc.radius );
+                                    double const t = R * std::tan( theta3 * 0.5 );
+                                    // upstream run: total length up to the tangent point
+                                    double runothers = 0.0;
+                                    for( int e = runstart; e < runend; ++e ) { runothers += ch.elements[ e ].length; }
+                                    ch.elements[ runend ].length = std::max( 1.0, a - t - runothers );
+                                    // the arc keeps its radius; only the sweep adapts
+                                    arc.left = ( adir.x * d2.z - adir.z * d2.x ) < 0.0;
+                                    arc.length = R * theta3;
+                                    // downstream straight: same line, far end pinned
+                                    glm::dvec3 const t2 = corner + d2 * t;
+                                    next.length = std::max( 1.0, glm::dot( ffar - t2, d2 ) );
+                                }
+                            }
                         }
                         else if( el.type == track_panel::ARC ) {
                             // re-fit the arc through the point, tangent to the march direction
@@ -2377,6 +2437,7 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                 el.radius = ( el.type == track_panel::TRANSITION ) ? (double)ui()->track_radius_end() : (double)ui()->track_radius();
                 el.radius0 = (double)ui()->track_radius_start();
                 el.left = ui()->track_curve_left();
+                el.cuts = ui()->track_cuts();
                 m_chains[ m_active_chain ].elements.push_back( el );
                 regenerate_chain( m_active_chain );
                 m_input.mouse.button(Button, Action);

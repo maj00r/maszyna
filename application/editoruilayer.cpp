@@ -36,6 +36,7 @@ float editor_ui::track_radius() const { return m_trackpanel.radius; }
 float editor_ui::track_radius_start() const { return m_trackpanel.radius_start; }
 float editor_ui::track_radius_end() const { return m_trackpanel.radius_end; }
 bool editor_ui::track_curve_left() const { return m_trackpanel.curve_left; }
+int editor_ui::track_cuts() const { return m_trackpanel.cuts; }
 
 // updates state of UI elements
 void editor_ui::update()

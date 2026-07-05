@@ -133,7 +133,8 @@ class editor_mode : public application_mode
 		double radius { 300.0 };  // ARC radius / TRANSITION end radius (0 = straight)
 		double radius0 { 0.0 };   // TRANSITION start radius (0 = straight)
 		bool left { true };
-		TTrack *track { nullptr }; // generated result
+		int cuts { 0 }; // straight only: number of mid-element cuts (emits cuts+1 track pieces)
+		std::vector<TTrack *> tracks; // generated result (straights may emit several pieces)
 	};
 	struct track_chain {
 		glm::dvec3 origin { 0.0 };               // start point (node base level)

@@ -120,6 +120,7 @@ class track_panel : public ui_panel
 	float radius_start = 0.0f;   // [m], 0 = straight
 	float radius_end = 300.0f;   // [m], 0 = straight
 	bool curve_left = true; // ARC/TRANSITION/SWITCH curve direction
+	int cuts = 0; // STRAIGHT: mid-element cuts (element emits cuts+1 track pieces)
 	bool place_active = false; // when set, a left click in the scene lays a track
 	bool finish_chain = false; // one-shot: user asked to end the current niweleta
 
