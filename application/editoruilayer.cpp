@@ -30,6 +30,7 @@ editor_ui::editor_ui()
 
 bool editor_ui::track_place_active() const { return m_trackpanel.place_active; }
 bool editor_ui::consume_track_finish() { bool const v = m_trackpanel.finish_chain; m_trackpanel.finish_chain = false; return v; }
+bool editor_ui::consume_track_save() { bool const v = m_trackpanel.save_alignments; m_trackpanel.save_alignments = false; return v; }
 int editor_ui::track_type() const { return m_trackpanel.type; }
 float editor_ui::track_length() const { return m_trackpanel.length; }
 float editor_ui::track_radius() const { return m_trackpanel.radius; }

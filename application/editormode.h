@@ -137,6 +137,7 @@ class editor_mode : public application_mode
 		std::vector<TTrack *> tracks; // generated result (straights may emit several pieces)
 	};
 	struct track_chain {
+		int id { 0 };                            // stable id (persisted; drives generated track names)
 		glm::dvec3 origin { 0.0 };               // start point (node base level)
 		glm::dvec3 direction { 0.0, 0.0, -1.0 }; // unit start tangent
 		TTrack *anchor { nullptr };  // optional switch feeding this chain
@@ -146,10 +147,18 @@ class editor_mode : public application_mode
 		glm::dvec3 endtangent { 0.0, 0.0, -1.0 }; // cached march exit tangent (for branching / extending)
 	};
 	struct switch_meta { glm::dvec3 entry, straightend, divcv1, divcv2, divend; double radius, length; };
-	// marches one element from (pos, dir), optionally emitting the result track
-	TTrack *march_element(chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit);
+	// marches one element from (pos, dir), optionally emitting the result track; namebase (when
+	// emitting) makes the generated track names deterministic so they can be re-linked after a reload
+	TTrack *march_element(chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase = "");
 	// regenerates a chain: re-marches all elements from the (possibly anchored) origin
 	void regenerate_chain(int index);
+	// path of the niweleta sidecar file (<scenery>.niw next to the scenery)
+	std::string alignment_filepath() const;
+	// writes the niweleta source (chains + switch parameters) to the sidecar file
+	void save_alignments();
+	// reads the sidecar and rebuilds the editable chains, re-linking to the already-loaded tracks
+	// by name (marches with emit=false to rebuild joints, so no duplicate tracks are created)
+	void load_alignments();
 	// finds a chain joint close to the given screen position; joint 0 = chain origin
 	bool pick_chain_joint(float screenx, float screeny, int &chain, int &joint);
 	// lays a transition curve (clothoid) as a chain of short arc segments; curvature goes linearly
@@ -180,9 +189,11 @@ class editor_mode : public application_mode
 	// per-track editor labels (e.g. "KP 0->300", "Luk R=300"), shown by the track overlay
 	std::unordered_map<scene::basic_node const *, std::string> m_track_labels;
 	std::string m_pending_track_label; // label applied to the next track created by commit_track/commit_switch
+	std::string m_pending_track_name;  // when set, overrides the auto name in commit_track/commit_switch (for stable niweleta names)
 	// niweleta state
 	std::vector<track_chain> m_chains;
 	int m_active_chain { -1 }; // chain receiving new elements in place mode
+	int m_next_chain_id { 0 }; // running id assigned to new chains (persisted via the sidecar)
 	std::unordered_map<TTrack *, switch_meta> m_switch_meta; // creation parameters of editor switches
 	// drag state: either a chain joint or a whole switch
 	bool m_dragactive { false };

@@ -679,6 +679,9 @@ void track_panel::render()
 		ImGui::SameLine();
 		if (ImGui::Button("Zakoncz niwelete")) { finish_chain = true; }
 		ImGui::TextWrapped("Klik przy koncu istniejacego toru (tez P4 rozjazdu) dokleja nowy odcinek stycznie. Klik w puste miejsce zaczyna nowy tor. Poza trybem stawiania: zlap koniec toru i przeciagnij - tor i sasiad dopasuja geometrie.");
+		ImGui::Separator();
+		if (ImGui::Button("Zapisz niwelete + scene")) { save_alignments = true; }
+		ImGui::TextWrapped("Zapisuje szczegoly niwelety do pliku obok scenerii (.niw) oraz eksportuje scene z torami. Niweleta wczytuje sie z powrotem przy wejsciu do edytora.");
 	}
 	ImGui::End();
 }

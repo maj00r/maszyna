@@ -268,6 +268,10 @@ public:
     // editor: clears any reference this track holds to Other (live trPrev/trNext and, for
     // switches, the per-branch pointer arrays), so a deleted neighbour is no longer followed
     void detach(TTrack *Other);
+    // editor: hides this track's baked mesh by replacing its geometry chunks with empty vertex
+    // arrays (the section's geometry bank is append-only, so we can't remove chunks; this leaves
+    // shapes like terrain untouched, unlike a full section rebuild)
+    void clear_geometry();
     bool SetConnections(int i);
     bool Switch(int i, float const t = -1.f, float const d = -1.f);
     bool SwitchForced(int i, TDynamicObject *o);

@@ -337,9 +337,6 @@ public:
 	// generates renderable version of held non-instanced geometry
     void
         create_geometry();
-    // rebuilds the section's baked geometry into a fresh bank (used after a node is removed in the editor)
-    void
-        rebuild_geometry();
 	void
 	    create_map_geometry(const gfx::geometrybank_handle handle);
 	void

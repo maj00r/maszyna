@@ -24,6 +24,7 @@ http://mozilla.org/MPL/2.0/.
 #include "model/Model3d.h"
 #include "world/Track.h"
 #include <sstream>
+#include <fstream>
 #include <iomanip>
 #include "utilities/Float3d.h"
 #include "scene/scene.h"
@@ -172,7 +173,11 @@ void editor_mode::apply_rotation_for_new_node(scene::basic_node *node, int rotat
 TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length)
 {
     static int counter = 0;
-    std::string const name = "editor_track_" + std::to_string( counter++ );
+    // a niweleta march sets m_pending_track_name for a stable, reload-linkable name; otherwise auto
+    std::string const name = m_pending_track_name.empty()
+        ? ( "editor_track_" + std::to_string( counter++ ) )
+        : m_pending_track_name;
+    m_pending_track_name.clear();
 
     // track node; geometry is the bezier p1 -> p1+cv1 -> p2+cv2 -> p2 (cv are offsets), radius only
     // drives mesh density / physics (see TTrack::Load)
@@ -317,7 +322,10 @@ void editor_mode::create_transition(glm::dvec3 const &start, glm::dvec3 const &t
 TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &straightend, glm::dvec3 const &divcv1, glm::dvec3 const &divcv2, glm::dvec3 const &divend, double radius, double length)
 {
     static int counter = 0;
-    std::string const name = "editor_switch_" + std::to_string( counter++ );
+    std::string const name = m_pending_track_name.empty()
+        ? ( "editor_switch_" + std::to_string( counter++ ) )
+        : m_pending_track_name;
+    m_pending_track_name.clear();
 
     // switch node: two paths sharing the entry point. path 1 = straight main route (control
     // vectors and radius zero), path 2 = diverging arc (bezier control offsets + radius).
@@ -357,20 +365,21 @@ TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &st
     return track;
 }
 
-// removes a track from the scene: out of its cell, rebuild that section's baked geometry,
-// drop from the path lookup. the object itself is left orphaned on purpose (still referenced
-// by scene groups) to avoid dangling pointers.
+// removes a track from the scene: detach from the network, hide its mesh, drop it from the path
+// lookup. the object itself is left orphaned on purpose (still referenced by scene groups) to
+// avoid dangling pointers.
 void editor_mode::delete_track(TTrack *track)
 {
     if( track == nullptr ) { return; }
-    glm::dvec3 const loc = track->location();
     std::string const trackname = track->name();
     // detach from the network first: clear neighbours' references so trains stop following it,
     // and drop its endpoints from the path lookup so find_path no longer returns it
     simulation::Region->disconnect_track( track );
     simulation::Region->unregister( track );
     simulation::Region->erase( track );
-    simulation::Region->section( loc ).rebuild_geometry();
+    // hide the track's mesh by emptying its own geometry chunks. do NOT rebuild the whole section
+    // (that re-bakes shapes whose vertex data is consumed on first bake -> terrain would vanish)
+    track->clear_geometry();
     simulation::Paths.detach( trackname );
     m_track_labels.erase( track );
     if( m_node == track ) {
@@ -431,7 +440,7 @@ bool editor_mode::pick_track_endpoint(float screenx, float screeny, bool allowsw
 
 // marches a single chain element from (pos, dir); optionally emits the result track
 // (P1 = element start, P2 = element end: track directionality always follows the march)
-TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit )
+TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase )
 {
     auto const rotY = []( glm::dvec3 const &v, double a ) {
         double const c = std::cos( a ), s = std::sin( a );
@@ -451,6 +460,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
                 std::ostringstream plbl;
                 plbl << std::fixed << std::setprecision( 0 ) << "Prosty L=" << step;
                 m_pending_track_label = plbl.str();
+                if( !namebase.empty() ) { m_pending_track_name = namebase + "p" + std::to_string( i ); }
                 made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, step );
                 if( made != nullptr ) { el.tracks.push_back( made ); }
             }
@@ -469,6 +479,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
         if( emit ) {
             lbl << "Luk R=" << R << " L=" << el.length;
             m_pending_track_label = lbl.str();
+            if( !namebase.empty() ) { m_pending_track_name = namebase + "p0"; }
             made = commit_track( pos, dir * h, -Tend * h, end, R, el.length );
             if( made != nullptr ) { el.tracks.push_back( made ); }
         }
@@ -500,6 +511,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
         if( emit ) {
             lbl << "KP " << el.radius0 << "->" << el.radius << " L=" << el.length;
             m_pending_track_label = lbl.str();
+            if( !namebase.empty() ) { m_pending_track_name = namebase + "p0"; }
             made = commit_track( pos, dir * h, -idir * h, ipos, rmesh, el.length );
             if( made != nullptr ) { el.tracks.push_back( made ); }
         }
@@ -541,12 +553,166 @@ void editor_mode::regenerate_chain(int index)
     glm::dvec3 pos = ch.origin;
     glm::dvec3 dir = hnorm( ch.direction );
     ch.joints.push_back( pos );
-    for( auto &el : ch.elements ) {
-        march_element( el, pos, dir, true );
+    for( size_t e = 0; e < ch.elements.size(); ++e ) {
+        // stable, reload-linkable base name: _niw_<chainid>_<elementindex>_
+        std::string const namebase = "_niw_" + std::to_string( ch.id ) + "_" + std::to_string( e ) + "_";
+        march_element( ch.elements[ e ], pos, dir, true, namebase );
         ch.joints.push_back( pos );
     }
     ch.endtangent = dir;
     m_pending_track_label.clear();
+}
+
+// path of the niweleta sidecar (<scenery>.niw next to the scenery file)
+std::string editor_mode::alignment_filepath() const
+{
+    std::string scenery = Global.SceneryFile;
+    // strip any leading '$' rainsted adds to modified scenery names
+    while( !scenery.empty() && scenery.front() == '$' ) { scenery.erase( 0, 1 ); }
+    auto const slash = scenery.find_last_of( "/\\" );
+    if( slash != std::string::npos ) { scenery = scenery.substr( slash + 1 ); }
+    auto const dot = scenery.find_last_of( '.' );
+    if( dot != std::string::npos ) { scenery = scenery.substr( 0, dot ); }
+    if( scenery.empty() ) { scenery = "default"; }
+    return Global.asCurrentSceneryPath + scenery + ".niw";
+}
+
+// writes the niweleta source layer (chains of typed elements + switch parameters) to the sidecar.
+// the generated tracks themselves live in the scenery (exported separately); this file only holds
+// what the scenery format can't: the editable niweleta description, so a session can be resumed.
+void editor_mode::save_alignments()
+{
+    std::string const path = alignment_filepath();
+    std::ofstream out( path );
+    if( !out ) {
+        ErrorLog( "editor: cannot write niweleta file \"" + path + "\"" );
+        return;
+    }
+    out << std::fixed << std::setprecision( 3 );
+    out << "niweleta 1\n";
+    out << "nextid " << m_next_chain_id << "\n";
+
+    // switch parameters (by track name), so switches can be re-linked / moved after a reload
+    for( auto const &entry : m_switch_meta ) {
+        TTrack *track = entry.first;
+        switch_meta const &m = entry.second;
+        if( track == nullptr ) { continue; }
+        out << "switch " << track->name()
+            << ' ' << m.entry.x << ' ' << m.entry.y << ' ' << m.entry.z
+            << ' ' << m.straightend.x << ' ' << m.straightend.y << ' ' << m.straightend.z
+            << ' ' << m.divcv1.x << ' ' << m.divcv1.y << ' ' << m.divcv1.z
+            << ' ' << m.divcv2.x << ' ' << m.divcv2.y << ' ' << m.divcv2.z
+            << ' ' << m.divend.x << ' ' << m.divend.y << ' ' << m.divend.z
+            << ' ' << m.radius << ' ' << m.length << "\n";
+    }
+
+    for( auto const &ch : m_chains ) {
+        out << "chain " << ch.id << "\n";
+        out << "origin " << ch.origin.x << ' ' << ch.origin.y << ' ' << ch.origin.z << "\n";
+        out << "dir " << ch.direction.x << ' ' << ch.direction.y << ' ' << ch.direction.z << "\n";
+        if( ch.anchor != nullptr ) {
+            out << "anchor " << ch.anchor->name() << ' ' << ch.anchor_end << "\n";
+        }
+        for( auto const &el : ch.elements ) {
+            out << "element " << el.type
+                << ' ' << el.length << ' ' << el.radius << ' ' << el.radius0
+                << ' ' << ( el.left ? 1 : 0 ) << ' ' << el.cuts << "\n";
+        }
+        out << "endchain\n";
+    }
+    WriteLog( "editor: saved niweleta \"" + path + "\" (" + std::to_string( m_chains.size() ) + " chains)" );
+}
+
+// reads the sidecar and rebuilds the editable chains. the tracks themselves are already loaded
+// from the scenery, so we DON'T regenerate them (that would duplicate); instead we march each
+// chain with emit=false to rebuild the joint cache, and re-link el.tracks by their stable names.
+void editor_mode::load_alignments()
+{
+    std::string const path = alignment_filepath();
+    std::ifstream in( path );
+    if( !in ) { return; } // no sidecar for this scenery - nothing to restore
+
+    auto const hnorm = []( glm::dvec3 v ) {
+        v.y = 0.0;
+        double const l = glm::length( v );
+        return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+    };
+
+    m_chains.clear();
+    track_chain current;
+    bool inchain = false;
+    std::string line;
+    while( std::getline( in, line ) ) {
+        std::istringstream ls( line );
+        std::string tok;
+        ls >> tok;
+        if( tok == "chain" ) {
+            if( inchain ) { m_chains.push_back( current ); }
+            current = track_chain{};
+            inchain = true;
+            ls >> current.id;
+        }
+        else if( tok == "origin" ) { ls >> current.origin.x >> current.origin.y >> current.origin.z; }
+        else if( tok == "dir" ) { ls >> current.direction.x >> current.direction.y >> current.direction.z; }
+        else if( tok == "anchor" ) {
+            std::string swname; int end;
+            ls >> swname >> end;
+            current.anchor = simulation::Paths.find( swname );
+            current.anchor_end = end;
+        }
+        else if( tok == "element" ) {
+            chain_element el;
+            int left = 1;
+            ls >> el.type >> el.length >> el.radius >> el.radius0 >> left >> el.cuts;
+            el.left = ( left != 0 );
+            current.elements.push_back( el );
+        }
+        else if( tok == "endchain" ) {
+            if( inchain ) { m_chains.push_back( current ); }
+            inchain = false;
+        }
+        else if( tok == "nextid" ) { ls >> m_next_chain_id; }
+        // "switch" lines: parameters of editor switches. re-link m_switch_meta by name
+        else if( tok == "switch" ) {
+            std::string swname;
+            switch_meta m;
+            ls >> swname
+               >> m.entry.x >> m.entry.y >> m.entry.z
+               >> m.straightend.x >> m.straightend.y >> m.straightend.z
+               >> m.divcv1.x >> m.divcv1.y >> m.divcv1.z
+               >> m.divcv2.x >> m.divcv2.y >> m.divcv2.z
+               >> m.divend.x >> m.divend.y >> m.divend.z
+               >> m.radius >> m.length;
+            TTrack *track = simulation::Paths.find( swname );
+            if( track != nullptr ) { m_switch_meta[ track ] = m; }
+        }
+    }
+    if( inchain ) { m_chains.push_back( current ); }
+
+    // rebuild joint caches (march without emitting) and re-link element tracks by stable name
+    int maxid = m_next_chain_id - 1;
+    for( auto &ch : m_chains ) {
+        maxid = std::max( maxid, ch.id );
+        glm::dvec3 pos = ch.origin;
+        glm::dvec3 dir = hnorm( ch.direction );
+        ch.joints.clear();
+        ch.joints.push_back( pos );
+        for( size_t e = 0; e < ch.elements.size(); ++e ) {
+            auto &el = ch.elements[ e ];
+            march_element( el, pos, dir, false ); // advances pos/dir, no track creation
+            ch.joints.push_back( pos );
+            // re-link the tracks this element produced (names must match regenerate_chain)
+            std::string const namebase = "_niw_" + std::to_string( ch.id ) + "_" + std::to_string( e ) + "_";
+            int const pieces = ( el.type == track_panel::STRAIGHT ) ? 1 + std::max( 0, el.cuts ) : 1;
+            for( int i = 0; i < pieces; ++i ) {
+                TTrack *t = simulation::Paths.find( namebase + "p" + std::to_string( i ) );
+                if( t != nullptr ) { el.tracks.push_back( t ); }
+            }
+        }
+        ch.endtangent = dir;
+    }
+    m_next_chain_id = maxid + 1;
+    WriteLog( "editor: loaded niweleta \"" + path + "\" (" + std::to_string( m_chains.size() ) + " chains)" );
 }
 
 // finds a chain joint close to the given screen position; transition-curve end joints are
@@ -1128,6 +1294,15 @@ bool editor_mode::update()
         // "finish niweleta" ends the active chain; the next click starts a new one
         if (ui()->consume_track_finish())
             m_active_chain = -1;
+
+        // "save niweleta + scene": persist the editable chains to the sidecar, then run the
+        // established scene save (handles the terrain streamer setup that a bare export skips)
+        if (ui()->consume_track_save())
+        {
+            save_alignments();
+            save_scene_with_terrain();
+            WriteLog("Editor: saved niweleta + scene", logtype::generic);
+        }
 
         if (mouseHold)
         {
@@ -1967,6 +2142,10 @@ void editor_mode::enter()
     Global.ControlPicking = true;
     EditorModeFlag = true;
 
+    // restore the editable niweleta from its sidecar on the first entry of the session (re-links
+    // to the already-loaded scenery tracks; skipped on re-entry so in-session edits aren't clobbered)
+    if( m_chains.empty() ) { load_alignments(); }
+
     Application.set_cursor(GLFW_CURSOR_NORMAL);
 }
 
@@ -2435,6 +2614,7 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                         double const dl = glm::length( dir );
                         ch.direction = ( dl > 1e-6 ) ? dir / dl : glm::dvec3{ 0.0, 0.0, -1.0 };
                     }
+                    ch.id = m_next_chain_id++;
                     m_chains.push_back( ch );
                     m_active_chain = (int)m_chains.size() - 1;
                 }

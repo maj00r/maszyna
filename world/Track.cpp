@@ -1333,6 +1333,23 @@ glm::vec3 TTrack::get_nearest_point(const glm::dvec3 &point) const
 }
 
 // wypełnianie tablic VBO
+void TTrack::clear_geometry() {
+    // replace every baked chunk with an empty vertex array so the track stops drawing. the bank
+    // is append-only (chunks can't be freed), but an empty chunk renders nothing and, crucially,
+    // this doesn't disturb shapes (terrain) sharing the same section bank.
+    gfx::vertex_array empty_vertices;
+    gfx::userdata_array empty_userdata;
+    for( auto const &geometry : Geometry1 ) {
+        if( geometry.chunk != 0 ) { GfxRenderer->Replace( empty_vertices, empty_userdata, geometry, GL_TRIANGLE_STRIP ); }
+    }
+    for( auto const &geometry : Geometry2 ) {
+        if( geometry.chunk != 0 ) { GfxRenderer->Replace( empty_vertices, empty_userdata, geometry, GL_TRIANGLE_STRIP ); }
+    }
+    if( SwitchExtension && SwitchExtension->Geometry3.chunk != 0 ) {
+        GfxRenderer->Replace( empty_vertices, empty_userdata, SwitchExtension->Geometry3, GL_TRIANGLE_STRIP );
+    }
+}
+
 void TTrack::create_geometry( gfx::geometrybank_handle const &Bank ) {
 	gfx::userdata_array empty_userdata;
     // bake per-instance sleeper transforms now that the owning cell has assigned m_origin.

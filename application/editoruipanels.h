@@ -123,6 +123,7 @@ class track_panel : public ui_panel
 	int cuts = 0; // STRAIGHT: mid-element cuts (element emits cuts+1 track pieces)
 	bool place_active = false; // when set, a left click in the scene lays a track
 	bool finish_chain = false; // one-shot: user asked to end the current niweleta
+	bool save_alignments = false; // one-shot: user asked to save the niweleta + scene
 
 	track_panel(std::string const &Name, bool const Isopen) : ui_panel(Name, Isopen) {}
 	void render() override;

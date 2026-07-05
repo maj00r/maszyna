@@ -48,6 +48,8 @@ class editor_ui : public ui_layer
 	int track_cuts() const;
 	// one-shot: true when the user clicked "finish niweleta"; clears the flag
 	bool consume_track_finish();
+	// one-shot: true when the user clicked "save niweleta + scene"; clears the flag
+	bool consume_track_save();
 
   private:
 	// members
