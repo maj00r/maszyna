@@ -151,6 +151,9 @@ public:
     // removes provided memory cell from the cell
     void
         erase( TMemCell *Memorycell );
+    // removes provided path/track from the cell (editor track deletion)
+    void
+        erase( TTrack *Path );
     // find a vehicle located nearest to specified point, within specified radius. reurns: located vehicle and distance
     std::tuple<TDynamicObject *, float>
         find( glm::dvec3 const &Point, float const Radius, bool const Onlycontrolled, bool const Findbycoupler ) const;
@@ -326,6 +329,9 @@ public:
 	// generates renderable version of held non-instanced geometry
     void
         create_geometry();
+    // rebuilds the section's baked geometry into a fresh bank (used after a node is removed in the editor)
+    void
+        rebuild_geometry();
 	void
 	    create_map_geometry(const gfx::geometrybank_handle handle);
 	void

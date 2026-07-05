@@ -39,6 +39,10 @@ http://mozilla.org/MPL/2.0/.
 #include <functional>
 #include <limits>
 #include <vector>
+#include <memory>
+
+// collects a track's segment(s): one for normal tracks, both paths for a switch/crossing (defined below)
+static void collect_track_segments( TTrack *track, std::vector<std::shared_ptr<TSegment>> &out );
 
 // Static member initialization
 TCamera editor_mode::Camera;
@@ -165,7 +169,7 @@ void editor_mode::apply_rotation_for_new_node(scene::basic_node *node, int rotat
     }
 }
 
-void editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length)
+TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length)
 {
     static int counter = 0;
     std::string const name = "editor_track_" + std::to_string( counter++ );
@@ -186,11 +190,13 @@ void editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm:
     TTrack *track = simulation::State.create_track( src.str(), name );
     if( track == nullptr ) {
         ErrorLog( "editor: failed to create track" );
-        return;
+        return nullptr;
     }
     m_node = track;
     ui()->set_node( track );
+    if( !m_pending_track_label.empty() ) { m_track_labels[track] = m_pending_track_label; }
     WriteLog( "editor: created track \"" + name + "\"" );
+    return track;
 }
 
 void editor_mode::create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir)
@@ -202,15 +208,35 @@ void editor_mode::create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir
 
     double const length = (double)ui()->track_length();
     int const type = ui()->track_type();
+    bool const left = ui()->track_curve_left();
+
+    {   // label shown by the track overlay
+        std::ostringstream lbl;
+        lbl << std::fixed << std::setprecision(0);
+        if( type == track_panel::STRAIGHT )        { lbl << "Prosty L=" << length; }
+        else if( type == track_panel::TRANSITION ) { lbl << "KP " << ui()->track_radius_start() << "->" << ui()->track_radius_end() << " L=" << length; }
+        else if( type == track_panel::SWITCH )     { lbl << "Rozjazd R=" << ui()->track_radius(); }
+        else                                       { lbl << "Luk R=" << ui()->track_radius() << " L=" << length; }
+        m_pending_track_label = lbl.str();
+    }
 
     if( type == track_panel::STRAIGHT ) {
         commit_track( start, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, start + T * length, 0.0, length );
         return;
     }
 
-    // ARC / TRANSITION: circular arc approximated by a cubic bezier
+    if( type == track_panel::TRANSITION ) {
+        // clothoid: curvature varies linearly from 1/radius_start to 1/radius_end (0 == straight)
+        double const rs = (double)ui()->track_radius_start();
+        double const re = (double)ui()->track_radius_end();
+        double const ks = ( rs <= 1e-6 ) ? 0.0 : 1.0 / rs;
+        double const ke = ( re <= 1e-6 ) ? 0.0 : 1.0 / re;
+        create_transition( start, T, length, ks, ke, left );
+        return;
+    }
+
+    // ARC / SWITCH: single circular arc approximated by a cubic bezier
     double const R = std::max( 1.0, (double)ui()->track_radius() );
-    bool const left = ui()->track_curve_left();
     double theta = length / R;              // sweep angle
     theta = std::min( theta, M_PI * 0.9 );  // keep a single bezier accurate (< 180 deg)
 
@@ -229,13 +255,371 @@ void editor_mode::create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir
     glm::dvec3 const Tend = rotY( T, ang );
     double const h = R * ( 4.0 / 3.0 ) * std::tan( theta / 4.0 );
 
-    if( type == track_panel::TRANSITION ) {
-        // rough easement: straight-tangent entry (short handle), full curve handle on exit
-        commit_track( start, T * ( h * 0.5 ), -Tend * h, p2, R, length );
+    if( type == track_panel::SWITCH ) {
+        // switch: straight main route + diverging arc route, both sharing the entry point
+        commit_switch( start, start + T * length, T * h, -Tend * h, p2, R, length );
         return;
     }
     // ARC
     commit_track( start, T * h, -Tend * h, p2, R, length );
+}
+
+void editor_mode::create_transition(glm::dvec3 const &start, glm::dvec3 const &tangent, double length, double kappa_start, double kappa_end, bool left)
+{
+    // A single track segment is one cubic bezier, so we represent the whole transition as one
+    // bezier node: integrate the clothoid (curvature linear in arc length) only to find the true
+    // end position and end tangent, then fit a single bezier through start/end with those tangents.
+    int const N = 240; // integration steps (endpoint accuracy only; nothing is emitted per step)
+    double const ds = length / N;
+    double const turn = left ? 1.0 : -1.0;
+    auto const rotY = []( glm::dvec3 const &v, double a ) {
+        double const c = std::cos( a ), s = std::sin( a );
+        return glm::dvec3{ v.x * c + v.z * s, v.y, -v.x * s + v.z * c };
+    };
+
+    glm::dvec3 pos = start;
+    glm::dvec3 d{ tangent.x, 0.0, tangent.z };
+    double const dl = glm::length( d );
+    d = ( dl > 1e-6 ) ? d / dl : glm::dvec3{ 0.0, 0.0, -1.0 };
+    glm::dvec3 const T = d;
+    double phi_total = 0.0;
+
+    for( int i = 0; i < N; ++i ) {
+        double const s_mid = ( i + 0.5 ) * ds;
+        double const kappa = kappa_start + ( kappa_end - kappa_start ) * ( s_mid / length );
+        double const dphi = turn * kappa * ds;
+        pos += rotY( d, dphi * 0.5 ) * ds; // advance using the mid-step heading
+        d = rotY( d, dphi );
+        phi_total += dphi;
+    }
+    glm::dvec3 const p2 = pos;      // end position
+    glm::dvec3 const Tend = d;      // end tangent
+
+    // symmetric handle sized as the equivalent circular arc of the total turn through the chord;
+    // keeps the endpoint tangents exact (curvature is approximate, but it's a single bezier)
+    double const chord = glm::length( p2 - start );
+    double const Phi = std::abs( phi_total );
+    double const h = ( Phi < 1e-4 )
+        ? chord / 3.0
+        : ( chord / ( 2.0 * std::sin( Phi * 0.5 ) ) ) * ( 4.0 / 3.0 ) * std::tan( Phi * 0.25 );
+
+    // radius field: tightest of the two ends (drives mesh density / physics)
+    double const r_end = ( std::abs( kappa_end ) > 1e-9 ) ? 1.0 / std::abs( kappa_end ) : 0.0;
+    double const r_start = ( std::abs( kappa_start ) > 1e-9 ) ? 1.0 / std::abs( kappa_start ) : 0.0;
+    double const radius = ( r_start > 0.0 && r_end > 0.0 ) ? std::min( r_start, r_end ) : std::max( r_start, r_end );
+
+    commit_track( start, T * h, -Tend * h, p2, radius, length );
+}
+
+TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &straightend, glm::dvec3 const &divcv1, glm::dvec3 const &divcv2, glm::dvec3 const &divend, double radius, double length)
+{
+    static int counter = 0;
+    std::string const name = "editor_switch_" + std::to_string( counter++ );
+
+    // switch node: two paths sharing the entry point. path 1 = straight main route (control
+    // vectors and radius zero), path 2 = diverging arc (bezier control offsets + radius).
+    std::ostringstream src;
+    src << std::fixed << std::setprecision(3)
+        << "node -1 0 " << name << " track switch 34.0"
+        // normal ballast profile width (texwidth/slope): a standalone switch has no connected track
+        // to take the profile from, so it uses its own fTexWidth/fTexSlope - keep them track-sized
+        << " 1.435 0.24 15.0 20 2 flat vis Rail_screw_used1 4.0 TpBpS-new2 0.2 0.5 1.1\n"
+        << entry.x << ' ' << entry.y << ' ' << entry.z << " 0.0\n"
+        << "0.0 0.0 0.0\n"
+        << "0.0 0.0 0.0\n"
+        << straightend.x << ' ' << straightend.y << ' ' << straightend.z << " 0.0\n"
+        << "0.0\n"
+        << entry.x << ' ' << entry.y << ' ' << entry.z << " 0.0\n"
+        << divcv1.x << ' ' << divcv1.y << ' ' << divcv1.z << '\n'
+        << divcv2.x << ' ' << divcv2.y << ' ' << divcv2.z << '\n'
+        << divend.x << ' ' << divend.y << ' ' << divend.z << " 0.0\n"
+        << radius << '\n'
+        // explicit trackbed material so the auto-generated switch ballast renders even for a
+        // standalone switch (no connected track to copy the ballast texture from)
+        << "trackbed TpBpS-new2\n"
+        << "endtrack\n";
+
+    TTrack *track = simulation::State.create_track( src.str(), name );
+    if( track == nullptr ) {
+        ErrorLog( "editor: failed to create switch" );
+        return nullptr;
+    }
+    m_node = track;
+    ui()->set_node( track );
+    if( !m_pending_track_label.empty() ) { m_track_labels[track] = m_pending_track_label; }
+    m_switch_meta[ track ] = switch_meta{ entry, straightend, divcv1, divcv2, divend, radius, length };
+    WriteLog( "editor: created switch \"" + name + "\"" );
+    return track;
+}
+
+// removes a track from the scene: out of its cell, rebuild that section's baked geometry,
+// drop from the path lookup. the object itself is left orphaned on purpose (still referenced
+// by scene groups) to avoid dangling pointers.
+void editor_mode::delete_track(TTrack *track)
+{
+    if( track == nullptr ) { return; }
+    glm::dvec3 const loc = track->location();
+    std::string const trackname = track->name();
+    simulation::Region->erase( track );
+    simulation::Region->section( loc ).rebuild_geometry();
+    simulation::Paths.detach( trackname );
+    m_track_labels.erase( track );
+    if( m_node == track ) {
+        m_node = nullptr;
+        ui()->set_node( nullptr );
+    }
+}
+
+// finds a track endpoint close to the given screen position (for extending / dragging)
+bool editor_mode::pick_track_endpoint(float screenx, float screeny, bool allowswitch, TTrack *&track, int &endindex, glm::dvec3 &point, glm::dvec3 &outward)
+{
+    ImGuiIO const &io = ImGui::GetIO();
+    glm::mat4 const view = GfxRenderer->Camera_View_Matrix();
+    glm::dvec3 const camerapos = GfxRenderer->Camera_Position();
+    float const fovy = glm::radians( Global.FieldOfView / Global.ZoomFactor );
+    float const aspect = io.DisplaySize.y > 0.0f ? io.DisplaySize.x / io.DisplaySize.y : 1.0f;
+    glm::mat4 const projection = glm::perspective( fovy, aspect, 0.1f, 10000.0f );
+
+    auto const hnorm = []( glm::dvec3 v ) {
+        v.y = 0.0;
+        double const l = glm::length( v );
+        return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+    };
+
+    float const pickradius = 14.0f; // [px]
+    float best = pickradius * pickradius;
+    track = nullptr; endindex = -1;
+    std::vector<std::shared_ptr<TSegment>> segs;
+    for( auto *path : simulation::Paths.sequence() ) {
+        if( path == nullptr ) { continue; }
+        if( !allowswitch && path->SwitchExtension ) { continue; } // switch points are locked for dragging
+        segs.clear();
+        collect_track_segments( path, segs );
+        for( size_t s = 0; s < segs.size(); ++s ) {
+            if( !segs[ s ] ) { continue; }
+            glm::dvec3 const pts[ 2 ] = { glm::dvec3{ segs[ s ]->FastGetPoint_0() }, glm::dvec3{ segs[ s ]->FastGetPoint_1() } };
+            for( int e = 0; e < 2; ++e ) {
+                glm::vec4 const clip = projection * view * glm::vec4( glm::vec3( pts[ e ] - camerapos ), 1.0f );
+                if( clip.w <= 1e-4f ) { continue; }
+                glm::vec2 const ndc = glm::vec2( clip ) / clip.w;
+                float const sx = ( ndc.x * 0.5f + 0.5f ) * io.DisplaySize.x;
+                float const sy = ( 1.0f - ( ndc.y * 0.5f + 0.5f ) ) * io.DisplaySize.y;
+                float const dx = sx - screenx, dy = sy - screeny;
+                float const d2 = dx * dx + dy * dy;
+                if( d2 < best ) {
+                    best = d2;
+                    track = path;
+                    endindex = (int)s * 2 + e;
+                    point = pts[ e ];
+                    // outward continuation direction beyond this end (same convention as snap)
+                    outward = hnorm( e == 0 ? -segs[ s ]->GetDirection1() : -segs[ s ]->GetDirection2() );
+                }
+            }
+        }
+    }
+    return track != nullptr;
+}
+
+// marches a single chain element from (pos, dir); optionally emits the result track
+// (P1 = element start, P2 = element end: track directionality always follows the march)
+TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit )
+{
+    auto const rotY = []( glm::dvec3 const &v, double a ) {
+        double const c = std::cos( a ), s = std::sin( a );
+        return glm::dvec3{ v.x * c + v.z * s, v.y, -v.x * s + v.z * c };
+    };
+    TTrack *made = nullptr;
+    std::ostringstream lbl;
+    lbl << std::fixed << std::setprecision( 0 );
+
+    if( el.type == track_panel::STRAIGHT ) {
+        glm::dvec3 const end = pos + dir * el.length;
+        if( emit ) {
+            lbl << "Prosty L=" << el.length;
+            m_pending_track_label = lbl.str();
+            made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, el.length );
+        }
+        pos = end;
+    }
+    else if( el.type == track_panel::ARC ) {
+        double const R = std::max( 1.0, el.radius );
+        double const turn = el.left ? 1.0 : -1.0;
+        double const theta = std::min( el.length / R, M_PI * 0.9 );
+        glm::dvec3 const N = rotY( dir, turn * M_PI_2 );
+        glm::dvec3 const centre = pos + N * R;
+        glm::dvec3 const end = centre + rotY( pos - centre, turn * theta );
+        glm::dvec3 const Tend = rotY( dir, turn * theta );
+        double const h = R * ( 4.0 / 3.0 ) * std::tan( theta / 4.0 );
+        if( emit ) {
+            lbl << "Luk R=" << R << " L=" << el.length;
+            m_pending_track_label = lbl.str();
+            made = commit_track( pos, dir * h, -Tend * h, end, R, el.length );
+        }
+        pos = end;
+        dir = Tend;
+    }
+    else { // TRANSITION: clothoid, parameters (R0 -> R1, L) are never deformed by editing
+        double const k0 = ( el.radius0 > 1e-6 ) ? 1.0 / el.radius0 : 0.0;
+        double const k1 = ( el.radius > 1e-6 ) ? 1.0 / el.radius : 0.0;
+        double const turn = el.left ? 1.0 : -1.0;
+        int const N = 240;
+        double const ds = el.length / N;
+        glm::dvec3 ipos = pos, idir = dir;
+        double phi = 0.0;
+        for( int i = 0; i < N; ++i ) {
+            double const smid = ( i + 0.5 ) * ds;
+            double const kappa = k0 + ( k1 - k0 ) * ( smid / el.length );
+            double const dphi = turn * kappa * ds;
+            ipos += rotY( idir, dphi * 0.5 ) * ds;
+            idir = rotY( idir, dphi );
+            phi += dphi;
+        }
+        double const chord = glm::length( ipos - pos );
+        double const Phi = std::abs( phi );
+        double const h = ( Phi < 1e-4 )
+            ? chord / 3.0
+            : ( chord / ( 2.0 * std::sin( Phi * 0.5 ) ) ) * ( 4.0 / 3.0 ) * std::tan( Phi * 0.25 );
+        double const rmesh = ( k1 > 1e-9 && k0 > 1e-9 ) ? std::min( 1.0 / k1, 1.0 / k0 ) : std::max( el.radius, el.radius0 );
+        if( emit ) {
+            lbl << "KP " << el.radius0 << "->" << el.radius << " L=" << el.length;
+            m_pending_track_label = lbl.str();
+            made = commit_track( pos, dir * h, -idir * h, ipos, rmesh, el.length );
+        }
+        pos = ipos;
+        dir = idir;
+    }
+    return made;
+}
+
+// regenerates a chain: resolves the (possibly switch-anchored) origin and re-marches all elements
+void editor_mode::regenerate_chain(int index)
+{
+    if( index < 0 || index >= (int)m_chains.size() ) { return; }
+    auto &ch = m_chains[ index ];
+
+    auto const hnorm = []( glm::dvec3 v ) {
+        v.y = 0.0;
+        double const l = glm::length( v );
+        return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+    };
+
+    // anchored chains take origin/direction from the switch outlet (main = end 1, diverging = end 3)
+    if( ch.anchor != nullptr && ch.anchor->SwitchExtension ) {
+        auto const seg = ch.anchor->SwitchExtension->Segments[ ch.anchor_end == 3 ? 1 : 0 ];
+        if( seg ) {
+            glm::dvec3 p{ seg->FastGetPoint_1() };
+            p.y -= 0.18;
+            ch.origin = p;
+            ch.direction = hnorm( -seg->GetDirection2() );
+        }
+    }
+
+    for( auto &el : ch.elements ) {
+        if( el.track != nullptr ) { delete_track( el.track ); el.track = nullptr; }
+    }
+    ch.joints.clear();
+
+    glm::dvec3 pos = ch.origin;
+    glm::dvec3 dir = hnorm( ch.direction );
+    ch.joints.push_back( pos );
+    for( auto &el : ch.elements ) {
+        el.track = march_element( el, pos, dir, true );
+        ch.joints.push_back( pos );
+    }
+    ch.endtangent = dir;
+    m_pending_track_label.clear();
+}
+
+// finds a chain joint close to the given screen position; transition-curve end joints are
+// locked (their parameters are never deformed), the origin of an anchored chain likewise
+bool editor_mode::pick_chain_joint(float screenx, float screeny, int &chain, int &joint)
+{
+    ImGuiIO const &io = ImGui::GetIO();
+    glm::mat4 const view = GfxRenderer->Camera_View_Matrix();
+    glm::dvec3 const camerapos = GfxRenderer->Camera_Position();
+    float const fovy = glm::radians( Global.FieldOfView / Global.ZoomFactor );
+    float const aspect = io.DisplaySize.y > 0.0f ? io.DisplaySize.x / io.DisplaySize.y : 1.0f;
+    glm::mat4 const projection = glm::perspective( fovy, aspect, 0.1f, 10000.0f );
+
+    float const pickradius = 14.0f;
+    float best = pickradius * pickradius;
+    chain = -1; joint = -1;
+    for( size_t c = 0; c < m_chains.size(); ++c ) {
+        auto const &ch = m_chains[ c ];
+        for( size_t j = 0; j < ch.joints.size(); ++j ) {
+            if( j == 0 && ch.anchor != nullptr ) { continue; } // anchored origin is owned by the switch
+            if( j > 0 && ch.elements[ j - 1 ].type == track_panel::TRANSITION ) { continue; } // KP locked
+            glm::vec4 const clip = projection * view * glm::vec4( glm::vec3( ch.joints[ j ] - camerapos ), 1.0f );
+            if( clip.w <= 1e-4f ) { continue; }
+            glm::vec2 const ndc = glm::vec2( clip ) / clip.w;
+            float const sx = ( ndc.x * 0.5f + 0.5f ) * io.DisplaySize.x;
+            float const sy = ( 1.0f - ( ndc.y * 0.5f + 0.5f ) ) * io.DisplaySize.y;
+            float const dx = sx - screenx, dy = sy - screeny;
+            if( dx * dx + dy * dy < best ) {
+                best = dx * dx + dy * dy;
+                chain = (int)c;
+                joint = (int)j;
+            }
+        }
+    }
+    return chain != -1;
+}
+
+bool editor_mode::snap_track_start(glm::dvec3 &start, glm::dvec3 &dir)
+{
+    double const snapradius = 8.0; // [m]
+    double best = snapradius * snapradius;
+    bool found = false;
+    // compare horizontally (ignore the railhead height offset) so proximity is stable
+    auto const hdist2 = []( glm::dvec3 const &a, glm::dvec3 const &b ) {
+        double const dx = a.x - b.x, dz = a.z - b.z;
+        return dx * dx + dz * dz;
+    };
+    glm::dvec3 const click = start; // snap against the fixed click point, not a moving target
+    std::vector<std::shared_ptr<TSegment>> segs;
+    for( auto *path : simulation::Paths.sequence() ) {
+        if( path == nullptr ) { continue; }
+        segs.clear();
+        collect_track_segments( path, segs );
+        for( auto const &seg : segs ) {
+            if( !seg ) { continue; }
+            glm::dvec3 const p1{ seg->FastGetPoint_0() };
+            glm::dvec3 const p2{ seg->FastGetPoint_1() };
+            double const d1 = hdist2( p1, click );
+            if( d1 < best ) { best = d1; start = p1; dir = -seg->GetDirection1(); found = true; }
+            double const d2 = hdist2( p2, click );
+            if( d2 < best ) { best = d2; start = p2; dir = -seg->GetDirection2(); found = true; }
+        }
+    }
+    // snapped endpoints are geometry points at railhead height; TTrack::Load re-adds the 0.18 m
+    // railhead offset when the new track is built, so bring the start back down to the node base level
+    if( found ) { start.y -= 0.18; }
+    return found;
+}
+
+glm::dvec3 editor_mode::cursor_ground_point() const
+{
+    ImGuiIO const &io = ImGui::GetIO();
+    glm::mat4 const view = GfxRenderer->Camera_View_Matrix();          // camera-relative (rotation only)
+    glm::dvec3 const camerapos = GfxRenderer->Camera_Position();
+    float const fovy = glm::radians( Global.FieldOfView / Global.ZoomFactor );
+    float const aspect = io.DisplaySize.y > 0.0f ? io.DisplaySize.x / io.DisplaySize.y : 1.0f;
+    glm::mat4 const projection = glm::perspective( fovy, aspect, 0.1f, 10000.0f );
+
+    float const nx = ( io.MousePos.x / io.DisplaySize.x ) * 2.0f - 1.0f;
+    float const ny = 1.0f - ( io.MousePos.y / io.DisplaySize.y ) * 2.0f;
+    glm::mat4 const invvp = glm::inverse( projection * view );
+    glm::vec4 pn = invvp * glm::vec4( nx, ny, -1.0f, 1.0f );
+    glm::vec4 pf = invvp * glm::vec4( nx, ny,  1.0f, 1.0f );
+    glm::dvec3 const nearp = camerapos + glm::dvec3( glm::vec3( pn ) / pn.w );
+    glm::dvec3 const farp  = camerapos + glm::dvec3( glm::vec3( pf ) / pf.w );
+
+    glm::dvec3 const rd = farp - nearp;
+    if( std::abs( rd.y ) < 1e-9 ) { return glm::dvec3{ nearp.x, 0.0, nearp.z }; } // ray ~parallel to ground
+    double const t = -nearp.y / rd.y;
+    glm::dvec3 hit = nearp + rd * t;
+    hit.y = 0.0;
+    return hit;
 }
 
 void editor_mode::create_straight_track_ahead(double length)
@@ -722,6 +1106,10 @@ bool editor_mode::update()
         // update brush settings visibility depending on panel mode
         ui()->toggleBrushSettings(ui()->mode() == nodebank_panel::BRUSH);
 
+        // "finish niweleta" ends the active chain; the next click starts a new one
+        if (ui()->consume_track_finish())
+            m_active_chain = -1;
+
         if (mouseHold)
         {
             // process continuous brush placement
@@ -744,6 +1132,12 @@ bool editor_mode::update()
 
     // variable step routines
     update_camera(deltarealtime);
+
+    // active drag (chain joint or switch) follows the cursor on the ground plane; geometry
+    // is re-marched once, on mouse release
+    if( m_dragactive ) {
+        m_dragpos = cursor_ground_point();
+    }
 
     simulation::Region->update_sounds();
     audio::renderer.update(Global.iPause ? 0.0 : deltarealtime);
@@ -791,6 +1185,9 @@ bool editor_mode::update()
 
     // --- ImGuizmo: in-viewport transform gizmo for the selected node ---
     render_gizmo();
+
+    // --- 2D overlay: selected track's control-vector handles + type/radius label ---
+    render_track_overlay();
 
     // --- ImGui: Editor Settings & History windows ---
     if(m_settings_open)
@@ -1258,6 +1655,104 @@ void editor_mode::capture_terrain()
     simulation::State.delete_model(model);
 }
 
+// collects a track's segment(s): one for normal tracks, both paths for a switch/crossing
+static void collect_track_segments( TTrack *track, std::vector<std::shared_ptr<TSegment>> &out )
+{
+    if( track->SwitchExtension ) {
+        if( track->SwitchExtension->Segments[ 0 ] ) { out.push_back( track->SwitchExtension->Segments[ 0 ] ); }
+        if( track->SwitchExtension->Segments[ 1 ] ) { out.push_back( track->SwitchExtension->Segments[ 1 ] ); }
+    }
+    else if( track->Segment ) {
+        out.push_back( track->Segment );
+    }
+}
+
+void editor_mode::render_track_overlay()
+{
+    // same camera-relative view/projection the gizmo uses, so the overlay lines up with the render
+    ImGuiIO const &io = ImGui::GetIO();
+    glm::mat4 const view = GfxRenderer->Camera_View_Matrix();
+    glm::dvec3 const camerapos = GfxRenderer->Camera_Position();
+    float const fovy = glm::radians( Global.FieldOfView / Global.ZoomFactor );
+    float const aspect = io.DisplaySize.y > 0.0f ? io.DisplaySize.x / io.DisplaySize.y : 1.0f;
+    glm::mat4 const projection = glm::perspective( fovy, aspect, 0.1f, 10000.0f );
+
+    auto const project = [&]( glm::dvec3 const &world, ImVec2 &out ) -> bool {
+        glm::vec4 const clip = projection * view * glm::vec4( glm::vec3( world - camerapos ), 1.0f );
+        if( clip.w <= 1e-4f ) { return false; } // behind the camera
+        glm::vec2 const ndc = glm::vec2( clip ) / clip.w;
+        out = ImVec2( ( ndc.x * 0.5f + 0.5f ) * io.DisplaySize.x,
+                      ( 1.0f - ( ndc.y * 0.5f + 0.5f ) ) * io.DisplaySize.y );
+        return true;
+    };
+
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImFont *const font = ImGui::GetFont();
+    float const fontsize = 22.0f;
+    ImU32 const endcol = IM_COL32( 60, 220, 255, 255 );   // track endpoints
+    ImU32 const handlecol = IM_COL32( 255, 200, 0, 255 ); // control-vector lines
+    ImU32 const dotcol = IM_COL32( 255, 120, 0, 255 );    // control points
+
+    std::vector<std::shared_ptr<TSegment>> segs;
+    for( auto *path : simulation::Paths.sequence() ) {
+        if( path == nullptr ) { continue; }
+        if( glm::length2( path->location() - camerapos ) > sq( 700.0 ) ) { continue; } // cull distant
+
+        segs.clear();
+        collect_track_segments( path, segs );
+        glm::dvec3 labelpos{ 0.0 };
+        bool haslabel = false;
+
+        for( auto const &seg : segs ) {
+            if( !seg ) { continue; }
+            glm::dvec3 const p1{ seg->FastGetPoint_0() };
+            glm::dvec3 const p2{ seg->FastGetPoint_1() };
+            ImVec2 a, b;
+            // endpoints
+            if( project( p1, a ) ) { dl->AddCircleFilled( a, 4.0f, endcol ); }
+            if( project( p2, b ) ) { dl->AddCircleFilled( b, 4.0f, endcol ); }
+            // control-vector handles (for curved segments)
+            if( seg->bCurve ) {
+                ImVec2 c;
+                if( project( p1, a ) && project( p1 + seg->GetDirection1(), c ) ) { dl->AddLine( a, c, handlecol, 2.0f ); dl->AddCircleFilled( c, 3.5f, dotcol ); }
+                if( project( p2, b ) && project( p2 + seg->GetDirection2(), c ) ) { dl->AddLine( b, c, handlecol, 2.0f ); dl->AddCircleFilled( c, 3.5f, dotcol ); }
+            }
+            if( !haslabel ) { labelpos = ( p1 + p2 ) * 0.5; haslabel = true; }
+        }
+
+        if( haslabel ) {
+            ImVec2 s;
+            if( project( labelpos, s ) ) {
+                auto const it = m_track_labels.find( path );
+                std::string const label = ( it != m_track_labels.end() ) ? it->second : ( "R=" + std::to_string( (int)path->fRadius ) );
+                float const ty = s.y - fontsize * 0.5f;
+                dl->AddText( font, fontsize, ImVec2( s.x + 8.0f, ty + 1.0f ), IM_COL32( 0, 0, 0, 220 ), label.c_str() ); // shadow
+                dl->AddText( font, fontsize, ImVec2( s.x + 7.0f, ty ), IM_COL32( 255, 240, 60, 255 ), label.c_str() );
+            }
+        }
+    }
+
+    // niweleta joints: editable (green) squares; KP-locked ends drawn grey
+    for( auto const &ch : m_chains ) {
+        for( size_t j = 0; j < ch.joints.size(); ++j ) {
+            ImVec2 s;
+            if( !project( ch.joints[ j ] + glm::dvec3{ 0.0, 0.25, 0.0 }, s ) ) { continue; }
+            bool const locked = ( j == 0 && ch.anchor != nullptr )
+                             || ( j > 0 && ch.elements[ j - 1 ].type == track_panel::TRANSITION );
+            ImU32 const col = locked ? IM_COL32( 150, 150, 150, 255 ) : IM_COL32( 40, 255, 40, 255 );
+            dl->AddRectFilled( ImVec2( s.x - 5, s.y - 5 ), ImVec2( s.x + 5, s.y + 5 ), col );
+        }
+    }
+    // drag preview: marker at the cursor and a guide line from the grabbed point
+    if( m_dragactive ) {
+        ImVec2 a, b;
+        bool const hasa = project( m_drag_from, a );
+        bool const hasb = project( m_dragpos + glm::dvec3{ 0.0, 0.2, 0.0 }, b );
+        if( hasa && hasb ) { dl->AddLine( a, b, IM_COL32( 255, 60, 60, 200 ), 2.0f ); }
+        if( hasb ) { dl->AddRectFilled( ImVec2( b.x - 6, b.y - 6 ), ImVec2( b.x + 6, b.y + 6 ), IM_COL32( 255, 60, 60, 255 ) ); }
+    }
+}
+
 void editor_mode::render_gizmo()
 {
     // the transform gizmo is suppressed while editing terrain, so the brush/chunk tool owns the mouse
@@ -1578,6 +2073,28 @@ void editor_mode::on_key(int const Key, int const Scancode, int const Action, in
                 ui()->set_node(nullptr);
                 simulation::State.delete_model(model);
             }
+            else if( TTrack *track = dynamic_cast<TTrack *>( m_node ) )
+            {
+                // keep the niweleta model in sync: drop the element owning this track, detach
+                // chains anchored to a deleted switch
+                for( size_t c = 0; c < m_chains.size(); ++c ) {
+                    auto &ch = m_chains[ c ];
+                    if( ch.anchor == track ) { ch.anchor = nullptr; }
+                    for( size_t e = 0; e < ch.elements.size(); ++e ) {
+                        if( ch.elements[ e ].track == track ) {
+                            ch.elements[ e ].track = nullptr;
+                            ch.elements.erase( ch.elements.begin() + e );
+                            regenerate_chain( (int)c );
+                            break;
+                        }
+                    }
+                }
+                m_switch_meta.erase( track );
+                std::string const trackname = track->name();
+                delete_track( track );
+                m_dragging = false;
+                WriteLog( "editor: deleted track \"" + trackname + "\"" );
+            }
         }
         break;
 
@@ -1642,7 +2159,115 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
 
     if (Button == GLFW_MOUSE_BUTTON_LEFT)
     {
-		
+        // finish a drag: apply the edit (element parameters / switch position) and re-march
+        if( !is_press(Action) && m_dragactive )
+        {
+            m_dragactive = false;
+            glm::dvec3 const target = cursor_ground_point();
+            auto const hnorm = []( glm::dvec3 v ) {
+                v.y = 0.0;
+                double const l = glm::length( v );
+                return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+            };
+
+            if( m_switchdrag != nullptr ) {
+                // translate the whole switch, then re-march chains anchored to it
+                auto const metait = m_switch_meta.find( m_switchdrag );
+                if( metait != m_switch_meta.end() ) {
+                    switch_meta meta = metait->second;
+                    glm::dvec3 const delta{ target.x - m_drag_from.x, 0.0, target.z - m_drag_from.z };
+                    meta.entry += delta; meta.straightend += delta; meta.divend += delta;
+                    TTrack *old = m_switchdrag;
+                    TTrack *fresh = commit_switch( meta.entry, meta.straightend, meta.divcv1, meta.divcv2, meta.divend, meta.radius, meta.length );
+                    if( fresh != nullptr ) {
+                        m_switch_meta.erase( old );
+                        delete_track( old );
+                        for( size_t c = 0; c < m_chains.size(); ++c ) {
+                            if( m_chains[ c ].anchor == old ) {
+                                m_chains[ c ].anchor = fresh;
+                                regenerate_chain( (int)c );
+                            }
+                        }
+                    }
+                }
+                m_switchdrag = nullptr;
+            }
+            else if( m_chaindrag_chain >= 0 && m_chaindrag_chain < (int)m_chains.size() ) {
+                auto &ch = m_chains[ m_chaindrag_chain ];
+                int const j = m_chaindrag_joint;
+                if( j == 0 ) {
+                    // free-chain origin: translate the whole chain
+                    if( ch.anchor == nullptr ) {
+                        ch.origin = glm::dvec3{ target.x, ch.origin.y, target.z };
+                    }
+                }
+                else if( j - 1 < (int)ch.elements.size() ) {
+                    // march up to the element start, then re-parametrize the element to reach
+                    // the dragged point while KEEPING ITS TYPE
+                    glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
+                    if( ch.anchor != nullptr ) { pos = ch.joints.front(); }
+                    for( int e = 0; e < j - 1; ++e ) {
+                        march_element( ch.elements[ e ], pos, dir, false );
+                    }
+                    auto &el = ch.elements[ j - 1 ];
+                    glm::dvec3 const chordv{ target.x - pos.x, 0.0, target.z - pos.z };
+                    double const chord = glm::length( chordv );
+                    if( chord > 1.0 ) {
+                        if( el.type == track_panel::STRAIGHT ) {
+                            // a run of consecutive straights behaves like one direction vector:
+                            // dragging its end rotates the run; the preceding arc adapts its
+                            // sweep to the new line, a KP predecessor locks the direction
+                            int const eidx = j - 1;
+                            int runstart = eidx;
+                            while( runstart > 0 && ch.elements[ runstart - 1 ].type == track_panel::STRAIGHT ) { --runstart; }
+                            glm::dvec3 rpos = ch.origin, rdir = hnorm( ch.direction );
+                            for( int e = 0; e < runstart; ++e ) { march_element( ch.elements[ e ], rpos, rdir, false ); }
+                            glm::dvec3 const newdir = hnorm( glm::dvec3{ target.x - rpos.x, 0.0, target.z - rpos.z } );
+                            if( runstart == 0 ) {
+                                if( ch.anchor == nullptr ) { ch.direction = newdir; }
+                            }
+                            else if( ch.elements[ runstart - 1 ].type == track_panel::ARC ) {
+                                auto &arc = ch.elements[ runstart - 1 ];
+                                glm::dvec3 apos = ch.origin, adir = hnorm( ch.direction );
+                                for( int e = 0; e < runstart - 1; ++e ) { march_element( ch.elements[ e ], apos, adir, false ); }
+                                double const cosang2 = std::clamp( glm::dot( adir, newdir ), -1.0, 1.0 );
+                                double const theta2 = std::acos( cosang2 );
+                                if( theta2 > 1e-3 ) {
+                                    arc.left = ( adir.x * newdir.z - adir.z * newdir.x ) < 0.0;
+                                    arc.length = std::max( 1.0, arc.radius ) * theta2;
+                                }
+                            }
+                            // re-march to this element and set its length toward the drag point
+                            glm::dvec3 pos2 = ch.origin, dir2 = hnorm( ch.direction );
+                            for( int e = 0; e < eidx; ++e ) { march_element( ch.elements[ e ], pos2, dir2, false ); }
+                            el.length = std::max( 1.0, glm::dot( glm::dvec3{ target.x - pos2.x, 0.0, target.z - pos2.z }, dir2 ) );
+                        }
+                        else if( el.type == track_panel::ARC ) {
+                            // re-fit the arc through the point, tangent to the march direction
+                            glm::dvec3 const cdir = hnorm( chordv );
+                            double const cosang = std::clamp( glm::dot( cdir, dir ), -1.0, 1.0 );
+                            double const ang = std::acos( cosang );
+                            if( ang < 1e-3 ) {
+                                el.length = chord;
+                            }
+                            else {
+                                double const R = chord / ( 2.0 * std::sin( ang ) );
+                                el.radius = R;
+                                el.length = R * 2.0 * ang;
+                                el.left = ( dir.x * cdir.z - dir.z * cdir.x ) < 0.0;
+                            }
+                        }
+                        // TRANSITION never lands here (locked at pick time)
+                    }
+                }
+                regenerate_chain( m_chaindrag_chain );
+                m_chaindrag_chain = -1;
+                m_chaindrag_joint = -1;
+            }
+            m_input.mouse.button(Button, Action);
+            return;
+        }
+
         auto const mode = ui()->mode();
         auto const rotation_mode = ui()->rot_mode();
         auto const fixed_rotation_value = ui()->rot_val();
@@ -1652,18 +2277,141 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
             mouseHold = true;
             m_node = nullptr;
 
-            // track-laying tool: a click lays a track starting at the cursor, running along the camera heading
+            // niweleta building: each click appends a typed element (panel parameters) to the
+            // active chain. The first click sets the origin - anchored to a switch outlet when
+            // clicked near one, or free (ground point + camera heading). A switch placed at the
+            // chain end is a branch point: it ends the chain and new chains can anchor to it.
             if (ui()->track_place_active())
             {
-                GfxRenderer->Pick_Node_Callback(
-                    [this](scene::basic_node * /*node*/) {
-                        glm::dvec3 start = glm::dvec3{ Camera.Pos } + clamp_mouse_offset_to_max( GfxRenderer->Mouse_Position() );
-                        start.y = 0.0; // lay on ground level for now
-                        glm::dvec3 const forward{ -std::sin( (double)Camera.Angle.y ), 0.0, -std::cos( (double)Camera.Angle.y ) };
-                        create_track_at( start, forward );
-                    });
+                ImGuiIO const &io = ImGui::GetIO();
+
+                if( ui()->track_type() == track_panel::SWITCH ) {
+                    glm::dvec3 start, dir;
+                    if( m_active_chain >= 0 && m_active_chain < (int)m_chains.size() && !m_chains[ m_active_chain ].joints.empty() ) {
+                        // branch point at the end of the active chain, tangent to it
+                        start = m_chains[ m_active_chain ].joints.back();
+                        dir = m_chains[ m_active_chain ].endtangent;
+                        m_active_chain = -1; // the chain ends at the branch
+                    }
+                    else {
+                        TTrack *seed = nullptr; int seedend = -1;
+                        if( pick_track_endpoint( io.MousePos.x, io.MousePos.y, true, seed, seedend, start, dir ) ) {
+                            start.y -= 0.18;
+                        }
+                        else {
+                            start = cursor_ground_point();
+                            glm::mat3 const rot = glm::mat3( GfxRenderer->Camera_View_Matrix() );
+                            glm::vec3 const fwd = glm::transpose( rot ) * glm::vec3( 0.0f, 0.0f, -1.0f );
+                            dir = glm::dvec3{ fwd.x, 0.0, fwd.z };
+                            double const dl = glm::length( dir );
+                            dir = ( dl > 1e-6 ) ? dir / dl : glm::dvec3{ 0.0, 0.0, -1.0 };
+                        }
+                    }
+                    create_track_at( start, dir ); // builds the switch (records its meta)
+                    m_input.mouse.button(Button, Action);
+                    return;
+                }
+
+                if( m_active_chain < 0 || m_active_chain >= (int)m_chains.size() ) {
+                    // start a new chain: anchored at a clicked switch outlet, continuing from a
+                    // clicked track end, or free at the ground point
+                    track_chain ch;
+                    TTrack *seed = nullptr; int seedend = -1;
+                    glm::dvec3 point, outward;
+                    bool picked = pick_track_endpoint( io.MousePos.x, io.MousePos.y, true, seed, seedend, point, outward );
+                    if( !picked ) {
+                        // world-space fallback: snap to the nearest endpoint within 8 m of the click
+                        glm::dvec3 const ground = cursor_ground_point();
+                        double best = 8.0 * 8.0;
+                        std::vector<std::shared_ptr<TSegment>> fsegs;
+                        for( auto *path : simulation::Paths.sequence() ) {
+                            if( path == nullptr ) { continue; }
+                            fsegs.clear();
+                            collect_track_segments( path, fsegs );
+                            for( size_t s = 0; s < fsegs.size(); ++s ) {
+                                if( !fsegs[ s ] ) { continue; }
+                                glm::dvec3 const pts[ 2 ] = { glm::dvec3{ fsegs[ s ]->FastGetPoint_0() }, glm::dvec3{ fsegs[ s ]->FastGetPoint_1() } };
+                                for( int e = 0; e < 2; ++e ) {
+                                    double const dx = pts[ e ].x - ground.x, dz = pts[ e ].z - ground.z;
+                                    if( dx * dx + dz * dz < best ) {
+                                        best = dx * dx + dz * dz;
+                                        seed = path;
+                                        seedend = (int)s * 2 + e;
+                                        point = pts[ e ];
+                                        glm::dvec3 o = ( e == 0 ? -fsegs[ s ]->GetDirection1() : -fsegs[ s ]->GetDirection2() );
+                                        o.y = 0.0;
+                                        double const ol = glm::length( o );
+                                        outward = ( ol > 1e-9 ) ? o / ol : glm::dvec3{ 0.0, 0.0, -1.0 };
+                                        picked = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if( picked ) {
+                        if( seed->SwitchExtension && ( seedend == 1 || seedend == 3 ) ) {
+                            ch.anchor = seed;
+                            ch.anchor_end = seedend;
+                        }
+                        else {
+                            ch.origin = glm::dvec3{ point.x, point.y - 0.18, point.z };
+                            ch.direction = outward;
+                        }
+                    }
+                    else {
+                        ch.origin = cursor_ground_point();
+                        glm::mat3 const rot = glm::mat3( GfxRenderer->Camera_View_Matrix() );
+                        glm::vec3 const fwd = glm::transpose( rot ) * glm::vec3( 0.0f, 0.0f, -1.0f );
+                        glm::dvec3 dir{ fwd.x, 0.0, fwd.z };
+                        double const dl = glm::length( dir );
+                        ch.direction = ( dl > 1e-6 ) ? dir / dl : glm::dvec3{ 0.0, 0.0, -1.0 };
+                    }
+                    m_chains.push_back( ch );
+                    m_active_chain = (int)m_chains.size() - 1;
+                }
+
+                // append one element of the panel type/parameters and re-march
+                chain_element el;
+                el.type = ui()->track_type();
+                el.length = (double)ui()->track_length();
+                el.radius = ( el.type == track_panel::TRANSITION ) ? (double)ui()->track_radius_end() : (double)ui()->track_radius();
+                el.radius0 = (double)ui()->track_radius_start();
+                el.left = ui()->track_curve_left();
+                m_chains[ m_active_chain ].elements.push_back( el );
+                regenerate_chain( m_active_chain );
                 m_input.mouse.button(Button, Action);
                 return;
+            }
+
+            // niweleta editing: grabbing a chain joint (or a switch) starts a drag; on release
+            // the element parameters are re-fitted (type preserved) or the switch is moved
+            {
+                ImGuiIO const &io = ImGui::GetIO();
+                int pickchain, pickjoint;
+                if( pick_chain_joint( io.MousePos.x, io.MousePos.y, pickchain, pickjoint ) ) {
+                    m_dragactive = true;
+                    m_chaindrag_chain = pickchain;
+                    m_chaindrag_joint = pickjoint;
+                    m_switchdrag = nullptr;
+                    m_drag_from = m_chains[ pickchain ].joints[ pickjoint ];
+                    m_dragpos = m_drag_from;
+                    m_input.mouse.button(Button, Action);
+                    return;
+                }
+                TTrack *seed = nullptr; int seedend = -1;
+                glm::dvec3 point, outward;
+                if( pick_track_endpoint( io.MousePos.x, io.MousePos.y, true, seed, seedend, point, outward )
+                 && seed->SwitchExtension
+                 && m_switch_meta.find( seed ) != m_switch_meta.end() ) {
+                    // grabbing any switch point moves the whole switch (branch point)
+                    m_dragactive = true;
+                    m_switchdrag = seed;
+                    m_chaindrag_chain = -1;
+                    m_drag_from = glm::dvec3{ point.x, point.y - 0.18, point.z };
+                    m_dragpos = m_drag_from;
+                    m_input.mouse.button(Button, Action);
+                    return;
+                }
             }
 
             // delegate node picking behaviour depending on current panel mode

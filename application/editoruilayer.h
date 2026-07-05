@@ -42,7 +42,11 @@ class editor_ui : public ui_layer
 	int track_type() const;
 	float track_length() const;
 	float track_radius() const;
+	float track_radius_start() const;
+	float track_radius_end() const;
 	bool track_curve_left() const;
+	// one-shot: true when the user clicked "finish niweleta"; clears the flag
+	bool consume_track_finish();
 
   private:
 	// members

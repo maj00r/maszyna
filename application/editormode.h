@@ -9,6 +9,9 @@ http://mozilla.org/MPL/2.0/.
 
 #pragma once
 
+#include <unordered_map>
+#include <string>
+
 #include "application/applicationmode.h"
 #include "input/editormouseinput.h"
 #include "input/editorkeyboardinput.h"
@@ -105,10 +108,57 @@ class editor_mode : public application_mode
 	void apply_rotation_for_new_node(scene::basic_node *node, int rotation_mode, float fixed_rotation_value);
 	// track tool: create a track (type/params from the track panel) starting at a point, along a direction
 	void create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir);
+	// snaps start point+direction to the nearest existing track endpoint within reach (for connecting tracks)
+	bool snap_track_start(glm::dvec3 &start, glm::dvec3 &dir);
 	// builds a track node from bezier control offsets and commits it (create_track + select)
-	void commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length);
+	TTrack *commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length);
+	// builds a switch node (straight main path + diverging arc path sharing the entry point)
+	TTrack *commit_switch(glm::dvec3 const &entry, glm::dvec3 const &straightend, glm::dvec3 const &divcv1, glm::dvec3 const &divcv2, glm::dvec3 const &divend, double radius, double length);
+	// removes a track from the scene (cell + baked section geometry + path table + labels)
+	void delete_track(TTrack *track);
+
+	// --- rainsted-style endpoint editing: tracks are typed segments (straight/arc/transition),
+	// new tracks extend from an existing endpoint (incl. a switch's P4), and geometry is edited
+	// by moving endpoints; tracks sharing the moved point are re-fitted to keep continuity ---
+	// finds a track endpoint close to the given screen position
+	bool pick_track_endpoint(float screenx, float screeny, bool allowswitch, TTrack *&track, int &endindex, glm::dvec3 &point, glm::dvec3 &outward);
+
+	// --- niweleta: an ordered chain of typed elements (straight / arc / transition curve),
+	// marched from an origin+direction; tracks are the generated result layer (P1->P2 always
+	// follows the march, preserving track directionality). A switch is a branch point: new
+	// chains anchor at its outlets and re-march when the switch is moved. ---
+	struct chain_element {
+		int type { 0 };           // track_panel::track_type
+		double length { 50.0 };   // [m] element arc length
+		double radius { 300.0 };  // ARC radius / TRANSITION end radius (0 = straight)
+		double radius0 { 0.0 };   // TRANSITION start radius (0 = straight)
+		bool left { true };
+		TTrack *track { nullptr }; // generated result
+	};
+	struct track_chain {
+		glm::dvec3 origin { 0.0 };               // start point (node base level)
+		glm::dvec3 direction { 0.0, 0.0, -1.0 }; // unit start tangent
+		TTrack *anchor { nullptr };  // optional switch feeding this chain
+		int anchor_end { -1 };       // switch endpoint index (1 = main end, 3 = diverging end)
+		std::vector<chain_element> elements;
+		std::vector<glm::dvec3> joints; // cached: origin + each element end (railhead-free base points)
+		glm::dvec3 endtangent { 0.0, 0.0, -1.0 }; // cached march exit tangent (for branching / extending)
+	};
+	struct switch_meta { glm::dvec3 entry, straightend, divcv1, divcv2, divend; double radius, length; };
+	// marches one element from (pos, dir), optionally emitting the result track
+	TTrack *march_element(chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit);
+	// regenerates a chain: re-marches all elements from the (possibly anchored) origin
+	void regenerate_chain(int index);
+	// finds a chain joint close to the given screen position; joint 0 = chain origin
+	bool pick_chain_joint(float screenx, float screeny, int &chain, int &joint);
+	// lays a transition curve (clothoid) as a chain of short arc segments; curvature goes linearly
+	// from kappa_start to kappa_end (1/radius; 0 == straight)
+	void create_transition(glm::dvec3 const &start, glm::dvec3 const &tangent, double length, double kappa_start, double kappa_end, bool left);
 	// convenience: track ahead of the editor camera (hotkey)
 	void create_straight_track_ahead(double length = 50.0);
+	// world point where the cursor ray meets the ground plane (y=0); deterministic, unlike a
+	// geometry raycast, so track placement/snap doesn't depend on what's under the cursor
+	glm::dvec3 cursor_ground_point() const;
 	// members
 	state_backup m_statebackup; // helper, cached variables to be restored on mode exit
 	editormode_input m_input;
@@ -126,6 +176,20 @@ class editor_mode : public application_mode
 	double fTime50Hz{0.0}; // bufor czasu dla komunikacji z PoKeys
 	scene::basic_editor m_editor;
 	scene::basic_node *m_node{nullptr}; // currently selected scene node
+	// per-track editor labels (e.g. "KP 0->300", "Luk R=300"), shown by the track overlay
+	std::unordered_map<scene::basic_node const *, std::string> m_track_labels;
+	std::string m_pending_track_label; // label applied to the next track created by commit_track/commit_switch
+	// niweleta state
+	std::vector<track_chain> m_chains;
+	int m_active_chain { -1 }; // chain receiving new elements in place mode
+	std::unordered_map<TTrack *, switch_meta> m_switch_meta; // creation parameters of editor switches
+	// drag state: either a chain joint or a whole switch
+	bool m_dragactive { false };
+	int m_chaindrag_chain { -1 };
+	int m_chaindrag_joint { -1 };
+	TTrack *m_switchdrag { nullptr };
+	glm::dvec3 m_drag_from { 0.0 };
+	glm::dvec3 m_dragpos { 0.0 };
 	bool m_takesnapshot{true}; // helper, hints whether snapshot of selected node(s) should be taken before modification
 	bool m_dragging = false;
 	glm::dvec3 oldPos;
@@ -205,6 +269,8 @@ class editor_mode : public application_mode
 	// ImGuizmo-based transform gizmo for the selected node
 	enum class gizmo_operation { translate, rotate, scale };
 	void render_gizmo();
+	// draws the selected track's bezier control handles and a type/radius label as a 2D overlay
+	void render_track_overlay();
 	bool m_gizmo_enabled{true};                                  // master switch for the in-viewport gizmo
 	bool m_gizmo_using{false};                                   // tracks an ongoing drag, so a single undo snapshot is taken per drag
 	bool m_gizmo_local{false};                                   // manipulate in the object's local space instead of world space

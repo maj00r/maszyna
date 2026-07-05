@@ -476,6 +476,16 @@ basic_cell::erase( TMemCell *Memorycell ) {
         std::end( m_memorycells ) );
 }
 
+// removes provided path/track from the cell (editor track deletion)
+void
+basic_cell::erase( TTrack *Path ) {
+
+    m_paths.erase(
+        std::remove( std::begin( m_paths ), std::end( m_paths ), Path ),
+        std::end( m_paths ) );
+    // NOTE: the section owning this cell should rebuild its baked geometry afterwards
+}
+
 // registers provided path in the lookup directory of the cell
 void
 basic_cell::register_end( TTrack *Path ) {
@@ -967,6 +977,22 @@ basic_section::create_geometry() {
         m_geometrybank = GfxRenderer->Create_Bank();
     }
 
+    for( auto &shape : m_shapes ) {
+        shape.create_geometry( m_geometrybank );
+    }
+    for( auto &cell : m_cells ) {
+        cell.create_geometry( m_geometrybank );
+    }
+}
+
+// rebuilds the section's baked geometry into a fresh bank; used after a node (e.g. a track) is
+// removed in the editor, so its mesh no longer shows
+void
+basic_section::rebuild_geometry() {
+
+    if( false == m_geometrycreated ) { return; } // nothing baked yet; it will build lazily later
+
+    m_geometrybank = GfxRenderer->Create_Bank(); // fresh bank (previous one is discarded)
     for( auto &shape : m_shapes ) {
         shape.create_geometry( m_geometrybank );
     }

@@ -654,21 +654,27 @@ void track_panel::render()
 		ImGui::Combo("Typ toru", (int *)&type, types, IM_ARRAYSIZE(types));
 
 		ImGui::DragFloat("Dlugosc [m]", &length, 1.0f, 1.0f, 2000.0f, "%.1f");
-		if (type == ARC || type == TRANSITION)
+		if (type == TRANSITION)
+		{
+			ImGui::DragFloat("Promien poczatkowy [m] (0=prosta)", &radius_start, 1.0f, 0.0f, 5000.0f, "%.1f");
+			ImGui::DragFloat("Promien koncowy [m] (0=prosta)", &radius_end, 1.0f, 0.0f, 5000.0f, "%.1f");
+		}
+		else if (type != STRAIGHT)
 		{
 			ImGui::DragFloat("Promien [m]", &radius, 1.0f, 20.0f, 5000.0f, "%.1f");
+		}
+		if (type != STRAIGHT)
+		{
 			if (ImGui::RadioButton("w lewo", curve_left)) { curve_left = true; }
 			ImGui::SameLine();
 			if (ImGui::RadioButton("w prawo", !curve_left)) { curve_left = false; }
 		}
-		if (type == TRANSITION)
-		{
-			ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Krzywa przejsciowa: przyblizenie (bezier), nie pelna klotoida.");
-		}
 
 		ImGui::Separator();
 		ImGui::Checkbox("Stawiaj tor (klik w scenie)", &place_active);
-		ImGui::TextWrapped("Wlacz i kliknij w scenie w miejscu startu toru. Tor biegnie w kierunku patrzenia kamery.");
+		ImGui::SameLine();
+		if (ImGui::Button("Zakoncz niwelete")) { finish_chain = true; }
+		ImGui::TextWrapped("Klik przy koncu istniejacego toru (tez P4 rozjazdu) dokleja nowy odcinek stycznie. Klik w puste miejsce zaczyna nowy tor. Poza trybem stawiania: zlap koniec toru i przeciagnij - tor i sasiad dopasuja geometrie.");
 	}
 	ImGui::End();
 }

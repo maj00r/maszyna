@@ -114,9 +114,14 @@ class track_panel : public ui_panel
 	};
 	track_type type = STRAIGHT;
 	float length = 50.0f;   // [m]
-	float radius = 300.0f;  // [m], used by ARC/TRANSITION
-	bool curve_left = true; // ARC/TRANSITION curve direction
+	float radius = 300.0f;  // [m], used by ARC / SWITCH
+	// TRANSITION (clothoid): curvature changes linearly from 1/radius_start to 1/radius_end.
+	// a radius of 0 means "straight" (infinite radius, zero curvature) at that end.
+	float radius_start = 0.0f;   // [m], 0 = straight
+	float radius_end = 300.0f;   // [m], 0 = straight
+	bool curve_left = true; // ARC/TRANSITION/SWITCH curve direction
 	bool place_active = false; // when set, a left click in the scene lays a track
+	bool finish_chain = false; // one-shot: user asked to end the current niweleta
 
 	track_panel(std::string const &Name, bool const Isopen) : ui_panel(Name, Isopen) {}
 	void render() override;
