@@ -192,6 +192,9 @@ TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, g
         ErrorLog( "editor: failed to create track" );
         return nullptr;
     }
+    // wire the new track into the drivable network so trains can traverse it (and neighbours
+    // reconnect to it); without this the track is only visible, not routable
+    simulation::Region->connect_track( track );
     m_node = track;
     ui()->set_node( track );
     if( !m_pending_track_label.empty() ) { m_track_labels[track] = m_pending_track_label; }
@@ -348,6 +351,8 @@ TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &st
     ui()->set_node( track );
     if( !m_pending_track_label.empty() ) { m_track_labels[track] = m_pending_track_label; }
     m_switch_meta[ track ] = switch_meta{ entry, straightend, divcv1, divcv2, divend, radius, length };
+    // connect normal neighbours meeting the switch's outlets into the network
+    simulation::Region->connect_track( track );
     WriteLog( "editor: created switch \"" + name + "\"" );
     return track;
 }
@@ -360,6 +365,10 @@ void editor_mode::delete_track(TTrack *track)
     if( track == nullptr ) { return; }
     glm::dvec3 const loc = track->location();
     std::string const trackname = track->name();
+    // detach from the network first: clear neighbours' references so trains stop following it,
+    // and drop its endpoints from the path lookup so find_path no longer returns it
+    simulation::Region->disconnect_track( track );
+    simulation::Region->unregister( track );
     simulation::Region->erase( track );
     simulation::Region->section( loc ).rebuild_geometry();
     simulation::Paths.detach( trackname );

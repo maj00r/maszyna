@@ -142,6 +142,9 @@ public:
     // registers provided path in the lookup directory of the cell
     void
         register_end( TTrack *Path );
+    // removes provided path from the lookup directory of the cell (editor track deletion)
+    void
+        unregister_end( TTrack *Path );
     // registers provided traction piece in the lookup directory of the cell
     void
         register_end( TTraction *Traction );
@@ -311,6 +314,11 @@ public:
     void
         register_node( Type_ *Node, glm::dvec3 const &Point ) {
             cell( Point ).register_end( Node ); }
+    // removes provided node's end from the lookup directory of the section enclosing specified point
+    template <class Type_>
+    void
+        unregister_node( Type_ *Node, glm::dvec3 const &Point ) {
+            cell( Point ).unregister_end( Node ); }
     // find a vehicle located nearest to specified point, within specified radius. reurns: located vehicle and distance
     std::tuple<TDynamicObject *, float>
         find( glm::dvec3 const &Point, float const Radius, bool const Onlycontrolled, bool const Findbycoupler );
@@ -407,6 +415,15 @@ public:
     // legacy method, links specified path piece with potential neighbours
     void
         TrackJoin( TTrack *Track );
+    // editor: wires a newly created track into the drivable network, mirroring the load-time
+    // connection logic (handles neighbouring switches). A switch itself is passive: its normal
+    // neighbours are (re)connected to it instead.
+    void
+        connect_track( TTrack *Track );
+    // editor: detaches a track from its neighbours (clears their references) before deletion,
+    // so trains no longer follow it
+    void
+        disconnect_track( TTrack *Track );
     // legacy method, triggers radio-stop procedure for all vehicles in 2km radius around specified location
     void
         RadioStop( glm::dvec3 const &Location );
@@ -434,6 +451,13 @@ public:
             for( auto const &point : Node->endpoints() ) {
                 if( point_inside( point ) ) {
                     section( point ).register_node( Node, point ); } } }
+    // removes provided node's ends from the lookup directory (editor node deletion)
+    template <class Type_>
+    void
+        unregister( Type_ *Node ) {
+            for( auto const &point : Node->endpoints() ) {
+                if( point_inside( point ) ) {
+                    section( point ).unregister_node( Node, point ); } } }
     // removes specified node from the region
     template <class Type_>
     void

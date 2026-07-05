@@ -499,6 +499,15 @@ basic_cell::register_end( TTrack *Path ) {
         std::end( m_directories.paths ) );
 }
 
+// removes provided path from the lookup directory of the cell (editor track deletion)
+void
+basic_cell::unregister_end( TTrack *Path ) {
+
+    m_directories.paths.erase(
+        std::remove( std::begin( m_directories.paths ), std::end( m_directories.paths ), Path ),
+        std::end( m_directories.paths ) );
+}
+
 // registers provided traction piece in the lookup directory of the cell
 void
 basic_cell::register_end( TTraction *Traction ) {
@@ -1271,6 +1280,76 @@ basic_region::TrackJoin( TTrack *Track ) {
                 Track->ConnectNextNext( matchingtrack, 1 );
                 break;
         }
+    }
+}
+
+// connects a single normal track's free ends to matching neighbours, replicating the load-time
+// connection logic (see scenery init in world/Track.cpp). handles neighbouring switches (codes 2-5).
+static void
+connect_normal_ends( basic_region *Region, TTrack *track ) {
+    TTrack *matchingtrack;
+    int connection;
+    if( track->CurrentPrev() == nullptr ) {
+        std::tie( matchingtrack, connection ) = Region->find_path( track->CurrentSegment()->FastGetPoint_0(), track );
+        switch( connection ) {
+            case 0: track->ConnectPrevPrev( matchingtrack, 0 ); break;
+            case 1: track->ConnectPrevNext( matchingtrack, 1 ); break;
+            case 2: track->ConnectPrevPrev( matchingtrack, 0 ); matchingtrack->SetConnections( 0 ); break;
+            case 3: track->ConnectPrevNext( matchingtrack, 1 ); matchingtrack->SetConnections( 0 ); break;
+            case 4: matchingtrack->Switch( 1 ); track->ConnectPrevPrev( matchingtrack, 2 ); matchingtrack->SetConnections( 1 ); matchingtrack->Switch( 0 ); break;
+            case 5: matchingtrack->Switch( 1 ); track->ConnectPrevNext( matchingtrack, 3 ); matchingtrack->SetConnections( 1 ); matchingtrack->Switch( 0 ); break;
+            default: break;
+        }
+    }
+    if( track->CurrentNext() == nullptr ) {
+        std::tie( matchingtrack, connection ) = Region->find_path( track->CurrentSegment()->FastGetPoint_1(), track );
+        switch( connection ) {
+            case 0: track->ConnectNextPrev( matchingtrack, 0 ); break;
+            case 1: track->ConnectNextNext( matchingtrack, 1 ); break;
+            case 2: track->ConnectNextPrev( matchingtrack, 0 ); matchingtrack->SetConnections( 0 ); break;
+            case 3: track->ConnectNextNext( matchingtrack, 1 ); matchingtrack->SetConnections( 0 ); break;
+            case 4: matchingtrack->Switch( 1 ); track->ConnectNextPrev( matchingtrack, 2 ); matchingtrack->SetConnections( 1 ); break;
+            case 5: matchingtrack->Switch( 1 ); track->ConnectNextNext( matchingtrack, 3 ); matchingtrack->SetConnections( 1 ); break;
+            default: break;
+        }
+    }
+}
+
+// editor: wires a newly created track into the drivable network
+void
+basic_region::connect_track( TTrack *Track ) {
+    if( Track == nullptr ) { return; }
+    if( Track->eType == tt_Switch ) {
+        // a switch is passive: only its normal neighbours connect to it. (re)connect any normal
+        // track meeting one of the switch's endpoints
+        for( auto const &point : Track->endpoints() ) {
+            TTrack *neighbour;
+            int id;
+            std::tie( neighbour, id ) = find_path( point, Track );
+            if( neighbour != nullptr && neighbour->eType == tt_Normal ) {
+                connect_normal_ends( this, neighbour );
+            }
+        }
+        return;
+    }
+    connect_normal_ends( this, Track );
+}
+
+// editor: detaches a track from its neighbours before deletion
+void
+basic_region::disconnect_track( TTrack *Track ) {
+    if( Track == nullptr ) { return; }
+    // collect every track that may hold a reference to this one
+    std::vector<TTrack *> neighbours { Track->CurrentPrev(), Track->CurrentNext() };
+    if( Track->SwitchExtension ) {
+        neighbours.push_back( Track->SwitchExtension->pNexts[ 0 ] );
+        neighbours.push_back( Track->SwitchExtension->pNexts[ 1 ] );
+        neighbours.push_back( Track->SwitchExtension->pPrevs[ 0 ] );
+        neighbours.push_back( Track->SwitchExtension->pPrevs[ 1 ] );
+    }
+    for( auto *neighbour : neighbours ) {
+        if( neighbour == nullptr || neighbour == Track ) { continue; }
+        neighbour->detach( Track ); // clears the neighbour's live + switch-array references to Track
     }
 }
 

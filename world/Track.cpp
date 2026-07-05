@@ -1759,6 +1759,19 @@ void TTrack::RenderDynSounds()
     }
 };
 //---------------------------------------------------------------------------
+void TTrack::detach(TTrack *Other)
+{ // editor: usunięcie wszelkich odwołań tego toru do Other (kasowany sąsiad)
+    if( Other == nullptr ) { return; }
+    if( trNext == Other ) { trNext = nullptr; }
+    if( trPrev == Other ) { trPrev = nullptr; }
+    if( SwitchExtension ) {
+        for( int i = 0; i < 2; ++i ) {
+            if( SwitchExtension->pNexts[ i ] == Other ) { SwitchExtension->pNexts[ i ] = nullptr; }
+            if( SwitchExtension->pPrevs[ i ] == Other ) { SwitchExtension->pPrevs[ i ] = nullptr; }
+        }
+    }
+}
+
 bool TTrack::SetConnections(int i)
 { // przepisanie aktualnych połączeń toru do odpowiedniego segmentu
     if (SwitchExtension)
