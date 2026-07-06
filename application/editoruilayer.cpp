@@ -38,6 +38,11 @@ float editor_ui::track_radius_start() const { return m_trackpanel.radius_start; 
 float editor_ui::track_radius_end() const { return m_trackpanel.radius_end; }
 bool editor_ui::track_curve_left() const { return m_trackpanel.curve_left; }
 int editor_ui::track_cuts() const { return m_trackpanel.cuts; }
+float editor_ui::track_cant() const { return m_trackpanel.cant; }
+bool editor_ui::consume_track_apply_cant() { bool const v = m_trackpanel.apply_cant; m_trackpanel.apply_cant = false; return v; }
+bool editor_ui::consume_track_apply_geometry() { bool const v = m_trackpanel.apply_geometry; m_trackpanel.apply_geometry = false; return v; }
+bool editor_ui::track_diag() const { return m_trackpanel.diag; }
+bool editor_ui::consume_track_dump() { bool const v = m_trackpanel.dump; m_trackpanel.dump = false; return v; }
 
 // updates state of UI elements
 void editor_ui::update()

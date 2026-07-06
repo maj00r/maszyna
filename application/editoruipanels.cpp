@@ -682,6 +682,19 @@ void track_panel::render()
 		ImGui::Separator();
 		if (ImGui::Button("Zapisz niwelete + scene")) { save_alignments = true; }
 		ImGui::TextWrapped("Zapisuje szczegoly niwelety do pliku obok scenerii (.niw) oraz eksportuje scene z torami. Niweleta wczytuje sie z powrotem przy wejsciu do edytora.");
+		ImGui::Separator();
+		ImGui::DragFloat("Przechylka [mm]", &cant, 1.0f, -200.0f, 200.0f, "%.0f");
+		if (ImGui::Button("Ustaw przechylke na zaznaczonym torze")) { apply_cant = true; }
+		if (ImGui::Button("Ustaw geometrie (dlugosc/promienie) na zaznaczonym"))
+		{
+			apply_geometry = true;
+		}
+		ImGui::TextWrapped("Zaznacz istniejacy tor niwelety, wpisz mm i kliknij: ten tor dostaje stala przechylke, a sasiednie tory rampuja do niej. Na styku nigdy nie ma skoku przechylki (wspolna wartosc w wezle).");
+		ImGui::Separator();
+		ImGui::Checkbox("Diagnostyka niwelety", &diag);
+		ImGui::SameLine();
+		if (ImGui::Button("Zrzut do logu")) { dump = true; }
+		ImGui::TextWrapped("Diagnostyka: na kazdym styku kat nieciaglosci stycznej (zielony<0.5st, zolty<2st, czerwony wiecej), przerwy miedzy elementami i rozjazd model-tor, typ i parametry elementu, liczba podpietych torow.");
 	}
 	ImGui::End();
 }

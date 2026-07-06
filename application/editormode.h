@@ -110,8 +110,9 @@ class editor_mode : public application_mode
 	void create_track_at(glm::dvec3 const &start, glm::dvec3 const &dir);
 	// snaps start point+direction to the nearest existing track endpoint within reach (for connecting tracks)
 	bool snap_track_start(glm::dvec3 &start, glm::dvec3 &dir);
-	// builds a track node from bezier control offsets and commits it (create_track + select)
-	TTrack *commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length);
+	// builds a track node from bezier control offsets and commits it (create_track + select).
+	// roll1/roll2 are the superelevation angles [deg] at p1/p2 (written into the node's roll fields)
+	TTrack *commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length, double roll1 = 0.0, double roll2 = 0.0);
 	// builds a switch node (straight main path + diverging arc path sharing the entry point)
 	TTrack *commit_switch(glm::dvec3 const &entry, glm::dvec3 const &straightend, glm::dvec3 const &divcv1, glm::dvec3 const &divcv2, glm::dvec3 const &divend, double radius, double length);
 	// removes a track from the scene (cell + baked section geometry + path table + labels)
@@ -144,12 +145,19 @@ class editor_mode : public application_mode
 		int anchor_end { -1 };       // switch endpoint index (1 = main end, 3 = diverging end)
 		std::vector<chain_element> elements;
 		std::vector<glm::dvec3> joints; // cached: origin + each element end (railhead-free base points)
+		// superelevation [mm] at each joint (signed; same size as joints). elements interpolate
+		// between their two joint values, so cant is continuous across junctions by construction
+		std::vector<double> joint_cant;
 		glm::dvec3 endtangent { 0.0, 0.0, -1.0 }; // cached march exit tangent (for branching / extending)
 	};
 	struct switch_meta { glm::dvec3 entry, straightend, divcv1, divcv2, divend; double radius, length; };
 	// marches one element from (pos, dir), optionally emitting the result track; namebase (when
-	// emitting) makes the generated track names deterministic so they can be re-linked after a reload
-	TTrack *march_element(chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase = "");
+	// emitting) makes the generated track names deterministic so they can be re-linked after a reload.
+	// cant_start/cant_end [mm] bank the emitted track (ramped linearly along the element)
+	TTrack *march_element(chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase = "", double cant_start = 0.0, double cant_end = 0.0);
+	// sets the cant [mm] of the niweleta element owning the given track and regenerates its chain.
+	// returns false if the track isn't part of any chain
+	bool set_track_cant(TTrack *track, double cant_mm);
 	// regenerates a chain: re-marches all elements from the (possibly anchored) origin
 	void regenerate_chain(int index);
 	// path of the niweleta sidecar file (<scenery>.niw next to the scenery)
@@ -159,8 +167,35 @@ class editor_mode : public application_mode
 	// reads the sidecar and rebuilds the editable chains, re-linking to the already-loaded tracks
 	// by name (marches with emit=false to rebuild joints, so no duplicate tracks are created)
 	void load_alignments();
-	// finds a chain joint close to the given screen position; joint 0 = chain origin
+	// finds a chain joint close to the given screen position; joint 0 = chain origin.
+	// only draggable joints match: a free origin or the far end of a STRAIGHT element (curves
+	// - arcs and transition curves - are never dragged directly)
 	bool pick_chain_joint(float screenx, float screeny, int &chain, int &joint);
+	// writes a full diagnostic dump of every niweleta chain (elements, joints, tangent continuity,
+	// gaps, track link status) to the log
+	void dump_alignment_diag();
+	// fits a curve group (arc + optional transition curves, elements [gfirst..glast]) between two
+	// fixed straight lines (P1,d1) and (P2,d2), keeping every KP's length/radii and the arc radius:
+	// only the arc sweep varies (= turn between the lines minus the fixed KP spiral angles). Solves
+	// the group's placement so its start lands on line1 and its end on line2; outputs those points.
+	// returns false if the group can't fit (lines near-parallel, or radii too large for the turn).
+	bool fit_group_between_lines(int chain, int gfirst, int glast,
+		glm::dvec3 const &P1, glm::dvec3 const &d1, glm::dvec3 const &P2, glm::dvec3 const &d2,
+		glm::dvec3 &groupstart, glm::dvec3 &groupend);
+	// drags a STRAIGHT element to follow the cursor: the straight rotates about its (fixed) start,
+	// and the curve groups on each side re-fit against the unchanged neighbour straight lines, so
+	// neighbours only change length - they never move. Curves keep KP length/radii and arc radius.
+	// returns false if the fit is infeasible (lines near-parallel, turn too small for the transition
+	// curves so the arc sweep would be negative, or a straight would overlap into negative length).
+	bool fit_straight_drag(int chain, int element, glm::dvec3 const &target);
+	// applies the current chain-joint drag to reach target: restores the pre-drag snapshot first, so
+	// the fit is always relative to the original geometry. preview=true only re-marches the joint
+	// cache (cheap, live per frame - no track baking); preview=false regenerates the real tracks.
+	// returns false if the fit was infeasible (see fit_straight_drag).
+	bool apply_chain_drag(glm::dvec3 const &target, bool preview);
+	// applies the track panel's geometry fields (length / radius / radius_start-end) to the niweleta
+	// element owning the given track, then regenerates. returns false if not part of a chain
+	bool set_track_geometry(TTrack *track);
 	// lays a transition curve (clothoid) as a chain of short arc segments; curvature goes linearly
 	// from kappa_start to kappa_end (1/radius; 0 == straight)
 	void create_transition(glm::dvec3 const &start, glm::dvec3 const &tangent, double length, double kappa_start, double kappa_end, bool left);
@@ -202,6 +237,14 @@ class editor_mode : public application_mode
 	TTrack *m_switchdrag { nullptr };
 	glm::dvec3 m_drag_from { 0.0 };
 	glm::dvec3 m_dragpos { 0.0 };
+	glm::dvec3 m_dragapplied { 0.0 };  // cursor position at which the live fit was last applied
+	glm::dvec3 m_draglastgood { 0.0 }; // last cursor position where the fit was feasible (drag holds here)
+	bool m_dragfeasible { true };      // false while the cursor is in an infeasible region (shows a warning)
+	// snapshot of the dragged chain's element params (taken at drag start) so a live drag always
+	// fits relative to the original geometry, not the already-moved result. .tracks left empty.
+	std::vector<chain_element> m_dragsnap;
+	glm::dvec3 m_dragsnap_origin { 0.0 };
+	glm::dvec3 m_dragsnap_dir { 0.0, 0.0, -1.0 };
 	bool m_takesnapshot{true}; // helper, hints whether snapshot of selected node(s) should be taken before modification
 	bool m_dragging = false;
 	glm::dvec3 oldPos;

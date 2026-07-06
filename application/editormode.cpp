@@ -170,7 +170,7 @@ void editor_mode::apply_rotation_for_new_node(scene::basic_node *node, int rotat
     }
 }
 
-TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length)
+TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, glm::dvec3 const &cv2, glm::dvec3 const &p2, double radius, double length, double roll1, double roll2)
 {
     static int counter = 0;
     // a niweleta march sets m_pending_track_name for a stable, reload-linkable name; otherwise auto
@@ -185,10 +185,10 @@ TTrack *editor_mode::commit_track(glm::dvec3 const &p1, glm::dvec3 const &cv1, g
     src << std::fixed << std::setprecision(3)
         << "node -1 0 " << name << " track normal " << length
         << " 1.435 0.25 20.0 20 0 flat vis Rail_screw_used1 4.0 TpBpS-new2 0.2 0.5 1.1\n"
-        << p1.x << ' ' << p1.y << ' ' << p1.z << " 0.0\n"
+        << p1.x << ' ' << p1.y << ' ' << p1.z << ' ' << roll1 << '\n'
         << cv1.x << ' ' << cv1.y << ' ' << cv1.z << '\n'
         << cv2.x << ' ' << cv2.y << ' ' << cv2.z << '\n'
-        << p2.x << ' ' << p2.y << ' ' << p2.z << " 0.0\n"
+        << p2.x << ' ' << p2.y << ' ' << p2.z << ' ' << roll2 << '\n'
         << radius << '\n'
         << "endtrack\n";
 
@@ -334,7 +334,7 @@ TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &st
         << "node -1 0 " << name << " track switch 34.0"
         // normal ballast profile width (texwidth/slope): a standalone switch has no connected track
         // to take the profile from, so it uses its own fTexWidth/fTexSlope - keep them track-sized
-        << " 1.435 0.24 15.0 20 2 flat vis Rail_screw_used1 4.0 TpBpS-new2 0.2 0.5 1.1\n"
+        << " 1.435 0.24 15.0 20 2 flat vis Rail_screw_used1 4.0 Rail_screw_used1 0.2 0.5 1.1\n"
         << entry.x << ' ' << entry.y << ' ' << entry.z << " 0.0\n"
         << "0.0 0.0 0.0\n"
         << "0.0 0.0 0.0\n"
@@ -345,9 +345,6 @@ TTrack *editor_mode::commit_switch(glm::dvec3 const &entry, glm::dvec3 const &st
         << divcv2.x << ' ' << divcv2.y << ' ' << divcv2.z << '\n'
         << divend.x << ' ' << divend.y << ' ' << divend.z << " 0.0\n"
         << radius << '\n'
-        // explicit trackbed material so the auto-generated switch ballast renders even for a
-        // standalone switch (no connected track to copy the ballast texture from)
-        << "trackbed TpBpS-new2\n"
         << "endtrack\n";
 
     TTrack *track = simulation::State.create_track( src.str(), name );
@@ -440,12 +437,15 @@ bool editor_mode::pick_track_endpoint(float screenx, float screeny, bool allowsw
 
 // marches a single chain element from (pos, dir); optionally emits the result track
 // (P1 = element start, P2 = element end: track directionality always follows the march)
-TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase )
+TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dvec3 &dir, bool emit, std::string const &namebase, double cant_start, double cant_end )
 {
     auto const rotY = []( glm::dvec3 const &v, double a ) {
         double const c = std::cos( a ), s = std::sin( a );
         return glm::dvec3{ v.x * c + v.z * s, v.y, -v.x * s + v.z * c };
     };
+    // joint cant [mm] (already signed) -> roll angle [deg]; shared joint values give continuity
+    double const roll_start = glm::degrees( std::atan2( cant_start, 1435.0 ) );
+    double const roll_end = glm::degrees( std::atan2( cant_end, 1435.0 ) );
     TTrack *made = nullptr;
     std::ostringstream lbl;
     lbl << std::fixed << std::setprecision( 0 );
@@ -461,7 +461,10 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
                 plbl << std::fixed << std::setprecision( 0 ) << "Prosty L=" << step;
                 m_pending_track_label = plbl.str();
                 if( !namebase.empty() ) { m_pending_track_name = namebase + "p" + std::to_string( i ); }
-                made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, step );
+                // ramp cant across the pieces so a cut straight still banks smoothly
+                double const r0 = roll_start + ( roll_end - roll_start ) * ( (double)i / pieces );
+                double const r1 = roll_start + ( roll_end - roll_start ) * ( (double)( i + 1 ) / pieces );
+                made = commit_track( pos, glm::dvec3{ 0.0 }, glm::dvec3{ 0.0 }, end, 0.0, step, r0, r1 );
                 if( made != nullptr ) { el.tracks.push_back( made ); }
             }
             pos = end;
@@ -480,7 +483,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
             lbl << "Luk R=" << R << " L=" << el.length;
             m_pending_track_label = lbl.str();
             if( !namebase.empty() ) { m_pending_track_name = namebase + "p0"; }
-            made = commit_track( pos, dir * h, -Tend * h, end, R, el.length );
+            made = commit_track( pos, dir * h, -Tend * h, end, R, el.length, roll_start, roll_end );
             if( made != nullptr ) { el.tracks.push_back( made ); }
         }
         pos = end;
@@ -512,7 +515,7 @@ TTrack *editor_mode::march_element( chain_element &el, glm::dvec3 &pos, glm::dve
             lbl << "KP " << el.radius0 << "->" << el.radius << " L=" << el.length;
             m_pending_track_label = lbl.str();
             if( !namebase.empty() ) { m_pending_track_name = namebase + "p0"; }
-            made = commit_track( pos, dir * h, -idir * h, ipos, rmesh, el.length );
+            made = commit_track( pos, dir * h, -idir * h, ipos, rmesh, el.length, roll_start, roll_end );
             if( made != nullptr ) { el.tracks.push_back( made ); }
         }
         pos = ipos;
@@ -550,17 +553,44 @@ void editor_mode::regenerate_chain(int index)
     }
     ch.joints.clear();
 
+    // cant is stored per joint (elements+1 values); keep existing values, size to the joint count
+    ch.joint_cant.resize( ch.elements.size() + 1, 0.0 );
+
     glm::dvec3 pos = ch.origin;
     glm::dvec3 dir = hnorm( ch.direction );
     ch.joints.push_back( pos );
     for( size_t e = 0; e < ch.elements.size(); ++e ) {
         // stable, reload-linkable base name: _niw_<chainid>_<elementindex>_
         std::string const namebase = "_niw_" + std::to_string( ch.id ) + "_" + std::to_string( e ) + "_";
-        march_element( ch.elements[ e ], pos, dir, true, namebase );
+        // element interpolates cant between its two joint values -> continuous across junctions
+        march_element( ch.elements[ e ], pos, dir, true, namebase, ch.joint_cant[ e ], ch.joint_cant[ e + 1 ] );
         ch.joints.push_back( pos );
     }
     ch.endtangent = dir;
     m_pending_track_label.clear();
+}
+
+// sets the cant [mm] of the niweleta element owning the given track: both of the element's joints
+// get the (direction-signed) value, so the selected track is constant-cant and its neighbours ramp
+// to meet it - junctions never step because adjacent elements share a joint value
+bool editor_mode::set_track_cant(TTrack *track, double cant_mm)
+{
+    if( track == nullptr ) { return false; }
+    for( size_t c = 0; c < m_chains.size(); ++c ) {
+        auto &ch = m_chains[ c ];
+        ch.joint_cant.resize( ch.elements.size() + 1, 0.0 );
+        for( size_t e = 0; e < ch.elements.size(); ++e ) {
+            auto &el = ch.elements[ e ];
+            if( std::find( el.tracks.begin(), el.tracks.end(), track ) != el.tracks.end() ) {
+                double const signed_cant = cant_mm * ( el.left ? 1.0 : -1.0 ); // bank into the curve
+                ch.joint_cant[ e ] = signed_cant;
+                ch.joint_cant[ e + 1 ] = signed_cant;
+                regenerate_chain( (int)c );
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // path of the niweleta sidecar (<scenery>.niw next to the scenery file)
@@ -618,6 +648,12 @@ void editor_mode::save_alignments()
                 << ' ' << el.length << ' ' << el.radius << ' ' << el.radius0
                 << ' ' << ( el.left ? 1 : 0 ) << ' ' << el.cuts << "\n";
         }
+        // per-joint cant [mm] (elements+1 values); continuous by construction
+        if( !ch.joint_cant.empty() ) {
+            out << "cant";
+            for( double const c : ch.joint_cant ) { out << ' ' << c; }
+            out << "\n";
+        }
         out << "endchain\n";
     }
     WriteLog( "editor: saved niweleta \"" + path + "\" (" + std::to_string( m_chains.size() ) + " chains)" );
@@ -666,6 +702,11 @@ void editor_mode::load_alignments()
             ls >> el.type >> el.length >> el.radius >> el.radius0 >> left >> el.cuts;
             el.left = ( left != 0 );
             current.elements.push_back( el );
+        }
+        else if( tok == "cant" ) {
+            current.joint_cant.clear();
+            double c;
+            while( ls >> c ) { current.joint_cant.push_back( c ); }
         }
         else if( tok == "endchain" ) {
             if( inchain ) { m_chains.push_back( current ); }
@@ -732,8 +773,12 @@ bool editor_mode::pick_chain_joint(float screenx, float screeny, int &chain, int
     for( size_t c = 0; c < m_chains.size(); ++c ) {
         auto const &ch = m_chains[ c ];
         for( size_t j = 0; j < ch.joints.size(); ++j ) {
-            if( j == 0 && ch.anchor != nullptr ) { continue; } // anchored origin is owned by the switch
-            if( j > 0 && ch.elements[ j - 1 ].type == track_panel::TRANSITION ) { continue; } // KP locked
+            // only straights are draggable: a free origin, or the far end of a STRAIGHT element.
+            // arc- and transition-curve joints are locked (curves re-fit, they aren't dragged)
+            bool draggable;
+            if( j == 0 ) { draggable = ( ch.anchor == nullptr ); }
+            else         { draggable = ( ch.elements[ j - 1 ].type == track_panel::STRAIGHT ); }
+            if( !draggable ) { continue; }
             glm::vec4 const clip = projection * view * glm::vec4( glm::vec3( ch.joints[ j ] - camerapos ), 1.0f );
             if( clip.w <= 1e-4f ) { continue; }
             glm::vec2 const ndc = glm::vec2( clip ) / clip.w;
@@ -748,6 +793,266 @@ bool editor_mode::pick_chain_joint(float screenx, float screeny, int &chain, int
         }
     }
     return chain != -1;
+}
+
+// writes a full diagnostic dump of every chain to the log: elements, joints, per-joint tangent
+// continuity and gaps, and whether each element's generated tracks are linked
+void editor_mode::dump_alignment_diag()
+{
+    auto const hnorm = []( glm::dvec3 v ) {
+        v.y = 0.0; double const l = glm::length( v );
+        return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+    };
+    char const *typenames[] = { "Prosty", "Luk", "KP", "Rozjazd" };
+    WriteLog( "=== niweleta diag: " + std::to_string( m_chains.size() ) + " chain(s) ===" );
+    char buf[ 256 ];
+    for( size_t c = 0; c < m_chains.size(); ++c ) {
+        auto &ch = m_chains[ c ];
+        std::snprintf( buf, sizeof( buf ), "chain %zu id=%d elements=%zu anchor=%s origin=[%.2f %.2f %.2f] dir=[%.3f %.3f]",
+            c, ch.id, ch.elements.size(), ch.anchor ? ch.anchor->name().c_str() : "-",
+            ch.origin.x, ch.origin.y, ch.origin.z, ch.direction.x, ch.direction.z );
+        WriteLog( buf );
+        // re-march capturing tangents/points
+        struct estate { glm::dvec3 pstart, pend, din, dout; };
+        std::vector<estate> es;
+        glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
+        if( ch.anchor != nullptr && !ch.joints.empty() ) { pos = ch.joints.front(); }
+        for( size_t e = 0; e < ch.elements.size(); ++e ) {
+            estate st; st.pstart = pos; st.din = dir;
+            march_element( ch.elements[ e ], pos, dir, false );
+            st.pend = pos; st.dout = dir;
+            es.push_back( st );
+        }
+        for( size_t e = 0; e < ch.elements.size(); ++e ) {
+            auto const &el = ch.elements[ e ];
+            char const *tn = ( el.type >= 0 && el.type < 4 ) ? typenames[ el.type ] : "?";
+            int const linked = (int)el.tracks.size();
+            bool const missing = std::any_of( el.tracks.begin(), el.tracks.end(), []( TTrack *t ){ return t == nullptr; } );
+            double contin = 0.0, gap = 0.0;
+            if( e > 0 ) {
+                double const d = std::clamp( glm::dot( hnorm( es[ e - 1 ].dout ), hnorm( es[ e ].din ) ), -1.0, 1.0 );
+                contin = glm::degrees( std::acos( d ) );
+                gap = glm::length( glm::dvec3{ es[ e ].pstart.x - es[ e - 1 ].pend.x, 0.0, es[ e ].pstart.z - es[ e - 1 ].pend.z } );
+            }
+            std::snprintf( buf, sizeof( buf ),
+                "  #%zu %s L=%.2f R=%.1f R0=%.1f %s cant[%.0f,%.0f] tracks=%d%s  joint%zu: dTangent=%.3f deg gap=%.4f",
+                e, tn, el.length, el.radius, el.radius0, el.left ? "L" : "P",
+                ch.joint_cant.size() > e ? ch.joint_cant[ e ] : 0.0, ch.joint_cant.size() > e + 1 ? ch.joint_cant[ e + 1 ] : 0.0,
+                linked, missing ? "(MISSING!)" : "", e, contin, gap );
+            WriteLog( buf );
+        }
+    }
+    WriteLog( "=== end niweleta diag ===" );
+}
+
+// fits a curve group [gfirst..glast] between two fixed straight lines, keeping KP length/radii and
+// the arc radius; only the arc sweep varies. See header for the contract.
+bool editor_mode::fit_group_between_lines(int chain, int gfirst, int glast,
+    glm::dvec3 const &P1, glm::dvec3 const &d1in, glm::dvec3 const &P2, glm::dvec3 const &d2in,
+    glm::dvec3 &groupstart, glm::dvec3 &groupend)
+{
+    auto const hnorm = []( glm::dvec3 v ) { v.y = 0.0; double const l = glm::length( v ); return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 }; };
+    auto const cross2 = []( glm::dvec3 const &a, glm::dvec3 const &b ) { return a.x * b.z - a.z * b.x; };
+    glm::dvec3 const d1 = hnorm( d1in );
+    glm::dvec3 const d2 = hnorm( d2in );
+    double const denom = cross2( d1, d2 );
+
+    // empty group: the two straights meet directly -> group start = end = their line intersection
+    if( gfirst > glast ) {
+        if( std::abs( denom ) < 1e-9 ) { return false; } // parallel, no corner
+        double const a = -cross2( P1 - P2, d2 ) / denom;
+        groupstart = groupend = P1 + d1 * a;
+        return true;
+    }
+
+    auto &ch = m_chains[ chain ];
+    double const turn = std::atan2( cross2( d1, d2 ), glm::dot( d1, d2 ) ); // desired signed turn d1->d2
+
+    // fixed spiral angle contributed by the transition curves (magnitude is independent of direction)
+    double kpsum = 0.0;
+    for( int e = gfirst; e <= glast; ++e ) {
+        if( ch.elements[ e ].type != track_panel::TRANSITION ) { continue; }
+        glm::dvec3 p{ 0.0 }, d{ 0.0, 0.0, -1.0 };
+        march_element( ch.elements[ e ], p, d, false );
+        kpsum += std::abs( std::atan2( d.x, -d.z ) - std::atan2( -0.0, 1.0 ) );
+    }
+    double const arcsweep = std::abs( turn ) - kpsum;
+    if( arcsweep < 1e-4 ) { return false; } // radii too large for this turn: can't fit
+
+    // apply: direction of every curve element follows the turn; the arc absorbs the residual sweep
+    bool left = ( turn > 0.0 );
+    chain_element *arc = nullptr;
+    auto apply = [&]() {
+        for( int e = gfirst; e <= glast; ++e ) {
+            ch.elements[ e ].left = left;
+            if( ch.elements[ e ].type == track_panel::ARC ) { arc = &ch.elements[ e ]; }
+        }
+        if( arc != nullptr ) { arc->length = std::max( 1.0, std::max( 1.0, arc->radius ) * arcsweep ); }
+    };
+    apply();
+    if( arc == nullptr ) { return false; } // a fittable group needs exactly one arc
+
+    // probe-march the whole group to get its net turn and end offset; flip direction if the sign is wrong
+    auto probe = [&]( glm::dvec3 &V, double &net ) {
+        glm::dvec3 p{ 0.0 }, d = d1;
+        for( int e = gfirst; e <= glast; ++e ) { march_element( ch.elements[ e ], p, d, false ); }
+        V = p; net = std::atan2( cross2( d1, d ), glm::dot( d1, d ) );
+    };
+    glm::dvec3 V; double net;
+    probe( V, net );
+    if( std::abs( turn ) > 1e-3 && ( net > 0.0 ) != ( turn > 0.0 ) ) {
+        left = !left; arc = nullptr; apply(); probe( V, net );
+    }
+
+    // place the group: start S on line1, end E = S + V on line2
+    if( std::abs( denom ) < 1e-9 ) { return false; }
+    glm::dvec3 const W = P1 + V - P2;
+    double const a = -cross2( W, d2 ) / denom;
+    groupstart = P1 + d1 * a;
+    groupend = groupstart + V;
+    return true;
+}
+
+// drags a STRAIGHT element: it rotates about its (fixed) pre-edit start, and the curve groups on
+// each side re-fit against the unchanged neighbour straight lines (neighbours only change length).
+bool editor_mode::fit_straight_drag(int chain, int k, glm::dvec3 const &target)
+{
+    double const minlen = 0.5; // [m] below this a straight is considered overlapping -> infeasible
+    auto const hnorm = []( glm::dvec3 v ) { v.y = 0.0; double const l = glm::length( v ); return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 }; };
+    if( chain < 0 || chain >= (int)m_chains.size() ) { return false; }
+    auto &ch = m_chains[ chain ];
+    int const n = (int)ch.elements.size();
+    if( k < 0 || k >= n || ch.elements[ k ].type != track_panel::STRAIGHT ) { return false; }
+
+    // capture pre-edit boundary state (point + direction) at every joint by re-marching
+    std::vector<glm::dvec3> bp( n + 1 ), bd( n + 1 );
+    glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
+    if( ch.anchor != nullptr && !ch.joints.empty() ) { pos = ch.joints.front(); }
+    bp[ 0 ] = pos; bd[ 0 ] = dir;
+    for( int e = 0; e < n; ++e ) { march_element( ch.elements[ e ], pos, dir, false ); bp[ e + 1 ] = pos; bd[ e + 1 ] = dir; }
+
+    glm::dvec3 const A0 = bp[ k ];                       // fixed pivot: pre-edit start of the dragged straight
+    glm::dvec3 const dk = hnorm( target - A0 );          // its new direction (line through A0 and the cursor)
+
+    // neighbours across the curve groups
+    int prevS = -1; for( int e = k - 1; e >= 0; --e ) { if( ch.elements[ e ].type == track_panel::STRAIGHT ) { prevS = e; break; } }
+    int nextS = -1; for( int e = k + 1; e < n; ++e ) { if( ch.elements[ e ].type == track_panel::STRAIGHT ) { nextS = e; break; } }
+
+    glm::dvec3 kstart = A0; // start of the dragged straight after the previous-side fit
+    bool feasible = true;
+
+    // --- previous side ---
+    if( prevS >= 0 ) {
+        glm::dvec3 const Pp = bp[ prevS ];               // fixed start of the previous straight
+        glm::dvec3 const dp = hnorm( bd[ prevS + 1 ] );  // its (fixed) direction
+        glm::dvec3 S, E;
+        if( fit_group_between_lines( chain, prevS + 1, k - 1, Pp, dp, A0, dk, S, E ) ) {
+            double const lp = glm::dot( S - Pp, dp );
+            if( lp < minlen ) { feasible = false; }      // curve reaches behind the previous straight's start
+            ch.elements[ prevS ].length = std::max( 1.0, lp ); // only its length changes
+            kstart = E;                                  // dragged straight starts where the group ends
+        }
+        else { feasible = false; }                       // can't establish the arc between these lines
+    }
+    else if( k == 0 && ch.anchor == nullptr ) {
+        ch.direction = dk;                               // first element: rotate the whole start direction
+        kstart = ch.origin;                              // origin stays put
+    }
+
+    // --- next side ---
+    if( nextS >= 0 ) {
+        glm::dvec3 const Pn = bp[ nextS ];               // fixed start of the next straight
+        glm::dvec3 const dn = hnorm( bd[ nextS + 1 ] );  // its (fixed) direction
+        glm::dvec3 const nextfar = Pn + dn * ch.elements[ nextS ].length; // fixed far end of the next straight
+        glm::dvec3 S, E;
+        if( fit_group_between_lines( chain, k + 1, nextS - 1, kstart, dk, Pn, dn, S, E ) ) {
+            double const lk = glm::dot( S - kstart, dk );
+            double const ln = glm::dot( nextfar - E, dn );
+            if( lk < minlen || ln < minlen ) { feasible = false; } // overlap: curve too big for the room
+            ch.elements[ k ].length = std::max( 1.0, lk );
+            ch.elements[ nextS ].length = std::max( 1.0, ln ); // next straight: length only
+        }
+        else { feasible = false; }                       // can't establish the arc between these lines
+    }
+    else {
+        // last straight: free far end follows the cursor
+        ch.elements[ k ].length = std::max( 1.0, glm::dot( target - kstart, dk ) );
+    }
+    return feasible;
+}
+
+// applies the active chain-joint drag toward target and regenerates; restores the pre-drag
+// snapshot first so the fit is always computed from the original geometry
+bool editor_mode::apply_chain_drag(glm::dvec3 const &target, bool preview)
+{
+    if( m_chaindrag_chain < 0 || m_chaindrag_chain >= (int)m_chains.size() ) { return true; }
+    auto &ch = m_chains[ m_chaindrag_chain ];
+    // restore original element params (not tracks) so live dragging doesn't accumulate
+    if( m_dragsnap.size() == ch.elements.size() ) {
+        for( size_t e = 0; e < ch.elements.size(); ++e ) {
+            ch.elements[ e ].length = m_dragsnap[ e ].length;
+            ch.elements[ e ].radius = m_dragsnap[ e ].radius;
+            ch.elements[ e ].radius0 = m_dragsnap[ e ].radius0;
+            ch.elements[ e ].left = m_dragsnap[ e ].left;
+            ch.elements[ e ].cuts = m_dragsnap[ e ].cuts;
+        }
+        ch.origin = m_dragsnap_origin;
+        ch.direction = m_dragsnap_dir;
+    }
+    int const j = m_chaindrag_joint;
+    bool feasible = true;
+    if( j == 0 ) {
+        if( ch.anchor == nullptr ) { ch.origin = glm::dvec3{ target.x, ch.origin.y, target.z }; }
+    }
+    else if( j - 1 < (int)ch.elements.size() ) {
+        feasible = fit_straight_drag( m_chaindrag_chain, j - 1, target );
+    }
+
+    if( !preview ) {
+        regenerate_chain( m_chaindrag_chain ); // final: rebuild the real tracks
+        return feasible;
+    }
+    // live preview: only re-march the joint cache (no track baking -> no geometry-bank churn), so
+    // the overlay's centerline/joints follow the drag while the rails snap into place on release
+    auto const hnorm = []( glm::dvec3 v ) { v.y = 0.0; double const l = glm::length( v ); return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 }; };
+    glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
+    if( ch.anchor != nullptr && !ch.joints.empty() ) { pos = ch.joints.front(); }
+    ch.joints.clear();
+    ch.joints.push_back( pos );
+    for( auto &el : ch.elements ) {
+        march_element( el, pos, dir, false );
+        ch.joints.push_back( pos );
+    }
+    ch.endtangent = dir;
+    return feasible;
+}
+
+// applies the track panel's geometry fields to the niweleta element owning the given track
+bool editor_mode::set_track_geometry(TTrack *track)
+{
+    if( track == nullptr ) { return false; }
+    for( size_t c = 0; c < m_chains.size(); ++c ) {
+        auto &ch = m_chains[ c ];
+        for( auto &el : ch.elements ) {
+            if( std::find( el.tracks.begin(), el.tracks.end(), track ) == el.tracks.end() ) { continue; }
+            if( el.type == track_panel::STRAIGHT ) {
+                el.length = (double)ui()->track_length();
+                el.cuts = ui()->track_cuts();
+            }
+            else if( el.type == track_panel::ARC ) {
+                el.radius = (double)ui()->track_radius();
+                el.length = (double)ui()->track_length();
+            }
+            else if( el.type == track_panel::TRANSITION ) {
+                el.radius0 = (double)ui()->track_radius_start();
+                el.radius = (double)ui()->track_radius_end();
+                el.length = (double)ui()->track_length();
+            }
+            regenerate_chain( (int)c );
+            return true;
+        }
+    }
+    return false;
 }
 
 bool editor_mode::snap_track_start(glm::dvec3 &start, glm::dvec3 &dir)
@@ -1304,6 +1609,30 @@ bool editor_mode::update()
             WriteLog("Editor: saved niweleta + scene", logtype::generic);
         }
 
+        // "dump niweleta to log": full diagnostic dump of every chain
+        if (ui()->consume_track_dump())
+            dump_alignment_diag();
+
+        // "apply cant to selected track": set the owning niweleta element's cant and regenerate
+        if (ui()->consume_track_apply_cant())
+        {
+            if (TTrack *seltrack = dynamic_cast<TTrack *>(m_node))
+            {
+                if (!set_track_cant(seltrack, (double)ui()->track_cant()))
+                    WriteLog("Editor: selected track is not part of a niweleta", logtype::generic);
+            }
+        }
+
+        // "apply geometry to selected": push the panel length/radius fields into the owning element
+        if (ui()->consume_track_apply_geometry())
+        {
+            if (TTrack *seltrack = dynamic_cast<TTrack *>(m_node))
+            {
+                if (!set_track_geometry(seltrack))
+                    WriteLog("Editor: selected track is not part of a niweleta", logtype::generic);
+            }
+        }
+
         if (mouseHold)
         {
             // process continuous brush placement
@@ -1327,10 +1656,23 @@ bool editor_mode::update()
     // variable step routines
     update_camera(deltarealtime);
 
-    // active drag (chain joint or switch) follows the cursor on the ground plane; geometry
-    // is re-marched once, on mouse release
+    // active drag follows the cursor on the ground plane. a chain-joint drag is fitted + regenerated
+    // live (each frame) so the user sees the result while dragging; a switch drag previews only.
     if( m_dragactive ) {
         m_dragpos = cursor_ground_point();
+        if( m_chaindrag_chain >= 0 && glm::length2( m_dragpos - m_dragapplied ) > 0.0025 ) {
+            // >5cm move -> live preview refit (joints only). if the cursor is where the arc can't be
+            // established, hold the alignment at the last feasible position and flag it (red warning)
+            if( apply_chain_drag( m_dragpos, true ) ) {
+                m_dragfeasible = true;
+                m_draglastgood = m_dragpos;
+            }
+            else {
+                m_dragfeasible = false;
+                apply_chain_drag( m_draglastgood, true ); // revert to the last valid geometry
+            }
+            m_dragapplied = m_dragpos;
+        }
     }
 
     simulation::Region->update_sounds();
@@ -1926,15 +2268,86 @@ void editor_mode::render_track_overlay()
         }
     }
 
-    // niweleta joints: editable (green) squares; KP-locked ends drawn grey
+    // niweleta centerline: polyline through the joints (updates live during a drag preview)
+    for( size_t c = 0; c < m_chains.size(); ++c ) {
+        auto const &ch = m_chains[ c ];
+        bool const dragged = ( (int)c == m_chaindrag_chain && m_dragactive );
+        ImU32 const linecol = dragged ? IM_COL32( 255, 80, 80, 230 ) : IM_COL32( 120, 200, 255, 120 );
+        ImVec2 prev; bool hasprev = false;
+        for( size_t j = 0; j < ch.joints.size(); ++j ) {
+            ImVec2 s;
+            if( !project( ch.joints[ j ] + glm::dvec3{ 0.0, 0.25, 0.0 }, s ) ) { hasprev = false; continue; }
+            if( hasprev ) { dl->AddLine( prev, s, linecol, dragged ? 2.5f : 1.5f ); }
+            prev = s; hasprev = true;
+        }
+    }
+
+    // niweleta joints: draggable (green) = free origin / straight end; locked (grey) = curve joint
     for( auto const &ch : m_chains ) {
         for( size_t j = 0; j < ch.joints.size(); ++j ) {
             ImVec2 s;
             if( !project( ch.joints[ j ] + glm::dvec3{ 0.0, 0.25, 0.0 }, s ) ) { continue; }
-            bool const locked = ( j == 0 && ch.anchor != nullptr )
-                             || ( j > 0 && ch.elements[ j - 1 ].type == track_panel::TRANSITION );
-            ImU32 const col = locked ? IM_COL32( 150, 150, 150, 255 ) : IM_COL32( 40, 255, 40, 255 );
+            bool const draggable = ( j == 0 ) ? ( ch.anchor == nullptr )
+                                              : ( ch.elements[ j - 1 ].type == track_panel::STRAIGHT );
+            ImU32 const col = draggable ? IM_COL32( 40, 255, 40, 255 ) : IM_COL32( 150, 150, 150, 255 );
             dl->AddRectFilled( ImVec2( s.x - 5, s.y - 5 ), ImVec2( s.x + 5, s.y + 5 ), col );
+        }
+    }
+
+    // niweleta diagnostics overlay (toggle in the track panel): per-joint tangent continuity and
+    // gaps, plus per-element type/params and track-link status. re-marches each chain (no emit).
+    if( ui()->track_diag() ) {
+        auto const hnorm = []( glm::dvec3 v ) {
+            v.y = 0.0; double const l = glm::length( v );
+            return ( l > 1e-9 ) ? v / l : glm::dvec3{ 0.0, 0.0, -1.0 };
+        };
+        char buf[ 160 ];
+        for( auto const &chc : m_chains ) {
+            auto &ch = const_cast<track_chain &>( chc ); // march_element mutates copies only via refs below
+            // capture per-element entry/exit tangent + endpoints by re-marching without emitting
+            struct estate { glm::dvec3 pstart, pend, din, dout; };
+            std::vector<estate> es;
+            glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
+            if( ch.anchor != nullptr && !ch.joints.empty() ) { pos = ch.joints.front(); }
+            for( size_t e = 0; e < ch.elements.size(); ++e ) {
+                estate st; st.pstart = pos; st.din = dir;
+                march_element( ch.elements[ e ], pos, dir, false );
+                st.pend = pos; st.dout = dir;
+                es.push_back( st );
+            }
+            // per-joint continuity: angle between exit tangent of e-1 and entry tangent of e
+            for( size_t e = 1; e < es.size(); ++e ) {
+                double const d = std::clamp( glm::dot( hnorm( es[ e - 1 ].dout ), hnorm( es[ e ].din ) ), -1.0, 1.0 );
+                double const angdeg = glm::degrees( std::acos( d ) );
+                double const gap = glm::length( glm::dvec3{ es[ e ].pstart.x - es[ e - 1 ].pend.x, 0.0, es[ e ].pstart.z - es[ e - 1 ].pend.z } );
+                ImVec2 s;
+                if( !project( ch.joints[ e ] + glm::dvec3{ 0.0, 0.6, 0.0 }, s ) ) { continue; }
+                ImU32 const col = ( angdeg < 0.5 ) ? IM_COL32( 60, 255, 60, 255 )
+                                : ( angdeg < 2.0 ) ? IM_COL32( 255, 230, 40, 255 )
+                                                   : IM_COL32( 255, 60, 60, 255 );
+                std::snprintf( buf, sizeof( buf ), "j%zu dW=%.2f\xC2\xB0 gap=%.3f", e, angdeg, gap );
+                dl->AddText( font, 18.0f, ImVec2( s.x + 7.0f, s.y + 1.0f ), IM_COL32( 0, 0, 0, 220 ), buf );
+                dl->AddText( font, 18.0f, ImVec2( s.x + 6.0f, s.y ), col, buf );
+            }
+            // per-element info: type, params, and whether the generated tracks are linked
+            char const *typenames[] = { "Prosty", "Luk", "KP", "Rozjazd" };
+            for( size_t e = 0; e < es.size(); ++e ) {
+                auto const &el = ch.elements[ e ];
+                ImVec2 s;
+                if( !project( ( es[ e ].pstart + es[ e ].pend ) * 0.5 + glm::dvec3{ 0.0, 0.9, 0.0 }, s ) ) { continue; }
+                char const *tn = ( el.type >= 0 && el.type < 4 ) ? typenames[ el.type ] : "?";
+                int const linked = (int)el.tracks.size();
+                bool const missing = std::any_of( el.tracks.begin(), el.tracks.end(), []( TTrack *t ){ return t == nullptr; } );
+                if( el.type == track_panel::TRANSITION )
+                    std::snprintf( buf, sizeof( buf ), "#%zu %s L=%.0f R0=%.0f R1=%.0f [%d%s]", e, tn, el.length, el.radius0, el.radius, linked, missing ? "!" : "" );
+                else if( el.type == track_panel::ARC )
+                    std::snprintf( buf, sizeof( buf ), "#%zu %s L=%.0f R=%.0f %s [%d%s]", e, tn, el.length, el.radius, el.left ? "L" : "P", linked, missing ? "!" : "" );
+                else
+                    std::snprintf( buf, sizeof( buf ), "#%zu %s L=%.0f cuts=%d [%d%s]", e, tn, el.length, el.cuts, linked, missing ? "!" : "" );
+                ImU32 const ecol = ( linked == 0 || missing ) ? IM_COL32( 255, 90, 90, 255 ) : IM_COL32( 120, 220, 255, 255 );
+                dl->AddText( font, 17.0f, ImVec2( s.x + 6.0f, s.y + 1.0f ), IM_COL32( 0, 0, 0, 220 ), buf );
+                dl->AddText( font, 17.0f, ImVec2( s.x + 5.0f, s.y ), ecol, buf );
+            }
         }
     }
     // drag preview: marker at the cursor and a guide line from the grabbed point
@@ -1944,6 +2357,12 @@ void editor_mode::render_track_overlay()
         bool const hasb = project( m_dragpos + glm::dvec3{ 0.0, 0.2, 0.0 }, b );
         if( hasa && hasb ) { dl->AddLine( a, b, IM_COL32( 255, 60, 60, 200 ), 2.0f ); }
         if( hasb ) { dl->AddRectFilled( ImVec2( b.x - 6, b.y - 6 ), ImVec2( b.x + 6, b.y + 6 ), IM_COL32( 255, 60, 60, 255 ) ); }
+        // infeasible fit: the alignment is held at the last valid position; warn near the cursor
+        if( !m_dragfeasible && hasb ) {
+            char const *msg = "nie da sie dopasowac luku - zmniejsz R / skroc KP";
+            dl->AddText( font, 20.0f, ImVec2( b.x + 11.0f, b.y - 23.0f ), IM_COL32( 0, 0, 0, 220 ), msg );
+            dl->AddText( font, 20.0f, ImVec2( b.x + 10.0f, b.y - 24.0f ), IM_COL32( 255, 70, 70, 255 ), msg );
+        }
     }
 }
 
@@ -2393,122 +2812,12 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                 m_switchdrag = nullptr;
             }
             else if( m_chaindrag_chain >= 0 && m_chaindrag_chain < (int)m_chains.size() ) {
-                auto &ch = m_chains[ m_chaindrag_chain ];
-                int const j = m_chaindrag_joint;
-                if( j == 0 ) {
-                    // free-chain origin: translate the whole chain
-                    if( ch.anchor == nullptr ) {
-                        ch.origin = glm::dvec3{ target.x, ch.origin.y, target.z };
-                    }
-                }
-                else if( j - 1 < (int)ch.elements.size() ) {
-                    // march up to the element start, then re-parametrize the element to reach
-                    // the dragged point while KEEPING ITS TYPE
-                    glm::dvec3 pos = ch.origin, dir = hnorm( ch.direction );
-                    if( ch.anchor != nullptr ) { pos = ch.joints.front(); }
-                    for( int e = 0; e < j - 1; ++e ) {
-                        march_element( ch.elements[ e ], pos, dir, false );
-                    }
-                    auto &el = ch.elements[ j - 1 ];
-                    glm::dvec3 const chordv{ target.x - pos.x, 0.0, target.z - pos.z };
-                    double const chord = glm::length( chordv );
-                    if( chord > 1.0 ) {
-                        if( el.type == track_panel::STRAIGHT ) {
-                            // a run of consecutive straights behaves like one direction vector:
-                            // dragging its end rotates the run; the preceding arc adapts its
-                            // sweep to the new line, a KP predecessor locks the direction
-                            int const eidx = j - 1;
-                            int runstart = eidx;
-                            while( runstart > 0 && ch.elements[ runstart - 1 ].type == track_panel::STRAIGHT ) { --runstart; }
-                            glm::dvec3 rpos = ch.origin, rdir = hnorm( ch.direction );
-                            for( int e = 0; e < runstart; ++e ) { march_element( ch.elements[ e ], rpos, rdir, false ); }
-                            glm::dvec3 const newdir = hnorm( glm::dvec3{ target.x - rpos.x, 0.0, target.z - rpos.z } );
-                            // when the run is followed by [ARC][straight...], solve the arc as a
-                            // fillet between the rotated line and the DOWNSTREAM LINE, which stays
-                            // fixed (vector untouched); curve parameters (radius) are preserved
-                            int runend = eidx;
-                            while( runend + 1 < (int)ch.elements.size() && ch.elements[ runend + 1 ].type == track_panel::STRAIGHT ) { ++runend; }
-                            bool const hasfillet =
-                                ( runend + 2 < (int)ch.elements.size()
-                               && ch.elements[ runend + 1 ].type == track_panel::ARC
-                               && ch.elements[ runend + 2 ].type == track_panel::STRAIGHT );
-                            glm::dvec3 q{ 0.0 }, d2{ 0.0 }, ffar{ 0.0 };
-                            if( hasfillet ) {
-                                // downstream line captured from the PRE-EDIT march (it must not move)
-                                glm::dvec3 cpos = ch.origin, cdir2 = hnorm( ch.direction );
-                                for( int e = 0; e <= runend + 1; ++e ) { march_element( ch.elements[ e ], cpos, cdir2, false ); }
-                                q = cpos; d2 = cdir2;
-                                ffar = q + d2 * ch.elements[ runend + 2 ].length;
-                            }
-
-                            if( runstart == 0 ) {
-                                if( ch.anchor == nullptr ) { ch.direction = newdir; }
-                            }
-                            else if( ch.elements[ runstart - 1 ].type == track_panel::ARC ) {
-                                auto &arc = ch.elements[ runstart - 1 ];
-                                glm::dvec3 apos = ch.origin, adir = hnorm( ch.direction );
-                                for( int e = 0; e < runstart - 1; ++e ) { march_element( ch.elements[ e ], apos, adir, false ); }
-                                double const cosang2 = std::clamp( glm::dot( adir, newdir ), -1.0, 1.0 );
-                                double const theta2 = std::acos( cosang2 );
-                                if( theta2 > 1e-3 ) {
-                                    arc.left = ( adir.x * newdir.z - adir.z * newdir.x ) < 0.0;
-                                    arc.length = std::max( 1.0, arc.radius ) * theta2;
-                                }
-                            }
-                            // re-march to this element and set its length toward the drag point
-                            glm::dvec3 pos2 = ch.origin, dir2 = hnorm( ch.direction );
-                            for( int e = 0; e < eidx; ++e ) { march_element( ch.elements[ e ], pos2, dir2, false ); }
-                            el.length = std::max( 1.0, glm::dot( glm::dvec3{ target.x - pos2.x, 0.0, target.z - pos2.z }, dir2 ) );
-
-                            if( hasfillet ) {
-                                auto &arc = ch.elements[ runend + 1 ];
-                                auto &next = ch.elements[ runend + 2 ];
-                                // line 1: run start (pivot) + new direction; line 2: fixed q/d2
-                                glm::dvec3 apos = ch.origin, adir = hnorm( ch.direction );
-                                for( int e = 0; e < runstart; ++e ) { march_element( ch.elements[ e ], apos, adir, false ); }
-                                double const det = d2.x * adir.z - adir.x * d2.z;
-                                double const cosang3 = std::clamp( glm::dot( adir, d2 ), -1.0, 1.0 );
-                                double const theta3 = std::acos( cosang3 );
-                                if( std::abs( det ) > 1e-6 && theta3 > 1e-3 ) {
-                                    // corner = intersection of the two lines
-                                    glm::dvec3 const w = q - apos;
-                                    double const denom = adir.x * ( -d2.z ) - ( -d2.x ) * adir.z;
-                                    double const a = ( w.x * ( -d2.z ) - ( -d2.x ) * w.z ) / denom;
-                                    glm::dvec3 const corner = apos + adir * a;
-                                    double const R = std::max( 1.0, arc.radius );
-                                    double const t = R * std::tan( theta3 * 0.5 );
-                                    // upstream run: total length up to the tangent point
-                                    double runothers = 0.0;
-                                    for( int e = runstart; e < runend; ++e ) { runothers += ch.elements[ e ].length; }
-                                    ch.elements[ runend ].length = std::max( 1.0, a - t - runothers );
-                                    // the arc keeps its radius; only the sweep adapts
-                                    arc.left = ( adir.x * d2.z - adir.z * d2.x ) < 0.0;
-                                    arc.length = R * theta3;
-                                    // downstream straight: same line, far end pinned
-                                    glm::dvec3 const t2 = corner + d2 * t;
-                                    next.length = std::max( 1.0, glm::dot( ffar - t2, d2 ) );
-                                }
-                            }
-                        }
-                        else if( el.type == track_panel::ARC ) {
-                            // re-fit the arc through the point, tangent to the march direction
-                            glm::dvec3 const cdir = hnorm( chordv );
-                            double const cosang = std::clamp( glm::dot( cdir, dir ), -1.0, 1.0 );
-                            double const ang = std::acos( cosang );
-                            if( ang < 1e-3 ) {
-                                el.length = chord;
-                            }
-                            else {
-                                double const R = chord / ( 2.0 * std::sin( ang ) );
-                                el.radius = R;
-                                el.length = R * 2.0 * ang;
-                                el.left = ( dir.x * cdir.z - dir.z * cdir.x ) < 0.0;
-                            }
-                        }
-                        // TRANSITION never lands here (locked at pick time)
-                    }
-                }
-                regenerate_chain( m_chaindrag_chain );
+                // finalize at the release point if feasible, otherwise at the last feasible position
+                // (never bake an alignment the arc can't actually close), then bake the real tracks
+                glm::dvec3 const finalpt = apply_chain_drag( target, true ) ? target : m_draglastgood;
+                apply_chain_drag( finalpt, false );
+                m_dragsnap.clear();
+                m_dragfeasible = true;
                 m_chaindrag_chain = -1;
                 m_chaindrag_joint = -1;
             }
@@ -2645,6 +2954,15 @@ void editor_mode::on_mouse_button(int const Button, int const Action, int const 
                     m_switchdrag = nullptr;
                     m_drag_from = m_chains[ pickchain ].joints[ pickjoint ];
                     m_dragpos = m_drag_from;
+                    m_dragapplied = m_drag_from;
+                    m_draglastgood = m_drag_from;
+                    m_dragfeasible = true;
+                    // snapshot the chain's element params so the live fit is always relative to the
+                    // original geometry (params only; tracks stay owned by the live chain)
+                    m_dragsnap = m_chains[ pickchain ].elements;
+                    for( auto &el : m_dragsnap ) { el.tracks.clear(); }
+                    m_dragsnap_origin = m_chains[ pickchain ].origin;
+                    m_dragsnap_dir = m_chains[ pickchain ].direction;
                     m_input.mouse.button(Button, Action);
                     return;
                 }

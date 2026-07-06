@@ -46,6 +46,15 @@ class editor_ui : public ui_layer
 	float track_radius_end() const;
 	bool track_curve_left() const;
 	int track_cuts() const;
+	float track_cant() const;
+	// one-shot: true when the user clicked "apply cant to selected track"; clears the flag
+	bool consume_track_apply_cant();
+	// one-shot: true when the user clicked "apply geometry to selected"; clears the flag
+	bool consume_track_apply_geometry();
+	// niweleta diagnostics overlay toggle
+	bool track_diag() const;
+	// one-shot: true when the user clicked "dump niweleta to log"; clears the flag
+	bool consume_track_dump();
 	// one-shot: true when the user clicked "finish niweleta"; clears the flag
 	bool consume_track_finish();
 	// one-shot: true when the user clicked "save niweleta + scene"; clears the flag

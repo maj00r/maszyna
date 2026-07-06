@@ -1287,23 +1287,25 @@ state_serializer::export_nodes_to_stream(std::ostream &scmfile, bool Dirty) cons
 	scene::Groups.export_as_text( scmfile, Dirty );
 
 	// tracks
+	// NOTE: table::detach() (used by the editor when deleting a node) leaves a nullptr hole in the
+	// sequence, so every consumer must skip nulls or it crashes here
 	scmfile << "// paths\n";
 	for( auto const *path : Paths.sequence() ) {
-		if( path->dirty() == Dirty && path->group() == null_handle ) {
+		if( path != nullptr && path->dirty() == Dirty && path->group() == null_handle ) {
 			path->export_as_text( scmfile );
 		}
 	}
 	// traction
 	scmfile << "// traction\n";
 	for( auto const *traction : Traction.sequence() ) {
-		if( traction->dirty() == Dirty && traction->group() == null_handle ) {
+		if( traction != nullptr && traction->dirty() == Dirty && traction->group() == null_handle ) {
 			traction->export_as_text( scmfile );
 		}
 	}
 	// power grid
 	scmfile << "// traction power sources\n";
 	for( auto const *powersource : Powergrid.sequence() ) {
-		if( powersource->dirty() == Dirty && powersource->group() == null_handle ) {
+		if( powersource != nullptr && powersource->dirty() == Dirty && powersource->group() == null_handle ) {
 			powersource->export_as_text( scmfile );
 		}
 	}

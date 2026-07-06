@@ -121,9 +121,14 @@ class track_panel : public ui_panel
 	float radius_end = 300.0f;   // [m], 0 = straight
 	bool curve_left = true; // ARC/TRANSITION/SWITCH curve direction
 	int cuts = 0; // STRAIGHT: mid-element cuts (element emits cuts+1 track pieces)
+	float cant = 0.0f; // superelevation [mm] applied to new elements / the selected track
 	bool place_active = false; // when set, a left click in the scene lays a track
 	bool finish_chain = false; // one-shot: user asked to end the current niweleta
 	bool save_alignments = false; // one-shot: user asked to save the niweleta + scene
+	bool apply_cant = false; // one-shot: user asked to set cant on the selected track
+	bool apply_geometry = false; // one-shot: apply length/radius fields to the selected niweleta element
+	bool diag = false; // diagnostics overlay for the niweleta (continuity angles, gaps, element info)
+	bool dump = false; // one-shot: user asked to dump the niweleta state to the log
 
 	track_panel(std::string const &Name, bool const Isopen) : ui_panel(Name, Isopen) {}
 	void render() override;
