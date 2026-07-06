@@ -417,7 +417,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 if (${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
 	# override cmake defaults
-	set(CMAKE_CXX_FLAGS_RELWITHDEBINFO " /MD /Zi /O2 /DNDEBUG")
+	set(CMAKE_CXX_FLAGS_RELWITHDEBINFO " /MD /Z7 /O2 /DNDEBUG") # /Z7: per-obj debug info, avoids the shared-PDB/mspdbsrv blowup (see GENERATE_PDB note)
 	set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO " /DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
 
 	target_link_options(${PROJECT_NAME} PRIVATE "/MAP")
@@ -596,12 +596,17 @@ endif ()
 # Enable compiling with debug symbols
 if(GENERATE_PDB)
     if (MSVC)
-        # Ensure Debug and Release configurations use appropriate runtime libraries
-        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi /MDd")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi /MD")
+        # Ensure Debug and Release configurations use appropriate runtime libraries.
+        # NOTE: /Z7 (CodeView debug info embedded in each .obj) instead of /Zi (one shared,
+        # monolithic compile-time PDB written via mspdbsrv). On a codebase this large /Zi makes
+        # mspdbsrv the bottleneck and blows past its limits ("PDB too large") in Debug/parallel
+        # builds (e.g. from CLion). /Z7 has no shared compile PDB, so parallel builds are robust;
+        # the linker still assembles the final target PDB from the .obj debug info.
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Z7 /MDd")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Z7 /MD")
 
         # Add compile options for debugging
-        add_compile_options(/Zi)   # Always enable debug symbols
+        add_compile_options(/Z7)   # Always enable debug symbols (embedded per-obj, see note above)
         add_link_options(/DEBUG /MAP)
 
         # Ensure that the PCH is built with the correct runtime library for each configuration
