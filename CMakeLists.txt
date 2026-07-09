@@ -397,7 +397,9 @@ if (${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
     set(SOURCES ${SOURCES} ${CMAKE_BINARY_DIR}/eu07.rc)
     set(SOURCES ${SOURCES} eu07.ico)
     set(SOURCES ${SOURCES} eu07.ico
-			editor/editorSettings.hpp)
+			editor/editorSettings.hpp
+            editor/gaugeVisualizer.h
+			editor/gaugeVisualizer.cpp)
     add_compile_options("/utf-8")
 endif()
 

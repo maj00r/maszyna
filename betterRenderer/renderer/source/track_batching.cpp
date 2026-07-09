@@ -23,6 +23,18 @@ struct RadiusTester {
 
 }  // namespace BatchingUtils
 
+void NvRenderer::Regather_Scene() {
+  m_shapes.clear();
+  m_lines.clear();
+  m_animateds.clear();
+  m_dynamics.clear();
+  m_cells.clear();
+  m_geometry_batches.clear();
+  m_track_batches.clear();
+  m_batched_instances.clear();
+  m_scene_initialized = false;
+}
+
 void NvRenderer::GatherModelsForBatching() {
   struct BatchedId {
     gfx::geometry_handle m_geometry;

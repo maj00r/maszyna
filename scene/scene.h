@@ -121,6 +121,10 @@ public:
     // adds provided lines to the cell
     void
         insert( lines_node Lines );
+    void
+        push_shape_direct( shape_node Shape );
+    void
+        erase_shapes( std::string const &Name );
     // adds provided path to the cell
     void
         insert( TTrack *Path );

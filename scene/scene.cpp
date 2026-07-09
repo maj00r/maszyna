@@ -318,6 +318,22 @@ basic_cell::insert( lines_node Lines ) {
     m_lines.emplace_back( Lines );
 }
 
+void
+basic_cell::push_shape_direct( shape_node Shape ) {
+
+    m_active = true;
+    if( true == Shape.data().translucent ) { m_shapestranslucent.emplace_back( std::move( Shape ) ); }
+    else                                   { m_shapesopaque.emplace_back( std::move( Shape ) ); }
+}
+
+void
+basic_cell::erase_shapes( std::string const &Name ) {
+
+    auto const named = [&]( shape_node const &Shape ) { return Shape.name() == Name; };
+    m_shapesopaque.erase( std::remove_if( std::begin( m_shapesopaque ), std::end( m_shapesopaque ), named ), std::end( m_shapesopaque ) );
+    m_shapestranslucent.erase( std::remove_if( std::begin( m_shapestranslucent ), std::end( m_shapestranslucent ), named ), std::end( m_shapestranslucent ) );
+}
+
 // adds provided path to the cell
 void
 basic_cell::insert( TTrack *Path ) {

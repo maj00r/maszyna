@@ -95,3 +95,16 @@ bool editor_ui::rot_from_last()
 {
 	return m_functionspanel.rot_from_last;
 }
+
+bool editor_ui::is_gauge_visible() const
+{
+	return m_functionspanel.is_gauge_visible;
+}
+bool editor_ui::is_gauge_position_locked() const
+{
+	return m_functionspanel.is_gauge_position_locked;
+}
+void editor_ui::toggle_gauge_position_locked()
+{
+	m_functionspanel.is_gauge_position_locked = !m_functionspanel.is_gauge_position_locked;
+}

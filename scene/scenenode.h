@@ -122,6 +122,8 @@ public:
     // relative to Origin. used by the editor's terrain to own editable geometry it can re-upload.
     shape_node &
         make_terrain( material_handle const Material, std::vector<world_vertex> Vertices, glm::dvec3 const Origin );
+    shape_node &
+        make_overlay( std::vector<world_vertex> Vertices, glm::dvec3 const Origin, material_handle const Material, glm::vec4 const Color, bool const Translucent, std::string const &Name );
     // adds content of provided node to already enclosed geometry. returns: true if merge could be performed
     bool
         merge( shape_node &Shape );
@@ -143,6 +145,8 @@ public:
     // replaces the renderable geometry handle (used by the editor when it re-uploads terrain geometry)
     void
         geometry( gfx::geometry_handle const &Handle );
+    std::string const &
+        name() const { return m_name; }
     // data access
     shapenode_data const &
         data() const;

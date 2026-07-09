@@ -114,7 +114,8 @@ class functions_panel : public ui_panel
 
 	float rot_value = 0.0f;
 	bool rot_from_last = false;
-
+	bool is_gauge_visible = false;
+	bool is_gauge_position_locked = false;
 	functions_panel(std::string const &Name, bool const Isopen) : ui_panel(Name, Isopen) {}
 
 	void update(scene::basic_node const *Node);

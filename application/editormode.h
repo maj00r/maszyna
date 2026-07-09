@@ -17,6 +17,7 @@ http://mozilla.org/MPL/2.0/.
 #include "scene/scenenode.h"
 #include "editor/editorTerrain.hpp"
 #include "editor/editorTerrainStreamer.hpp"
+#include "editor/gaugeVisualizer.h"
 
 #include <memory>
 
@@ -204,4 +205,6 @@ class editor_mode : public application_mode
 	bool m_gizmo_local{false};                                   // manipulate in the object's local space instead of world space
 	gizmo_operation m_gizmo_op{gizmo_operation::translate};      // current transform mode (translate/rotate/scale)
 	float m_gizmo_snap{1.0f};                                    // translation snap step (metres) applied while Ctrl is held
+
+	gauge_overlay m_gauge;
 };

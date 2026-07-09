@@ -708,6 +708,13 @@ bool editor_mode::update()
     // --- ImGuizmo: in-viewport transform gizmo for the selected node ---
     render_gizmo();
 
+    glm::dmat4 gauge_view(1.0);
+    Camera.SetMatrix(gauge_view);
+    m_gauge.update(Camera.Pos + GfxRenderer->Mouse_Position(),
+                   ui()->is_gauge_visible(),
+                   ui()->is_gauge_position_locked(),
+                   gauge_view);
+
     // --- ImGui: Editor Settings & History windows ---
     if(m_settings_open)
         render_settings();
@@ -1387,6 +1394,8 @@ void editor_mode::exit()
     m_gizmo_using = false;
     ui()->set_node(nullptr);
 
+    m_gauge.clear();
+
     Application.set_cursor(Global.ControlPicking ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
 
     if (!Global.ControlPicking)
@@ -1425,6 +1434,15 @@ void editor_mode::on_key(int const Key, int const Scancode, int const Action, in
         }
         if (handled)
             return;
+    }
+
+    if (!anyModifier
+    	&& is_press(Action)
+        && m_input.mouse.button(GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS
+        && Key == GLFW_KEY_L
+        && ui()->is_gauge_visible())
+    {
+        return ui()->toggle_gauge_position_locked();
     }
 
     // then internal input handling

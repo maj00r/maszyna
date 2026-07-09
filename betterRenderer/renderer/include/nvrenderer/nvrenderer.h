@@ -129,6 +129,7 @@ class NvRenderer : public gfx_renderer, public MaResourceRegistry {
   virtual TSubModel const *Pick_Control() const override;
   virtual scene::basic_node const *Pick_Node() const override;
   virtual glm::dvec3 Mouse_Position() const override;
+  virtual void Regather_Scene() override;
   virtual void Update(double const Deltatime) override;
   virtual void Update_Pick_Control() override;
   virtual void Update_Pick_Node() override;

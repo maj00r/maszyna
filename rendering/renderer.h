@@ -80,6 +80,9 @@ public:
     virtual auto Camera_View_Matrix() const -> glm::mat4 { return glm::mat4( 1.f ); }
     virtual auto Camera_Projection_Matrix() const -> glm::mat4 { return glm::mat4( 1.f ); }
     virtual auto Camera_Position() const -> glm::dvec3 { return glm::dvec3( 0.0 ); }
+    // forces backends that batch scene geometry once at load to rebuild that batch, so scene nodes
+    // added after load (editor overlays) become visible. no-op on backends that read the scene live.
+    virtual void Regather_Scene() {}
     // maintenance methods
     virtual void Update( double const Deltatime ) = 0;
     virtual void Update_Pick_Control() = 0;

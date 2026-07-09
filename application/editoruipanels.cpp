@@ -662,6 +662,10 @@ void functions_panel::render()
 			ImGui::SliderFloat("Rotation Value", &rot_value, 0.0f, 360.0f, "%.1f");
 		};
 		ImGui::RadioButton("Default rotation", (int *)&rot_mode, DEFAULT);
+		ImGui::Separator();
+		ImGui::Checkbox("Gauge overlay", &is_gauge_visible);
+		ImGui::SameLine();
+		ImGui::Checkbox("Lock position (L)", &is_gauge_position_locked);
 		for (auto const &line : text_lines)
 		{
 			ImGui::TextColored(ImVec4(line.color.r, line.color.g, line.color.b, line.color.a), line.data.c_str());

@@ -37,6 +37,9 @@ class editor_ui : public ui_layer
 	nodebank_panel::edit_mode mode();
 	float getSpacing();
 	void toggleBrushSettings(bool isVisible);
+	bool is_gauge_visible() const;
+	bool is_gauge_position_locked() const;
+	void toggle_gauge_position_locked();
 
   private:
 	// members
