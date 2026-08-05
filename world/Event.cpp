@@ -772,6 +772,49 @@ putvalues_event::run_() {
         + to_string( m_input.data_value_1, 2 ) + "] ["
         + to_string( m_input.data_value_2, 2 ) + "]" );
 
+    // "Rozkaz@nazwa" - tylko cm_Unknown, żeby nie ruszać SetVelocity / PassengerStopPoint: itd.
+    // gdy nie ma takiego pojazdu, lecimy zwykłą ścieżką (aktywator), a nie pożeramy eventu
+    if( m_input.command_type == TCommandType::cm_Unknown ) {
+        if( auto const addressee { m_input.data_text.rfind( '@' ) };
+            addressee != std::string::npos
+         && addressee > 0
+         && addressee + 1 < m_input.data_text.size() ) {
+            auto const command { m_input.data_text.substr( 0, addressee ) };
+            auto const vehiclename { m_input.data_text.substr( addressee + 1 ) };
+            auto *vehicle { simulation::Vehicles.find( vehiclename ) };
+
+            if( vehicle != nullptr ) {
+                WriteLog( " Vehicle: [" + vehiclename + "] command: [" + command + "] - "
+                    + ( vehicle->Mechanik != nullptr ? "to driver" : "to vehicle" ) );
+                // położenie względem samego pojazdu - event stoi gdzie indziej
+                TLocation const vehicleloc {
+                    -vehicle->GetPosition().x,
+                     vehicle->GetPosition().z,
+                     vehicle->GetPosition().y };
+                if( vehicle->Mechanik != nullptr ) {
+                    vehicle->Mechanik->PutCommand( command, m_input.data_value_1, m_input.data_value_2, vehicleloc );
+                }
+                else {
+                    vehicle->MoverParameters->PutCommand( command, m_input.data_value_1, m_input.data_value_2, vehicleloc );
+                }
+                return;
+            }
+        }
+    }
+
+    if( m_input.data_text.compare( 0, 5, "Crew:" ) == 0 ) {
+        // obsadzenie pojazdu wskazanego z nazwy albo zdjęcie z niego obsady; nie wymaga aktywatora, bo pojazd
+        // bez obsady niczego nie wyzwoli. Rozkazy dla dosadzonego kierowcy podaje sceneria osobnymi eventami
+        auto const vehiclename { m_input.data_text.substr( 5 ) };
+        auto *vehicle { simulation::Vehicles.find( vehiclename ) };
+        auto const cab { static_cast<int>( m_input.data_value_1 ) };
+        WriteLog( " Vehicle: [" + vehiclename + "] crew: " + std::to_string( cab ) + " - "
+            + ( vehicle == nullptr ? "not found" :
+                vehicle->set_crew( cab ) ? "done" :
+                                           "ignored" ) );
+        return;
+    }
+
     if( m_activator == nullptr ) { return; }
     // zamiana, bo fizyka ma inaczej niż sceneria
     // NOTE: y & z swap, negative x

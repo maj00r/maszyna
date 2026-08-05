@@ -4468,6 +4468,55 @@ void TMoverParameters::CompressorCheck(double dt)
 	}
 }
 
+double TMoverParameters::GetDPMainValve(double dt, double hp) const
+{ // wyliczenie dp z zaworu maszynisty; wyodrębnione, żeby bierna obsada mogła go odciąć
+	if (!BrakeValveActive)
+	{ // prowadzący jest w innej kabinie - nie ruszamy przewodu
+		return 0.0;
+	}
+
+	auto const cab_occupied{CabOccupied != 0};
+	// w trybie PS bez obsady zawór nie reaguje na nastawnik (poza nagłym)
+	auto const use_handle{
+	    (BrakeOpModes & bom_PS) == 0
+	    || (cab_occupied && BrakeOpModeFlag != bom_PS)};
+
+	if (!use_handle)
+	{
+		if (BrakeCtrlPos == Handle->GetPos(bh_EB))
+		{
+			return Handle->GetPF(BrakeCtrlPosR, PipePress, hp, dt, EqvtPipePress);
+		}
+		return 0.0;
+	}
+
+	// MHZ w EP: na pozycjach luzujących zawór trzymany jak na jeździe
+	auto const mhz_ep_idle{
+	    BrakeOpModeFlag >= bom_EP
+	    && BrakeCtrlPosR <= Handle->GetPos(bh_EB) - 0.5
+	    && (BrakeHandle == TBrakeHandle::MHZ_EN57 || BrakeHandle == TBrakeHandle::MHZ_K8P)};
+
+	if (mhz_ep_idle)
+	{
+		return Handle->GetPF(0, PipePress, hp, dt, EqvtPipePress);
+	}
+
+	double pos{BrakeCtrlPosR};
+	if (SpeedCtrlUnit.IsActive
+	    && SpeedCtrlUnit.BrakeIntervention
+	    && !SpeedCtrlUnit.Standby
+	    && BrakeCtrlPos != Handle->GetPos(bh_EB))
+	{ // tempomat może chwilowo przejąć nastawę hamulca
+		pos = Handle->GetPos(bh_NP);
+		if (SpeedCtrlUnit.BrakeInterventionBraking)
+			pos = Handle->GetPos(bh_FB);
+		if (SpeedCtrlUnit.BrakeInterventionUnbraking)
+			pos = Handle->GetPos(bh_RP);
+	}
+
+	return Handle->GetPF(pos, PipePress, hp, dt, EqvtPipePress);
+}
+
 // *************************************************************************************************
 // Q: 20160712
 // aktualizacja ciśnienia w przewodzie głównym
@@ -4484,7 +4533,7 @@ void TMoverParameters::UpdatePipePressure(double dt)
 	const double kL = 0.5;
 	// double dV;
 	// TMoverParameters *c; // T_MoverParameters
-	double temp;
+	double hp{0.0};
 	// int b;
 
 	PipePress = Pipe->P();
@@ -4524,39 +4573,15 @@ void TMoverParameters::UpdatePipePressure(double dt)
 
 		if (lock_old || lock_new)
 		{
-			temp = PipePress + 0.00001;
+			hp = PipePress + 0.00001;
 		}
 		else
 		{
-			temp = ScndPipePress;
+			hp = ScndPipePress;
 		}
 		Handle->SetReductor(BrakeCtrlPos2);
 
-		if ((BrakeOpModes & bom_PS) == 0 || (CabOccupied != 0 && BrakeOpModeFlag != bom_PS))
-		{
-
-			if (BrakeOpModeFlag < bom_EP || Handle->GetPos(bh_EB) - 0.5 < BrakeCtrlPosR || (BrakeHandle != TBrakeHandle::MHZ_EN57 && BrakeHandle != TBrakeHandle::MHZ_K8P))
-			{
-				double pos = BrakeCtrlPosR;
-				if (SpeedCtrlUnit.IsActive && SpeedCtrlUnit.BrakeIntervention && !SpeedCtrlUnit.Standby && BrakeCtrlPos != Handle->GetPos(bh_EB))
-				{
-					pos = Handle->GetPos(bh_NP);
-					if (SpeedCtrlUnit.BrakeInterventionBraking)
-						pos = Handle->GetPos(bh_FB);
-					if (SpeedCtrlUnit.BrakeInterventionUnbraking)
-						pos = Handle->GetPos(bh_RP);
-				}
-				dpMainValve = Handle->GetPF(pos, PipePress, temp, dt, EqvtPipePress);
-			}
-			else
-			{
-				dpMainValve = Handle->GetPF(0, PipePress, temp, dt, EqvtPipePress);
-			}
-		}
-		else if (BrakeCtrlPos == Handle->GetPos(bh_EB))
-		{
-			dpMainValve = Handle->GetPF(BrakeCtrlPosR, PipePress, temp, dt, EqvtPipePress);
-		}
+		dpMainValve = GetDPMainValve(dt, hp);
 
 		if (dpMainValve < 0) // && (PipePressureVal > 0.01)           //50
 			if (Compressor > ScndPipePress)
@@ -4727,11 +4752,9 @@ void TMoverParameters::UpdatePipePressure(double dt)
 
 	Pipe->Act();
 	PipePress = Pipe->P();
-	if ((Hamulec->GetBrakeStatus() & b_dmg) == b_dmg) // jesli hamulec wyłączony
-		temp = 0.0; // odetnij
-	else
-		temp = 1.0; // połącz
-	Pipe->Flow(temp * Hamulec->GetPF(temp * PipePress, dt, Vel) + GetDVc(dt));
+	// uszkodzony rozdzielacz odcina wagon od przewodu (jak dawniej temp=0/1)
+	auto const distributor_open{(Hamulec->GetBrakeStatus() & b_dmg) != b_dmg ? 1.0 : 0.0};
+	Pipe->Flow(distributor_open * Hamulec->GetPF(distributor_open * PipePress, dt, Vel) + GetDVc(dt));
 
 	if (ASBType == 128)
 		Hamulec->ASB(int(SlippingWheels && Vel > 1) * (1 + 2 * int(nrot_eps < -0.01)));

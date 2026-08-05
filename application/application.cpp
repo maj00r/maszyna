@@ -681,6 +681,11 @@ void eu07_application::exit()
 	for (auto &mode : m_modes)
 		mode.reset();
 
+	// stop and join the python screen-renderer workers before any GL/window teardown -
+	// they call glfwMakeContextCurrent() on their context window, so destroying it (or GLFW)
+	// while a worker is still running is an access violation (crash on close)
+	m_taskqueue.exit();
+
 	GfxRenderer->Shutdown();
 	m_network.reset();
 
@@ -693,7 +698,6 @@ void eu07_application::exit()
 	{
 		glfwDestroyWindow(window);
 	}
-	m_taskqueue.exit();
 	glfwPollEvents(); // TODO: This fixes a segfault on Wayland when closing. Remove after updating glfw to 3.5.
 	glfwTerminate();
 

@@ -673,6 +673,8 @@ private:
     int init_sections( TModel3d const *Model, std::string const &Nameprefix, bool const Overrideselfillum );
     bool init_destination( TModel3d *Model );
     void create_controller( std::string const Type, bool const Trainset );
+    // obsadzenie (1 = kabina A, -1 = kabina B) albo zdjęcie obsady (0) w trakcie symulacji
+    bool set_crew( int const Cab );
     void AttachNext(TDynamicObject *Object, int iType = 1);
     bool UpdateForce(double dt);
     // initiates load change by specified amounts, with a platform on specified side
@@ -791,6 +793,8 @@ private:
         return iDirection + iDirection - 1; };
     int DettachStatus(int dir);
     int Dettach(int dir);
+    // po rozłączeniu/obsadzeniu wybiera jednego prowadzącego w składzie - dwóch walczy o hamulec
+    void reassign_consist_primary();
     TDynamicObject * Neighbour(int &dir);
     // updates potential collision sources
     void update_neighbours();

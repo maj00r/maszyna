@@ -24,6 +24,7 @@ auto const EU07_AI_NOACCELERATION = -0.05;
 auto const EU07_AI_BRAKINGTESTACCELERATION = -0.06;
 auto const EU07_AI_NOMOVEMENT = 0.05; // standstill velocity threshold
 auto const EU07_AI_MOVEMENT = 1.0; // deliberate movement velocity threshold
+auto const EU07_AI_SIGNALADDRESSEEMARGIN = 25.0; // o ile czoło składu stojącego przy sygnalizatorze może go minąć
 auto const EU07_AI_SPEEDLIMITEXTENDSBEYONDSCANRANGE = 10000.0;
 
 enum TOrders
@@ -148,6 +149,30 @@ enum TSpeedPosFlag
 //    spDontApplySpeedLimit = 0x10000 // this point won't apply its speed limit. potentially set by the scanning vehicle
 };
 
+// nazwy flag pozycji tabelki prędkości, do podglądu w panelu; spEnabled pomijamy, bo mają je wszystkie widoczne
+struct speedpos_flag_description {
+    int flag;
+    char const *name;
+};
+
+inline constexpr speedpos_flag_description speedpos_flag_descriptions[] {
+    { spSemaphor, "semaphore" },
+    { spShuntSemaphor, "shunt" },
+    { spPassengerStopPoint, "W4" },
+    { spOutsideStation, "W5" },
+    { spSwitch, "switch" },
+    { spSwitchStatus, "diverging" },
+    { spTrack, "track" },
+    { spCurve, "curve" },
+    { spEnd, "end" },
+    { spSectionVel, "section" },
+    { spProximityVelocity, "proximity" },
+    { spRoadVel, "road" },
+    { spStopOnSBL, "SBL" },
+    { spReverse, "reverse" },
+    { spElapsed, "passed" },
+    { spCommandSent, "sent" } };
+
 class TSpeedPos
 { // pozycja tabeli prędkości dla AI
   public:
@@ -181,6 +206,8 @@ class TSpeedPos
     std::string TableText() const;
     std::string GetName() const;
     bool IsProperSemaphor(TOrders order = Wait_for_orders);
+    // semafor przed składem zezwala na jazdę - budzi wygaszone AI bez czekania na nową zmianę sygnału
+    bool AllowsDeparture() const;
 };
 
 //----------------------------------------------------------------------------
@@ -222,10 +249,8 @@ public:
     void Update( double dt ); // uruchamiac przynajmniej raz na sekundę
     void MoveTo( TDynamicObject *to );
     void TakeControl( bool const Aidriver, bool const Forcevehiclecheck = false );
-    inline
-    bool primary( bool const Primary ) {
-        SetFlag( iDrivigFlags, Primary ? movePrimary : -movePrimary );
-        return primary(); }
+    void release_transient_controls(); // zeruje sygnał ostrzegawczy i piasecznicę przy zmianie prowadzącego
+    bool primary( bool const Primary ); // ustawia prowadzącego i synchronizuje zawór hamulca
     inline
     bool primary() const {
         return (iDrivigFlags & movePrimary) != 0; };
@@ -317,6 +342,8 @@ private:
     void determine_braking_distance();
     void determine_proximity_ranges();
     void scan_route( double const Range );
+    // czoło/tył/fLength wg CheckDirection (z fallbackiem CabOccupied) - bez side-effectów CheckVehicles
+    void orient_scan_to_cab();
     void scan_obstacles( double const Range );
     void control_wheelslip();
     void control_pantographs();
@@ -355,6 +382,9 @@ private:
     void control_braking_force();
     void apply_independent_brake_only();
     void check_route_ahead( double const Range );
+    // rozpoznaje adresata zezwolenia na najbliższym sygnalizatorze; false, gdy podano je dla innego składu
+    bool signal_permission_is_ours( bool const Permitting );
+    bool signal_addressee_stands_ahead() const; // czy przed sygnalizatorem stoi obcy skład (adresat zezwolenia)
     void check_route_behind( double const Range );
     void UpdateBrakingHelper();
     void hint( driver_hint const Value, hintpredicate const Predicate, float const Predicateparameter = 0.f );
@@ -532,6 +562,9 @@ private:
     void SetProximityVelocity( double dist, double vel, glm::dvec3 const *pos );
     TCommandType BackwardScan( double const Range );
     std::string TableText( std::size_t const Index ) const;
+    double TableDistance( std::size_t const Index ) const; // odległość wpisu; max gdy poza zakresem
+    // wiersz tabelki skanowania opisujący najbliższy pojazd na trasie; pusty, gdy droga wolna
+    std::string ObstacleText() const;
 /*
     void RouteSwitch(int d);
 */
@@ -546,6 +579,9 @@ private:
     std::size_t SemNextStopIndex{ std::size_t( -1 ) };
     double dMoveLen = 0.0; // odległość przejechana od ostatniego sprawdzenia tabelki
     basic_event *eSignNext = nullptr; // sygnał zmieniający prędkość, do pokazania na [F2]
+    basic_event const *eSignForeignPermission = nullptr; // sygnalizator, którego zezwolenie podano dla innego składu
+    basic_event const *eSignObserved = nullptr; // sygnalizator obserwowany w poprzednim sprawdzeniu
+    bool bSignWasPermitting = false; // czy obserwowany sygnalizator już wtedy zezwalał
     neighbour_data Obstacle; // nearest vehicle detected ahead on current route
 
 // timetable

@@ -1616,6 +1616,8 @@ int TDynamicObject::Dettach(int dir)
             d = d->Next(); // i w drugą stronę
         }
     }
+    // sąsiad przed rozłączeniem - potem Neighbours już go nie wskaże
+    auto *const severedneighbour { MoverParameters->Neighbours[ dir ].vehicle };
     if( MoverParameters->Couplers[ dir ].CouplingFlag ) {
         // odczepianie, o ile coś podłączone
         MoverParameters->Dettach( dir );
@@ -1628,8 +1630,52 @@ int TDynamicObject::Dettach(int dir)
         };
 */
     }
+    // po rozczepieniu każdy fragment składu musi mieć co najwyżej jednego prowadzącego
+    reassign_consist_primary();
+    if( severedneighbour != nullptr ) {
+        severedneighbour->reassign_consist_primary();
+    }
     // sprzęg po rozłączaniu (czego się nie da odpiąć
     return MoverParameters->Couplers[dir].CouplingFlag;
+}
+
+void TDynamicObject::reassign_consist_primary()
+{ // w składzie może być tylko jeden prowadzący - inaczej walczą o zawór i kierunek
+    std::vector<TController *> drivers;
+    TController *existingprimary = nullptr;
+    int primarycount = 0;
+    TDynamicObject *farend = this;
+    TDynamicObject *camefrom = nullptr;
+    for( auto *d = this; d != nullptr; )
+    { // przejście po sprzęgach w obie strony (skład nie musi zaczynać się od this)
+        if( d->Mechanik != nullptr )
+        {
+            drivers.emplace_back( d->Mechanik );
+            if( d->Mechanik->primary() ) {
+                ++primarycount;
+                existingprimary = d->Mechanik;
+            }
+        }
+        farend = d;
+        auto *ahead = d->Next();
+        auto *behind = d->Prev();
+        auto *next = ( ahead != nullptr && ahead != camefrom ) ? ahead
+                   : ( behind != nullptr && behind != camefrom ) ? behind
+                   : nullptr;
+        camefrom = d;
+        d = next;
+        if( d == this ) { break; }
+    }
+    if( drivers.empty() ) { return; }
+    // jeden existing primary zostaje; przy 0/2+ bierzemy lokalnego, potem dalszy koniec, potem pierwszego
+    TController *lead =
+        ( primarycount == 1 )           ? existingprimary :
+        ( Mechanik != nullptr )         ? Mechanik :
+        ( farend->Mechanik != nullptr ) ? farend->Mechanik :
+                                          drivers.front();
+    for( auto *drv : drivers ) {
+        drv->primary( drv == lead );
+    }
 }
 
 void
@@ -2573,6 +2619,60 @@ TDynamicObject::create_controller( std::string const Type, bool const Trainset )
         // Ra: to jest niebezpieczne, bo w razie co będzie pomagał hamulcem bezpieczeństwa
         Mechanik = new TController( Controller, this, Easyman, false );
     }
+}
+
+bool TDynamicObject::set_crew( int const Cab )
+{ // obsadzenie albo zdjęcie obsady w trakcie symulacji; Cab: 1 = kabina A, -1 = kabina B, 0 = bez obsady
+    if( Cab == 0 ) {
+        if( Mechanik == nullptr )              { return false; }
+        if( false == Mechanik->AIControllFlag ) { return false; } // człowieka nie wypraszamy
+        // na prowadzącego wskazują też pozostałe pojazdy składu, inaczej zostaną z wiszącym wskaźnikiem
+        auto *const leaving { Mechanik };
+        for( auto *d = this; d != nullptr; d = d->Prev() ) {
+            if( d->ctOwner == leaving ) { d->ctOwner = nullptr; }
+        }
+        for( auto *d = Next(); d != nullptr; d = d->Next() ) {
+            if( d->ctOwner == leaving ) { d->ctOwner = nullptr; }
+        }
+        leaving->release_transient_controls();
+        Mechanik = nullptr;
+        delete leaving;
+        Controller = AIdriver;
+        // odchodzący maszynista zostawia pojazd zabezpieczony - inaczej skład jedzie dalej pod napięciem,
+        // bo nastawnik zostaje tam, gdzie był, a nie ma już nikogo, kto by go ruszył
+        MoverParameters->MainCtrlPos = MoverParameters->MainCtrlNoPowerPos();
+        MoverParameters->ScndCtrlPos = 0;
+        if( MoverParameters->BrakeCtrlPosNo > 0 ) {
+            MoverParameters->BrakeLevelSet( MoverParameters->Handle->GetPos( bh_FB ) );
+        }
+        MoverParameters->CabDeactivisation();
+        MoverParameters->CabOccupied = 0;
+        // w składzie mogą zostać zdemowani kierowcy - bez tego wszyscy zostaliby bierni i nikt by nie prowadził
+        reassign_consist_primary();
+        return true;
+    }
+
+    auto const cab { ( Cab > 0 ? 1 : -1 ) };
+
+    if( Mechanik != nullptr ) {
+        // obsada już jest: człowieka zostawiamy w spokoju, maszynistę przesadzamy do wskazanej kabiny
+        if( false == Mechanik->AIControllFlag ) { return false; }
+        if( MoverParameters->CabOccupied == cab ) { return false; }
+        Mechanik->release_transient_controls();
+        MoverParameters->CabDeactivisation();
+        MoverParameters->CabOccupied = cab;
+        return true;
+    }
+
+    // kabinę trzeba wskazać przed utworzeniem obsady: to z niej wynika kierunek skanowania i jazdy
+    MoverParameters->CabOccupied = cab;
+    // Trainset, żeby nowy kierowca nie dostawał od razu rozkładu - rozkazy podaje sceneria osobnymi eventami
+    create_controller( Cab > 0 ? "1" : "2", true );
+    if( Mechanik == nullptr ) { return false; }
+    // w składzie może już ktoś prowadzić, a dwóch prowadzących walczy o kabinę i przewód hamulcowy
+    reassign_consist_primary();
+
+    return true;
 }
 
 void TDynamicObject::FastMove(double fDistance)

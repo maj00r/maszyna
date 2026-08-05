@@ -359,13 +359,24 @@ std::string TSpeedPos::GetName() const
 }
 
 std::string TSpeedPos::TableText() const
-{ // pozycja tabelki pr?dko?ci
-    if (iFlags & spEnabled)
-    { // o ile pozycja istotna
-		return to_hex_str(iFlags, 8) + "   " + to_string(fDist, 1, 6) +
-               "   " + (fVelNext == -1.0 ? "  -" : to_string(static_cast<int>(fVelNext), 0, 3)) + "   " + GetName();
+{ // pozycja tabelki prędkości - dystans/prędkość/nazwa oraz czytelne tagi flag zamiast hex
+    if( ( iFlags & spEnabled ) == 0 ) {
+        return ""; // wygaszona - panel F2 pomija puste, nie zaśmieca listą "Empty"
     }
-    return "Empty";
+
+    std::string tags;
+    for( auto const &description : speedpos_flag_descriptions ) {
+        if( iFlags & description.flag ) {
+            if( false == tags.empty() ) { tags += " "; }
+            tags += description.name;
+        }
+    }
+
+    return
+        to_string( fDist, 1, 8 )
+        + "   " + ( fVelNext == -1.0 ? "  -" : to_string( static_cast<int>( fVelNext ), 0, 3 ) )
+        + "   " + GetName()
+        + ( tags.empty() ? "" : "   [" + tags + "]" );
 }
 
 bool TSpeedPos::IsProperSemaphor(TOrders order)
@@ -383,6 +394,14 @@ bool TSpeedPos::IsProperSemaphor(TOrders order)
             return true;
     }
 	return false; // true gdy zatrzymanie, wtedy nie ma po co skanować dalej
+}
+
+bool TSpeedPos::AllowsDeparture() const
+{ // semafor przed nami zezwala - wygaszone AI może wystartować bez czekania na zmianę sygnału
+    if( fDist <= 0.0 ) { return false; }
+    if( ( iFlags & spEnabled ) == 0 ) { return false; }
+    if( ( iFlags & ( spSemaphor | spShuntSemaphor ) ) == 0 ) { return false; }
+    return fVelNext < 0.0 || fVelNext >= 1.0;
 }
 
 bool TSpeedPos::Set(basic_event *event, double dist, double length, TOrders order)
@@ -503,7 +522,10 @@ void TController::TableTraceRoute(double fDistance, TDynamicObject *pVehicle)
     double fCurrentDistance{ 0.0 }; // aktualna przeskanowana długość
     double fLastDir{ 0.0 };
 
-    if (iTableDirection != iDirection ) {
+    // bez zadanego kierunku (wygaszony AI) skanujemy wg zajmowanej kabiny
+    int const scandirection{ iDirection != 0 ? iDirection : mvOccupied->CabOccupied };
+
+    if (iTableDirection != scandirection ) {
         // jeśli zmiana kierunku, zaczynamy od toru ze wskazanym pojazdem
         TableClear();
 /*
@@ -519,10 +541,19 @@ void TController::TableTraceRoute(double fDistance, TDynamicObject *pVehicle)
             // don't allow potential red light overrun keep us from reversing
             VelSignalLast = -1.0;
         }
-        iTableDirection = iDirection; // ustalenie w jakim kierunku jest wypełniana tabelka względem pojazdu
+        iTableDirection = scandirection;
         pTrack = pVehicle->GetTrack(); // odcinek, na którym stoi
         fTrackLength = pVehicle->RaTranslationGet(); // pozycja na tym torze (odległość od Point1)
         fLastDir = pVehicle->DirectionGet() * pVehicle->RaDirectionGet(); // ustalenie kierunku skanowania na torze
+        if( pVehicles[ end::front ] != nullptr
+         && pVehicles[ end::front ] != pVehicle ) {
+            // maszynista nie w czołowym pojeździe: DirectionGet() może patrzeć wstecz względem składu
+            auto const toward_front{ pVehicles[ end::front ]->GetPosition() - pVehicle->GetPosition() };
+            auto const nose{ pVehicle->VectorFront() * static_cast<double>( pVehicle->DirectionGet() ) };
+            if( toward_front.x * nose.x + toward_front.z * nose.z < 0.0 ) {
+                fLastDir = -fLastDir;
+            }
+        }
         if( fLastDir < 0.0 ) {
             // jeśli w kierunku Point2 toru
             fTrackLength = pTrack->Length() - fTrackLength; // przeskanowana zostanie odległość do Point2
@@ -700,6 +731,14 @@ void TController::TableTraceRoute(double fDistance, TDynamicObject *pVehicle)
             }
         }
 
+        if( IsOccupiedByAnotherConsist( pTrack, 0.0 ) ) {
+            // na tym odcinku stoi obcy skład: to on jest adresatem sygnałów zza niego, więc dalej nie skanujemy.
+            // Sam odcinek zostaje w tabelce razem z tym, co na nim stoi przed tamtym składem. Odhaczamy go jako
+            // sprawdzony, bo skanowanie wznawia się od ostatniej pozycji, a odcinki nie mają kontroli duplikatów
+            tLast = pTrack;
+            break;
+        }
+
         fCurrentDistance += fTrackLength; // doliczenie kolejnego odcinka do przeskanowanej długości
         tLast = pTrack; // odhaczenie, że sprawdzony
         fLastVel = pTrack->VelocityGet(); // prędkość na poprzednio sprawdzonym odcinku
@@ -772,7 +811,9 @@ void TController::TableTraceRoute(double fDistance, TDynamicObject *pVehicle)
 
 void TController::TableCheck(double fDistance)
 { // przeliczenie odległości w tabelce, ewentualnie doskanowanie (bez analizy prędkości itp.)
-    if( iTableDirection != iDirection ) {
+    // jak w TableTraceRoute: wygaszony AI nie ma iDirection, więc orientujemy się kabiną
+    int const scandirection{ iDirection != 0 ? iDirection : mvOccupied->CabOccupied };
+    if( iTableDirection != scandirection ) {
         // jak zmiana kierunku, to skanujemy od końca składu
         TableTraceRoute( fDistance, pVehicles[ end::rear ] );
         TableSort();
@@ -1553,6 +1594,15 @@ TController::TableUpdateEvent( double &Velocity, TCommandType &Command, TSpeedPo
                         Velocity = fVelMax;
                         VelSignal = fVelMax;
                     }
+                    if( Command == TCommandType::cm_Unknown && Point.AllowsDeparture() ) {
+                        // semafor już zezwalał przy wejściu w FOV - budzimy bez czekania na kolejną zmianę
+                        Command = ( Point.iFlags & spShuntSemaphor ) != 0 ?
+                            TCommandType::cm_ShuntVelocity :
+                            TCommandType::cm_SetVelocity;
+                        if( std::fabs( VelSignal ) < 1.0 ) {
+                            VelSignal = Point.fVelNext < 0.0 ? -1.0 : Point.fVelNext;
+                        }
+                    }
                 }
             }
         }
@@ -1820,6 +1870,15 @@ void TController::TableSort() {
 
 //---------------------------------------------------------------------------
 
+bool TController::primary( bool const Primary )
+{ // prowadzący otwiera zawór maszynisty, bierna obsada go odcina - inaczej walczą o przewód
+    SetFlag( iDrivigFlags, Primary ? movePrimary : -movePrimary );
+    if( mvOccupied != nullptr ) {
+        mvOccupied->BrakeValveActive = Primary;
+    }
+    return primary();
+}
+
 TController::TController(bool AI, TDynamicObject *NewControll, bool InitPsyche, bool Primary) :// czy ma aktywnie prowadzić?
               AIControllFlag( AI ),     pVehicle( NewControll )
 {
@@ -1870,9 +1929,7 @@ TController::TController(bool AI, TDynamicObject *NewControll, bool InitPsyche, 
     // OrderValue=0;
     OrdersClear();
 
-    if( true == Primary ) {
-        iDrivigFlags |= movePrimary; // aktywnie prowadzące pojazd
-    }
+    primary( Primary );
 
     SetDriverPsyche(); // na końcu, bo wymaga ustawienia zmiennych
     TableClear();
@@ -2035,6 +2092,7 @@ void TController::Activation()
             // odcięcie na zaworze maszynisty, FVel6 po drugiej stronie nie luzuje
             mvOccupied->BrakeLevelSet( mvOccupied->Handle->GetPos(bh_NP) ); // odcięcie na zaworze maszynisty
 			BrakeLevelSet( mvOccupied->BrakeCtrlPos ); //ustawienie zmiennej GBH
+            mvOccupied->BrakeValveActive = false; // przewodem steruje kabina docelowa
         }
         // przejście AI na drugą stronę EN57, ET41 itp.
         // TODO: clean this up, there's lot of redundancy with TMoverParameters::ChangeCab() and TTrain::MoveToVehicle()
@@ -2049,6 +2107,7 @@ void TController::Activation()
                 if( targetvehicle->DirectionGet() != pVehicle->DirectionGet() ) {
                     // jeśli są przeciwne do siebie to będziemy jechać w drugą stronę względem zasiedzianego pojazdu
                     iDirection = -iDirection;
+                    iDirectionOrder = iDirection; // żeby DirectionChange nie odwróciło z powrotem
                 }
                 // move the other driver to our old vehicle
                 pVehicle->Mechanik = targetvehicledriver; // wsadzamy tego, co ewentualnie był (podwójna trakcja)
@@ -2100,6 +2159,7 @@ void TController::Activation()
         }
 
         CheckVehicles(); // sprawdzenie składu, AI zapali światła
+        sync_consist_reversers(); // po zmianie kabiny kierunki członów muszą być zgodne
         TableClear(); // resetowanie tabelki skanowania torów
     }
 };
@@ -2340,6 +2400,10 @@ int TController::CheckDirection() {
         // jeśli nie ma ustalonego kierunku to jedziemy wg aktualnej kabiny
         d = mvOccupied->CabActive;
     }
+    if( !d ) {
+        // wygaszony: nawrotnik/kabina nieaktywna - orientacja wg zajmowanej kabiny (pysk AI)
+        d = mvOccupied->CabOccupied;
+    }
     return d;
 }
 
@@ -2365,14 +2429,14 @@ bool TController::CheckVehicles(TOrders user)
     { // sprawdzanie, czy jest głównym sterującym, żeby nie było konfliktu
         if( p->Mechanik // jeśli ma obsadę
          && p->Mechanik != this ) { // ale chodzi o inny pojazd, niż aktualnie sprawdzający
-            if( p->Mechanik->iDrivigFlags & movePrimary ) {
+            if( p->Mechanik->primary() ) {
                 // a tamten ma priorytet
                 // TODO: take into account drivers' operating modes, one or more of them might be on banking duty
-                if( iDrivigFlags & movePrimary
+                if( primary()
                  && mvOccupied->DirAbsolute
                  && mvOccupied->BrakeCtrlPos >= -1 ) {
                     // jeśli rządzi i ma kierunek
-                    p->Mechanik->primary( false ); // dezaktywuje tamtego
+                    p->Mechanik->primary( false );
                     p->Mechanik->ZeroLocalBrake();
                     p->MoverParameters->BrakeLevelSet( p->MoverParameters->Handle->GetPos( bh_NP ) ); // odcięcie na zaworze maszynisty
                     p->Mechanik->BrakeLevelSet( p->MoverParameters->BrakeCtrlPos ); //ustawienie zmiennej GBH
@@ -2395,12 +2459,12 @@ bool TController::CheckVehicles(TOrders user)
         p = p->Neighbour(dir); // pojazd podłączony od wskazanej strony
     }
     if( main ) {
-        iDrivigFlags |= movePrimary; // nie znaleziono innego, można się porządzić
+        primary( true );
     }
 
     ControllingSet(); // ustalenie członu do sterowania (może być inny niż zasiedziany)
 
-    if (iDrivigFlags & movePrimary)
+    if( primary() )
     { // jeśli jest aktywnie prowadzącym pojazd, może zrobić własny porządek
         auto pantmask = 1;
         p = pVehicles[end::front];
@@ -3974,7 +4038,7 @@ void TController::SpeedCntrl(double DesiredSpeed)
 void TController::SetTimeControllers()
 {
     // TBD, TODO: rework this method to use hint system and regardless of driver type
-    if( false == AIControllFlag || 0 == mvOccupied->CabActive ) { return; }
+    if( !primary() || !AIControllFlag || mvOccupied->CabActive == 0 ) { return; } // bierna obsada nie rusza nastawników
 
 	//1. Check the type of Main Brake Handle
     if( BrakeSystem == TBrakeSystem::Pneumatic || ForcePNBrake )
@@ -4185,7 +4249,7 @@ void TController::SetTimeControllers()
 void TController::CheckTimeControllers()
 {
     // TODO: rework this method to use hint system and regardless of driver type
-    if( false == AIControllFlag || 0 == mvControlling->CabActive ) { return; }
+    if( !primary() || !AIControllFlag || mvControlling->CabActive == 0 ) { return; } // bierna obsada nie rusza nastawników
 
 	//1. Check the type of Main Brake Handle
     if( BrakeSystem == TBrakeSystem::ElectroPneumatic && mvOccupied->Handle->TimeEP && !ForcePNBrake )
@@ -4388,6 +4452,27 @@ void TController::PutCommand(std::string NewCommand, double NewValue1, double Ne
 
 bool TController::PutCommand( std::string NewCommand, double NewValue1, double NewValue2, glm::dvec3 const *NewLocation, TStopReason reason )
 { // analiza komendy
+    // rozkaz jazdy/rozruchu dla biernej obsady: przejmuje prowadzenie, inaczej nikt nie ruszy
+    auto const claims_lead{
+        NewCommand.compare( 0, 10, "Timetable:" ) == 0
+     || NewCommand == "Prepare_engine"
+     || ( NewCommand == "SetVelocity" && NewValue1 != 0.0 )
+     || NewCommand == "ShuntVelocity"
+     || NewCommand == "Obey_train"
+     || NewCommand == "Bank"
+     || NewCommand == "Shunt"
+     || NewCommand == "Loose_shunt" };
+    if( claims_lead && !primary() && AIControllFlag ) {
+        primary( true );
+        if( mvOccupied->CabActive == 0 ) {
+            mvOccupied->CabActivisationAuto();
+        }
+        if( mvOccupied->DirActive == 0 ) {
+            DirectionForward( true );
+        }
+        DirectionChange();
+    }
+
     if (NewCommand == "CabSignal")
     { // SHP wyzwalane jest przez człon z obsadą, ale obsługiwane przez silnikowy
         // nie jest to najlepiej zrobione, ale bez symulacji obwodów lepiej nie będzie
@@ -4456,7 +4541,7 @@ bool TController::PutCommand( std::string NewCommand, double NewValue1, double N
                 TrainParams.StationStart = TrainParams.StationIndex;
                 asNextStop = TrainParams.NextStop();
                 m_lastannouncement = announcement_t::idle;
-                iDrivigFlags |= movePrimary; // skoro dostał rozkład, to jest teraz głównym
+                primary( true );
 //                NewCommand = Global.asCurrentSceneryPath + NewCommand;
                 auto lookup =
                     FileExists(
@@ -4882,10 +4967,58 @@ void TController::PhysicsLog()
 void
 TController::Update( double const Timedelta ) {
     // uruchamiać przynajmniej raz na sekundę
-    if( ( iDrivigFlags & movePrimary ) == 0 ) { return; } // pasywny nic nie robi
-    if( false == simulation::is_ready )       { return; }
+    if( !simulation::is_ready ) { return; }
 
     update_timers( Timedelta );
+
+    auto const awarenessrange {
+        std::max(
+            750.0,
+            mvOccupied->Vel > EU07_AI_MOVEMENT ?
+                400 + fBrakeDist :
+                30.0 * fDriverDist ) };
+
+    if( !primary() ) {
+        // bierna: nie steruje jazdą; przy wygaszonym składzie skanuje (budzenie / przejęcie na sygnał)
+        if( AIControllFlag ) {
+            // nie dokłada siły ani hamulca, pilnuje czuwaka; co takt, więc nic nie zostaje zapamiętane
+            mvOccupied->BrakeValveActive = false; // przewodem głównym steruje prowadzący
+            // zbicie czuwaka; bez NN samo potwierdzanie nie wystarcza (patrz TSecuritySystem::is_braking)
+            mvOccupied->SecuritySystem.acknowledge_press();
+            mvOccupied->SecuritySystem.acknowledge_release();
+            if( false == ( mvOccupied->Power24vIsAvailable || mvOccupied->Power110vIsAvailable ) ) {
+                mvOccupied->SecuritySystem.set_enabled( false );
+            }
+            ZeroSpeed( true );
+            ZeroLocalBrake();
+            if( mvOccupied->SpringBrake.Activate ) {
+                mvOccupied->SpringBrakeActivate( false );
+            }
+        }
+        else {
+            // w kabinie siedzi człowiek - obsługuje ją sam
+            mvOccupied->BrakeValveActive = true;
+        }
+        if( pVehicle->ctOwner != nullptr
+         && pVehicle->ctOwner != this
+         && pVehicle->ctOwner->iEngineActive ) {
+            return; // skład jedzie pod aktywnym prowadzącym - nie dublujemy skanu
+        }
+        auto const reactiontime{ std::min( ReactionTime, 2.0 ) };
+        if( LastReactionTime < reactiontime ) { return; }
+        LastReactionTime -= reactiontime;
+        orient_scan_to_cab();
+        scan_route( awarenessrange );
+        scan_obstacles( awarenessrange );
+        if( AIControllFlag
+         && ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank | Prepare_engine ) ) == 0 ) {
+            check_route_ahead( awarenessrange );
+        }
+        return;
+    }
+
+    mvOccupied->BrakeValveActive = true; // prowadzący otwiera zawór (mógł być odcięty jako bierny)
+
     update_logs( Timedelta );
 
     auto const reactiontime { std::min( ReactionTime, 2.0 ) };
@@ -4910,16 +5043,9 @@ TController::Update( double const Timedelta ) {
     determine_consist_state();
     determine_braking_distance();
     determine_proximity_ranges();
-    // vicinity check
-    auto const awarenessrange {
-        std::max(
-            750.0,
-            mvOccupied->Vel > EU07_AI_MOVEMENT ?
-                400 + fBrakeDist :
-                30.0 * fDriverDist ) }; // 1500m dla stojących pociągów;
-    if( is_active() ) {
-        scan_route( awarenessrange );
-    }
+
+    // skanujemy także wygaszeni, żeby zobaczyć zezwolenie i się obudzić
+    scan_route( awarenessrange );
     scan_obstacles( awarenessrange );
     // generic actions
     control_security_system( reactiontime );
@@ -5611,16 +5737,26 @@ void TController::UpdateDelayFlag() {
 
 //-----------koniec skanowania semaforow
 
+void TController::release_transient_controls()
+{ // chwilowe actuatory na każdą zmianę prowadzącego wracają do zera
+    mvOccupied->WarningSignal = 0;
+    mvControlling->SandboxManual( false );
+    fWarningDuration = 0.0;
+    iDrivigFlags &= ~( moveStartHornNow | moveStartHornDone );
+}
+
 void TController::TakeControl( bool const Aidriver, bool const Forcevehiclecheck )
 { // przejęcie kontroli przez AI albo oddanie
     if (AIControllFlag == Aidriver && !Forcevehiclecheck)
         return; // już jest jak ma być
+    release_transient_controls();
     if (Aidriver) //żeby nie wykonywać dwa razy
     { // teraz AI prowadzi
         AIControllFlag = AIdriver;
         pVehicle->Controller = AIdriver;
 		control_lights();   // reinicjalizacja swiatel
 		mvOccupied->CabActivisation(true);
+        sync_consist_reversers(); // po przejęciu od człowieka kierunki członów mogły się rozjechać
         iDirection = 0; // kierunek jazdy trzeba dopiero zgadnąć
         TableClear(); // ponowne utworzenie tabelki, bo człowiek mógł pojechać niezgodnie z sygnałami
         if( action() != TAction::actSleep ) {
@@ -5778,13 +5914,14 @@ TController::TrackObstacle() const {
 
 void TController::MoveTo(TDynamicObject *to)
 { // przesunięcie AI do innego pojazdu (przy zmianie kabiny)
+    auto take_primary{false}; // przejmujemy prowadzenie dopiero po usunięciu poprzednika
     if( to->Mechanik != nullptr
      && to->Mechanik != this ) {
         // ai controller thunderdome, there can be only one
         if( to->Mechanik->AIControllFlag ) {
-            if( to->Mechanik->primary() ) {
-                // take over boss duties
-                primary( true );
+            take_primary = to->Mechanik->primary();
+            if( take_primary ) {
+                to->Mechanik->primary( false ); // zawór odcinamy przed delete, żeby nie zostawić go otwartego
             }
             SafeDelete( to->Mechanik );
         }
@@ -5800,7 +5937,9 @@ void TController::MoveTo(TDynamicObject *to)
     pVehicle = to;
     ControllingSet(); // utworzenie połączenia do sterowanego pojazdu
     pVehicle->Mechanik = this;
-
+    if( take_primary ) {
+        primary( true );
+    }
 };
 
 void TController::ControllingSet()
@@ -5819,14 +5958,45 @@ void TController::ControllingSet()
 };
 
 std::string TController::TableText( std::size_t const Index ) const
-{ // pozycja tabelki prędkości
-    if( Index < sSpeedTable.size() ) {
-        return sSpeedTable[ Index ].TableText();
-    }
-    else {
+{ // pozycja tabelki prędkości; dopiski pomagają w debugu adresacji sygnałów
+    if( Index >= sSpeedTable.size() ) {
         return "";
     }
+
+    auto text { sSpeedTable[ Index ].TableText() };
+    auto const *pointevent { sSpeedTable[ Index ].evEvent };
+
+    if( pointevent != nullptr ) {
+        if( pointevent == eSignNext ) {
+            text += " <-- next";
+        }
+        if( pointevent == eSignForeignPermission ) {
+            text += " (not ours)";
+        }
+    }
+
+    return text;
 };
+
+double TController::TableDistance( std::size_t const Index ) const
+{ // do wstawiania przeszkody w tabelkę wg odległości
+    return
+        Index < sSpeedTable.size() ?
+            sSpeedTable[ Index ].fDist :
+            std::numeric_limits<double>::max();
+}
+
+std::string TController::ObstacleText() const
+{ // wiersz jak w TableText, żeby panel pokazał pojazd na właściwej pozycji dystansu
+    if( Obstacle.vehicle == nullptr ) {
+        return "";
+    }
+
+    return
+        to_string( Obstacle.distance, 1, 8 )
+        + "     -   " + Obstacle.vehicle->asName
+        + "   [vehicle" + ( Obstacle.vehicle->ctOwner == this ? " own-consist]" : "]" );
+}
 
 int TController::CrossRoute(TTrack *tr)
 { // zwraca numer segmentu dla skrzyżowania (tr)
@@ -6529,6 +6699,27 @@ TController::scan_route( double const Range ) {
     TableCheck( Range );
 }
 
+void
+TController::orient_scan_to_cab() {
+    // jak początek CheckVehicles, bez walki o primary / świateł / ControllingSet
+    iDirection = CheckDirection();
+    if( iDirection == 0 ) { return; }
+
+    auto d{ iDirection >= 0 ? 0 : 1 };
+    auto *p{ pVehicle->FirstFind( d ) };
+    if( p == nullptr ) {
+        p = pVehicle;
+    }
+    pVehicles[ end::front ] = p;
+    auto dir{ 1 - d }; // Neighbour() przesuwa ten indeks na kolejny człon, więc nie może być const
+    fLength = 0.0;
+    while( p != nullptr ) {
+        pVehicles[ end::rear ] = p;
+        fLength += p->MoverParameters->Dim.L;
+        p = p->Neighbour( dir );
+    }
+}
+
 // check for potential collisions
 void
 TController::scan_obstacles( double const Range ) {
@@ -6537,11 +6728,16 @@ TController::scan_obstacles( double const Range ) {
     // we cast to int to avoid getting confused by microstutters
     auto *frontvehicle { pVehicles[ ( static_cast<int>( mvOccupied->V ) * iDirection >= 0 ? end::front : end::rear ) ] };
 
+    // bez zadanego kierunku jazdy (wygaszony AI) bierzemy orientację fizyczną wg zajmowanej kabiny - inaczej
+    // oba warunki poniżej byłyby prawdziwe i skan zawsze szedłby w stronę sprzęgu 0, czyli w połowie
+    // przypadków za siebie: własne człony brane za przeszkodę, a stojący z przodu skład niewidoczny
+    auto const scandirection { iDirection != 0 ? iDirection : mvOccupied->CabOccupied };
+
     int routescandirection;
     // for moving vehicle determine heading from velocity; for standing fall back on the set direction
     if( std::abs(frontvehicle->MoverParameters->V) > 0.5 ? // ignore potential micro-stutters in oposite direction during "almost stop"
 	        frontvehicle->MoverParameters->V > 0.0 :
-	        pVehicle->DirectionGet() == frontvehicle->DirectionGet() ? iDirection >= 0 : iDirection <= 0 ) {
+	        pVehicle->DirectionGet() == frontvehicle->DirectionGet() ? scandirection >= 0 : scandirection <= 0 ) {
         // towards coupler 0
         routescandirection = end::front;
     }
@@ -7115,12 +7311,22 @@ TController::UpdateDisconnect() {
 
 void
 TController::handle_engine() {
-    // HACK: activate route scanning if an idling vehicle is activated by a human user
     if( OrderCurrentGet() == Wait_for_orders
-     && false == iEngineActive
-//     && ( false == AIControllFlag )
-     && true == mvOccupied->Power24vIsAvailable ) {
-        OrderNext( Prepare_engine );
+     && false == iEngineActive ) {
+        // świadomość otoczenia nie zależy od zasilania: skanowanie jest czysto geometryczne, a maszynista
+        // widzi sygnalizator także w pojeździe z wyłączoną baterią
+        iDrivigFlags |= moveActive;
+        if( AIControllFlag
+         && primary()
+         && mvOccupied->DirActive == 0
+         && SemNextIndex != -1 ) {
+            // jest sygnał z przodu, a kierunek jeszcze nieustawiony - ustawiamy, żeby skan szedł do przodu
+            if( mvOccupied->CabActive == 0 ) {
+                mvOccupied->CabActivisationAuto();
+            }
+            DirectionForward( true );
+            DirectionChange();
+        }
     }
     // basic engine preparation
     if( OrderCurrentGet() == Prepare_engine ) {
@@ -7245,8 +7451,12 @@ TController::pick_optimal_speed( double const Range ) {
     SwitchClearDist = -1;
     ActualProximityDist = Range; // funkcja Update() może pozostawić wartości bez zmian
 
-    // if we're idling bail out early
     if( false == is_active() ) {
+        // wygaszony też patrzy na sygnały - zezwolenie może go obudzić (Prepare_engine w masce)
+        if( AIControllFlag
+         && ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank | Prepare_engine ) ) == 0 ) {
+            check_route_ahead( Range );
+        }
         VelDesired = 0.0;
         VelNext = 0.0;
         AccDesired = std::min( AccDesired, EU07_AI_NOACCELERATION );
@@ -8176,10 +8386,78 @@ void TController::control_main_pipe() {
     }
 }
 
+bool
+TController::signal_addressee_stands_ahead() const {
+    // zezwolenie jest adresowane do składu stojącego przed sygnalizatorem, więc przeglądamy trasę tylko do
+    // niego. Zapas obejmuje tor, na którym adresat stoi - jego czoło potrafi wypaść tuż za sygnalizatorem
+    if( SemNextIndex == std::size_t( -1 ) ) { return false; }
+
+    auto const signaldistance { sSpeedTable[ SemNextIndex ].fDist + EU07_AI_SIGNALADDRESSEEMARGIN };
+
+    for( auto const &point : sSpeedTable ) {
+        if( point.fDist > signaldistance )          { break; }
+        if( ( point.iFlags & spTrack ) == 0 )       { continue; }
+        if( point.trTrack == nullptr )              { continue; }
+        for( auto const *vehicle : point.trTrack->Dynamics ) {
+            if( vehicle->ctOwner != this ) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool
+TController::signal_permission_is_ours( bool const Permitting ) {
+
+    // rozpoznanie adresata ma sens tylko tam, gdzie zezwolenie może być podane komu innemu: dla pojazdu
+    // wygaszonego oraz przy manewrach. Jadący w trybie pociągowym mija kolejne semafory i każdy zastawałby
+    // jako zezwalający, więc byłby bez przerwy uznawany za cudzy
+    auto const applies {
+        ( false == iEngineActive )
+     || ( ( OrderCurrentGet() & ( Shunt | Loose_shunt ) ) != 0 ) };
+
+    if( false == applies ) {
+        eSignObserved = eSignNext;
+        eSignForeignPermission = nullptr;
+        bSignWasPermitting = Permitting;
+        return true;
+    }
+
+    if( eSignNext != eSignObserved ) {
+        // sygnalizator dopiero wszedł w pole widzenia, wcześniej zasłaniał go zajęty tor; zastany jako
+        // zezwalający znaczy, że zezwolenie podano, zanim mogliśmy je zobaczyć
+        eSignObserved = eSignNext;
+        eSignForeignPermission = ( Permitting ? eSignNext : nullptr );
+    }
+    else if( false == Permitting ) {
+        // obserwowany jako zabraniający: najbliższe zezwolenie będzie podane już przy nas
+        eSignForeignPermission = nullptr;
+    }
+    else if( false == bSignWasPermitting
+          && true == signal_addressee_stands_ahead() ) {
+        // zezwolenie podano przy nas, ale przy sygnalizatorze stoi już inny skład
+        eSignForeignPermission = eSignNext;
+    }
+    bSignWasPermitting = Permitting;
+
+    return
+        ( false == Permitting )
+     || ( eSignNext == nullptr )
+     || ( eSignForeignPermission != eSignNext );
+}
+
 void
 TController::check_route_ahead( double const Range ) {
 
     auto const comm { TableUpdate( VelDesired, ActualProximityDist, VelNext, AccDesired ) };
+
+    auto const signalpermits { comm == TCommandType::cm_SetVelocity || comm == TCommandType::cm_ShuntVelocity };
+    if( false == signal_permission_is_ours( signalpermits ) ) {
+        // zezwolenie podano dla innego składu, czekamy na własne
+        return;
+    }
 
     switch (comm) {
     // ustawienie VelSignal - trochę proteza = do przemyślenia
@@ -8195,16 +8473,16 @@ TController::check_route_ahead( double const Range ) {
         }
         break;
     }
-    case TCommandType::cm_SetVelocity: { // od wersji 357 semafor nie budzi wyłączonej lokomotywy
-        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank ) ) == 0 ) { // jedzie w dowolnym trybie albo Wait_for_orders
+    case TCommandType::cm_SetVelocity: {
+        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank | Prepare_engine ) ) == 0 ) {
             if( std::fabs( VelSignal ) >= 1.0 ) { // 0.1 nie wysyła się do samochodow, bo potem nie ruszą
                 PutCommand( "SetVelocity", VelSignal, VelNext, nullptr ); // komenda robi dodatkowe operacje
             }
         }
         break;
     }
-    case TCommandType::cm_ShuntVelocity: { // od wersji 357 Tm nie budzi wyłączonej lokomotywy
-        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank ) ) == 0 ) { // jedzie w dowolnym trybie albo Wait_for_orders
+    case TCommandType::cm_ShuntVelocity: {
+        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank | Prepare_engine ) ) == 0 ) {
             PutCommand( "ShuntVelocity", VelSignal, VelNext, nullptr );
         }
         else if( iCoupler ) { // jeśli jedzie w celu połączenia
@@ -8213,8 +8491,7 @@ TController::check_route_ahead( double const Range ) {
         break;
     }
     case TCommandType::cm_Command: { // komenda z komórki
-        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank ) ) == 0 ) {
-            // jedzie w dowolnym trybie albo Wait_for_orders
+        if( ( OrderCurrentGet() & ~( Shunt | Loose_shunt | Obey_train | Bank | Prepare_engine ) ) == 0 ) {
             if( mvOccupied->Vel < 0.1 ) {
                 // dopiero jak stanie
 /*

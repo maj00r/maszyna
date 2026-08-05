@@ -2028,6 +2028,7 @@ class TMoverParameters
 
 	int BrakeCtrlPos = -2; /*nastawa hamulca zespolonego*/
 	double BrakeCtrlPosR = 0.0; /*nastawa hamulca zespolonego - plynna dla FV4a*/
+	bool BrakeValveActive{true}; // tylko prowadzący steruje przewodem; bierna obsada ma zawór odcięty
 	double BrakeCtrlPos2 = 0.0; /*nastawa hamulca zespolonego - kapturek dla FV4a*/
 	int ManualBrakePos = 0; /*nastawa hamulca recznego*/
 	double LocalBrakePosA = 0.0; /*nastawa hamulca pomocniczego*/
@@ -2408,6 +2409,7 @@ class TMoverParameters
 	void UpdateBrakePressure(double dt);
 	void UpdatePipePressure(double dt);
 	void CompressorCheck(double dt); /*wlacza, wylacza kompresor, laduje zbiornik*/
+	double GetDPMainValve(double dt, double hp) const; // przepływ przez zawór maszynisty; 0 gdy odcięty
 	void UpdatePantVolume(double dt); // Ra
 	void UpdateScndPipePressure(double dt);
 	void UpdateSpringBrake(double dt);

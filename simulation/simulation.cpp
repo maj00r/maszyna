@@ -250,11 +250,13 @@ void state_manager::process_commands() {
                     continue;
                 }
 
+                // pojazd może nie mieć obsady (zdjęta komendą Crew), a puste wskaźniki po obu stronach nie
+                // znaczą, że to ten sam skład
                 auto const sameconsist{
-                    targetvehicle->ctOwner == currentvehicle->Mechanik
-                 || targetvehicle->ctOwner == currentvehicle->ctOwner };
-                auto const isincharge{ currentvehicle->Mechanik->primary() };
-                auto const aidriveractive{ currentvehicle->Mechanik->AIControllFlag };
+                    ( currentvehicle->Mechanik != nullptr && targetvehicle->ctOwner == currentvehicle->Mechanik )
+                 || ( currentvehicle->ctOwner != nullptr && targetvehicle->ctOwner == currentvehicle->ctOwner ) };
+                auto const isincharge{ currentvehicle->Mechanik != nullptr && currentvehicle->Mechanik->primary() };
+                auto const aidriveractive{ currentvehicle->Mechanik != nullptr && currentvehicle->Mechanik->AIControllFlag };
                 // TODO: support for primary mode request passed as commanddata.param1
                 if( !sameconsist && isincharge ) {
                     // oddajemy dotychczasowy AI
