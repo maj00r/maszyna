@@ -791,6 +791,8 @@ private:
         return iDirection + iDirection - 1; };
     int DettachStatus(int dir);
     int Dettach(int dir);
+    // po rozłączeniu/obsadzeniu wybiera jednego prowadzącego w składzie - dwóch walczy o hamulec
+    void reassign_consist_primary();
     TDynamicObject * Neighbour(int &dir);
     // updates potential collision sources
     void update_neighbours();

@@ -895,12 +895,13 @@ debug_panel::update_section_vehicle( std::vector<text_line> &Output ) {
 
     std::snprintf(
         m_buffer.data(), m_buffer.size(),
-        STR_C("Brakes:\n train: %.2f (mode: %d, delay: %s, load flag: %d)\n independent: %.2f (%.2f), manual: %.2f, spring: %.2f\nBrake cylinder pressures:\n train: %.2f, independent: %.2f, status: 0x%.2x\nPipe pressures:\n brake: %.2f (hat: %.2f), main: %.2f, control: %.2f\nTank pressures:\n auxiliary: %.2f, main: %.2f, control: %.2f"),
+        STR_C("Brakes:\n train: %.2f (mode: %d, delay: %s, load flag: %d, valve: %s)\n independent: %.2f (%.2f), manual: %.2f, spring: %.2f\nBrake cylinder pressures:\n train: %.2f, independent: %.2f, status: 0x%.2x\nPipe pressures:\n brake: %.2f (hat: %.2f), main: %.2f, control: %.2f\nTank pressures:\n auxiliary: %.2f, main: %.2f, control: %.2f"),
         // brakes
         mover.fBrakeCtrlPos,
         mover.BrakeOpModeFlag,
         update_vehicle_brake().c_str(),
         mover.LoadFlag,
+        mover.BrakeValveActive ? "active" : "cut off",
         mover.LocalBrakePosA,
         mover.LocalBrakePosAEIM,
         mover.ManualBrakePos / static_cast<float>(ManualBrakePosNo),
@@ -1266,17 +1267,29 @@ debug_panel::update_section_scantable( std::vector<text_line> &Output ) {
 
 	if( m_input.mechanik == nullptr ) { return; }
 
-	Output.emplace_back( "Flags:       Dist:    Vel:  Name:", Global.UITextColor );
+	Output.emplace_back( "    Dist:  Vel:  Name:", Global.UITextColor );
 
 	auto const &mechanik{ *m_input.mechanik };
 
-	std::size_t i = 0; std::size_t const speedtablesize = std::clamp( static_cast<int>( mechanik.TableSize() ) - 1, 0, 30 );
-	do {
+	// najbliższy pojazd na trasie wchodzi w tabelkę wg swojego dystansu (i na koniec, jeśli dalej niż wszystkie)
+	auto const obstacleline { mechanik.ObstacleText() };
+	auto obstaclepending { false == obstacleline.empty() };
+	auto emit_obstacle = [&]() {
+		Output.emplace_back( Bezogonkow( obstacleline ), Global.UITextColor );
+		obstaclepending = false;
+	};
+
+	std::size_t const speedtablesize = std::clamp( static_cast<int>( mechanik.TableSize() ), 0, 30 );
+	for( std::size_t i = 0; i < speedtablesize; ++i ) {
 		auto const scanline = mechanik.TableText( i );
-		if( scanline.empty() ) { break; }
+		// wygaszone / poza zakresem dają pusty string - pomijamy (nie przerywamy, bo luki bywają w środku)
+		if( scanline.empty() ) { continue; }
+		if( obstaclepending && mechanik.Obstacle.distance < mechanik.TableDistance( i ) ) {
+			emit_obstacle();
+		}
 		Output.emplace_back( Bezogonkow( scanline ), Global.UITextColor );
-		++i;
-	} while( i < speedtablesize );
+	}
+	if( obstaclepending ) { emit_obstacle(); }
 	if( Output.size() == 1 ) {
 		Output.front().data = "(no points of interest)";
 	}

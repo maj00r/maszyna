@@ -681,6 +681,8 @@ void eu07_application::exit()
 	for (auto &mode : m_modes)
 		mode.reset();
 
+	m_taskqueue.exit();
+
 	GfxRenderer->Shutdown();
 	m_network.reset();
 
@@ -693,7 +695,6 @@ void eu07_application::exit()
 	{
 		glfwDestroyWindow(window);
 	}
-	m_taskqueue.exit();
 	glfwPollEvents(); // TODO: This fixes a segfault on Wayland when closing. Remove after updating glfw to 3.5.
 	glfwTerminate();
 

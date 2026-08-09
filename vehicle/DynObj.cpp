@@ -1616,6 +1616,8 @@ int TDynamicObject::Dettach(int dir)
             d = d->Next(); // i w drugą stronę
         }
     }
+    // sąsiad przed rozłączeniem - potem Neighbours już go nie wskaże
+    auto *const severedneighbour { MoverParameters->Neighbours[ dir ].vehicle };
     if( MoverParameters->Couplers[ dir ].CouplingFlag ) {
         // odczepianie, o ile coś podłączone
         MoverParameters->Dettach( dir );
@@ -1628,8 +1630,56 @@ int TDynamicObject::Dettach(int dir)
         };
 */
     }
+    // po rozczepieniu każdy fragment składu musi mieć co najwyżej jednego prowadzącego
+    reassign_consist_primary();
+    if( severedneighbour != nullptr ) {
+        severedneighbour->reassign_consist_primary();
+    }
     // sprzęg po rozłączaniu (czego się nie da odpiąć
     return MoverParameters->Couplers[dir].CouplingFlag;
+}
+
+void TDynamicObject::reassign_consist_primary()
+{ // wybiera lead; samą zmianę primary / zaworów / tabelki robi claim_consist_lead
+    std::vector<TController *> drivers;
+    TController *existingprimary = nullptr;
+    int primarycount = 0;
+    TDynamicObject *farend = this;
+    TDynamicObject *camefrom = nullptr;
+    for( auto *d = this; d != nullptr; )
+    { // przejście po sprzęgach w obie strony (skład nie musi zaczynać się od this)
+        if( d->Mechanik != nullptr )
+        {
+            drivers.emplace_back( d->Mechanik );
+            if( d->Mechanik->primary() ) {
+                ++primarycount;
+                existingprimary = d->Mechanik;
+            }
+        }
+        farend = d;
+        auto *ahead = d->Next();
+        auto *behind = d->Prev();
+        auto *next = ( ahead != nullptr && ahead != camefrom ) ? ahead
+                   : ( behind != nullptr && behind != camefrom ) ? behind
+                   : nullptr;
+        camefrom = d;
+        d = next;
+        if( d == this ) { break; }
+    }
+    if( drivers.empty() ) { return; }
+    // szukamy obsady prowadzonej przez człowieka - jego kabina ma pierwszeństwo, żeby AI nie odbierało mu składu
+    TController *humandriver = nullptr;
+    for( auto *drv : drivers ) {
+        if( false == drv->AIControllFlag ) { humandriver = drv; break; }
+    }
+    // przy jednym prowadzącym zostaje on; inaczej: człowiek, skrajne pojazdy, pierwsza z listy
+    TController *lead =
+        ( primarycount == 1 )           ? existingprimary :
+        ( humandriver != nullptr )      ? humandriver :
+        ( Mechanik != nullptr )         ? Mechanik :
+        ( farend->Mechanik != nullptr ) ? farend->Mechanik :
+                                          drivers.front();
+    lead->claim_consist_lead();
 }
 
 void
