@@ -22,6 +22,20 @@ vec3 envmap_color( vec3 normal )
 	return envcolor;
 }
 
+// Diffuse irradiance probe: along the normal, not the reflection vector, at a
+// mip blurred enough to read as incoming light rather than a mirror image.
+vec3 envmap_irradiance(vec3 fragnormal, float lod)
+{
+#if ENVMAP_ENABLED
+    vec3 n = vec3(inv_view * vec4(fragnormal, 0.0)); // world space
+    vec3 envcolor = textureLod(envmap, n, lod).rgb;
+    if (any(isnan(envcolor)) || any(isinf(envcolor))) envcolor = vec3(0.0);
+    return max(envcolor, vec3(0.0));
+#else
+    return vec3(0.5);
+#endif
+}
+
 // Roughness-aware env map lookup — uses mip levels for blurry reflections.
 // lod 0.0 = mirror sharp, lod ~8.0 = fully diffuse blur.
 vec3 envmap_color_lod(vec3 fragnormal, float lod)

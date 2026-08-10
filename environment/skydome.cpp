@@ -198,6 +198,9 @@ void CSkyDome::RebuildColors() {
 	// get perez function parametrs
 	float perezluminance[5], perezx[5], perezy[5];  
 	GetPerez( perezluminance, m_distributionluminance, m_turbidity );
+	// Perez's ~5.3 circumsolar term is faithful but assumes an adapting eye; at a
+	// fixed exposure it washes half the dome to white.
+	perezluminance[ 2 ] *= 0.25f;
 	GetPerez( perezx, m_distributionxcomp, m_turbidity );
 	GetPerez( perezy, m_distributionycomp, m_turbidity );
 
@@ -293,7 +296,9 @@ void CSkyDome::RebuildColors() {
         // simple gradient, darkening towards the top
         color *= std::clamp( 1.0f - vertex.y * 0.75f, 0.0f, 1.f );
 
-        float const horizonboost = 1.5f + m_overcast;
+        // Perez already brightens toward the horizon via its a/b terms; a strong
+        // boost on top of that washes the lower sky out.
+        float const horizonboost = 1.15f + m_overcast;
         float const horizonbandwidth = 0.2f; // boost tapers to 0 by ~11.5 degrees elevation
         float const horizonband = std::clamp( 1.0f - vertex.y / horizonbandwidth, 0.0f, 1.0f );
 

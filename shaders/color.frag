@@ -12,7 +12,12 @@ layout(location = 1) out vec4 out_motion;
 
 void main()
 {
-	vec3 col = clamp(pow(f_color.rgb, vec3(2.2)),0, 1);
+	// Skydome only. Gamma decode is meaningful below 1; above it sits Perez's
+	// circumsolar term, which washes half the dome without a knee.
+	const float SKY_GLOW_ROLLOFF = 1.5;
+	vec3 sky = max(f_color.rgb, 0.0);
+	vec3 excess = max(sky - 1.0, 0.0);
+	vec3 col = pow(min(sky, 1.0), vec3(2.2)) + excess / (1.0 + excess * SKY_GLOW_ROLLOFF);
 #if POSTFX_ENABLED
 	out_color = vec4(apply_fog(col), 1.0f);
 #else

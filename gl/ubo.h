@@ -139,7 +139,7 @@ namespace gl
     struct light_ubs
     {
         packed_vec3 ambient;
-		UBS_PAD(4);
+        float interior; // 1.0 while drawing a cab; reuses former padding
 
         packed_vec3 fog_color;
         uint32_t lights_count;

@@ -14,6 +14,9 @@ layout(location = 1) out vec4 out_motion;
 void main()
 {
 	vec4 tex_color = texture(tex1, f_coord);
+	// Crush the glare texture's soft alpha skirt; under AgX it reads as a muddy
+	// grey disc around night lamps. Core and rays survive.
+	tex_color.a = pow(max(tex_color.a, 0.0), 2.5);
 #if POSTFX_ENABLED
 	out_color = tex_color * param[0];
 #else

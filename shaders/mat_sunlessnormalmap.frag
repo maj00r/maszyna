@@ -33,11 +33,14 @@ uniform sampler2D normalmap;
 vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float reflectivity, float specularity, float shadowtone)
 {
 	vec3 basecolor = param[0].rgb;
+	// Same reasoning as apply_lights: the cubemap is shot from inside
+	// this cab, so indoors it mirrors the room onto itself.
+	reflectivity *= 1.0 - interior;
 
 	// Cab interior: dim ambient less than the exterior path because
 	// ambient is the dominant indoor illumination. 0.80 trims the
 	// brightest faces without making the cab feel under-lit.
-	fragcolor *= basecolor * 0.80;
+	fragcolor *= basecolor * 0.80 * mix(1.0, INTERIOR_AMBIENT_BOOST, interior);
 
 	vec3 emissioncolor = basecolor * emission;
 	vec3 envcolor = envmap_color(fragnormal);

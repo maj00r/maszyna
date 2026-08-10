@@ -47,6 +47,14 @@ vec3 filmic(vec3 x)
 #define AGX_LOOK 2
 #endif
 
+// Linear pre-exposure before AgX. Raise if interiors read dark.
+const float TONEMAP_EXPOSURE = 0.8;
+
+// Soft knee on HDR peaks only. Too low and the circumsolar aureole smears into
+// a blob instead of staying cooler than the sun core.
+const float HIGHLIGHT_KNEE = 2.0;
+const float HIGHLIGHT_ROLLOFF = 0.85;
+
 vec3 AgxDefaultContrastApprox(vec3 x)
 {
     vec3 x2 = x * x;
@@ -69,12 +77,10 @@ vec3 Agx(vec3 val)
         0.0423756549057051, 0.0784336, 0.879142973793104
     );
 
-    // DEFAULT_LOG2_MIN = -6.0
-    // DEFAULT_LOG2_MAX = +4.5
-    // MIDDLE_GRAY = 0.18
-    // log2(pow(2, VALUE) * MIDDLE_GRAY)
+    // Tonal range, hence contrast: narrower spreads the scene over more output.
+    // Stock AgX is 2.026; the knee caps input at 3.18 so neither clips.
     const float min_ev = -8.47393;
-    const float max_ev = 2.026069;
+    const float max_ev = 2.8;
     const float agx_eps = 1e-6;
 
     // Input transform (inset)
@@ -118,10 +124,11 @@ vec3 AgxLook(vec3 val)
     power = vec3(0.8);
     sat = 0.8;
 #elif AGX_LOOK == 2
-    // Punchy
+    // Punchy, but stock sat 1.1 over-saturates daylight here; power is the part
+    // worth keeping.
     slope = vec3(1.0);
     power = vec3(1.35);
-    sat = 1.1;
+    sat = 1.0;
 #endif
 
     // ASC CDL
@@ -146,6 +153,15 @@ vec4 tonemap(vec4 x)
 	vec3 hdr = x.rgb;
 	hdr = mix(hdr, vec3(0.0), vec3(any(isnan(hdr)) || any(isinf(hdr))));
 	hdr = max(hdr, vec3(0.0));
+	hdr *= TONEMAP_EXPOSURE;
+	{
+		float peak = max(hdr.r, max(hdr.g, hdr.b));
+		if (peak > HIGHLIGHT_KNEE) {
+			float excess = peak - HIGHLIGHT_KNEE;
+			float rolled = HIGHLIGHT_KNEE + excess / (1.0 + excess * HIGHLIGHT_ROLLOFF);
+			hdr *= rolled / peak;
+		}
+	}
 	return FBOUT(vec4(ApplyAgX(hdr), x.a));
 	//return FBOUT(vec4(ACESFilm(hdr), x.a));
 	//return FBOUT(vec4(reinhard(x.rgb), x.a));

@@ -20,26 +20,46 @@ float metalic = 0.0;
 //
 // SUN_DIFFUSE_SCALE:    brightness of UNSHADED (sun-lit) faces. Lower
 //                       this to dim hot surfaces in direct sunlight
-//                       without affecting shaded areas. Was 3.5; 2.5
-//                       calmly fits the ACES tonemap shoulder.
+//                       without affecting shaded areas.
 //
 // SUN_NDOTL_SHARPNESS:  N.L curve on the sun. 1.0 = pure Lambert, higher
 //                       = sharper terminator (more contrast between
 //                       lit and shaded faces of the same surface).
 // ---------------------------------------------------------------------
-const float AMBIENT_SCALE       = 0.65;
-const float SUN_DIFFUSE_SCALE   = 1.5;
+const float AMBIENT_SCALE       = 0.5;
+const float SUN_DIFFUSE_SCALE   = 0.8;
 const float SUN_NDOTL_SHARPNESS = 1.25;
 
-// Materials without a gloss map used to pass glossiness = param[1].w into
-// calc_light, which divides by that same param and collapses to the roughness
-// floor (mirror). Scale it down so concrete/asphalt stay matte.
-const float GLOSS_WITHOUT_MAP = 0.25;
+// Reflected env is linear HDR; without a ceiling the sky flares along edges,
+// where the env BRDF already peaks. Ceiling is KNEE + 1/ROLLOFF.
+const float ENV_HIGHLIGHT_KNEE    = 1.0;
+const float ENV_HIGHLIGHT_ROLLOFF = 1.8;
 
-// The GGX lobe is near-delta at the 0.04 roughness floor, so a bevelled edge
-// fires a one-pixel white line that crawls as the camera moves.
+// Mirror-sharp reflections turn every kink in low-poly bodywork into a facet.
+const float ENV_MIN_REFLECTION_LOD = 2.5;
+
+// Specular anti-aliasing: the GGX lobe is near-delta at the 0.04 roughness
+// floor, so a bevelled edge fires a one-pixel white line that crawls.
 const float SPECULAR_AA_VARIANCE = 0.25;
 const float SPECULAR_AA_MAX      = 0.18;
+
+// Stands in for the gloss map on materials that have none. calc_light divides
+// glossiness by param[1].w, so passing that param through cancels to the
+// roughness floor and renders plain concrete and asphalt as mirrors.
+const float GLOSS_WITHOUT_MAP = 0.25;
+
+// Interiors get no sun at all, so where an outdoor surface is lit by ambient
+// plus SUN_DIFFUSE_SCALE, a cab is left with ambient alone and reads dark.
+const float INTERIOR_AMBIENT_BOOST = 2.0;
+
+// Ambient arrives as one directionless colour. The cubemap's high mips are a
+// free irradiance probe; only its ratio to its own mean is used, so the level
+// the renderer picked (day/night, cab light) survives.
+const float ENV_AMBIENT_STRENGTH = 0.7;
+const float ENV_AMBIENT_MIN      = 0.35;
+const float ENV_AMBIENT_MAX      = 2.0;
+const float ENV_IRRADIANCE_LOD   = 8.0;  // ~4x4 per face
+const float ENV_AVERAGE_LOD      = 12.0; // clamps to the 1x1 mip
 
 float calc_shadow(float NdotL)
 {
@@ -56,14 +76,12 @@ float calc_shadow(float NdotL)
 		
 		
 
-	// Slope-scaled bias. Fixed bias stripes flat roads at dawn/dusk; a
-	// grazing sun makes each shadow texel span a large depth range so PCF
-	// neighbours self-shadow. Do NOT add screen-space dFdx(depth) here —
-	// at the caster silhouette those derivatives explode and punch bright
-	// holes in the shadow (peter-panning along the contact edge).
-	float ndl = clamp(NdotL, 0.0, 1.0);
-	float slope = min(sqrt(max(0.0, 1.0 - ndl * ndl)) / max(ndl, 0.06), 12.0);
-	float bias = 0.00008f * float(cascade + 1U) + 0.00018f * slope;
+	// Slope-scaled: a surface spans more depth per shadow texel as the light
+	// goes grazing, and a fixed bias leaves it striping itself at dawn and dusk.
+	// Added, not multiplied, by the cascade: compounding the two overshoots in
+	// the far cascades and light leaks through at the cascade boundary.
+	float slope = clamp(sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.15), 0.0, 6.0);
+	float bias = 0.00005f * float(cascade + 1U) + 0.00007f * slope;
 	vec2 texel = vec2(1.0) / vec2(textureSize(shadowmap, 0));
 	//float radius = 1.0; f_light_pos[cascade].w; //0.5 + 2.0 * max(abs(2.0 * coords.x - 1.0), abs(2.0 * coords.y - 1.0));
 	float radius = 1.0;
@@ -280,18 +298,42 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
     return F0 * AB.x + AB.y;
 }
 
+// Compresses only the over-bright part, and by luminance so hue survives.
+vec3 compress_env_highlights(vec3 c)
+{
+    float l = max(c.r, max(c.g, c.b));
+    if (l <= ENV_HIGHLIGHT_KNEE)
+        return c;
+    float excess = l - ENV_HIGHLIGHT_KNEE;
+    float rolled = ENV_HIGHLIGHT_KNEE + excess / (1.0 + excess * ENV_HIGHLIGHT_ROLLOFF);
+    return c * (rolled / l);
+}
+
 // [0] - diffuse, [1] - specular
 // do magic here
 vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float reflectivity, float specularity, float shadowtone)
 {
     vec3 basecolor = param[0].rgb;
+
+    // The cubemap is rendered from the camera, i.e. from inside this cab, so
+    // indoors it would mirror the room onto itself and swim as the camera turns.
+    reflectivity *= 1.0 - interior;
     // Scale ambient before it gets tinted by basecolor / texture.
     // Sun, headlights and emission are added afterwards so they are NOT
     // attenuated by AMBIENT_SCALE - this only dims the indirect term.
-    fragcolor *= basecolor * AMBIENT_SCALE;
+    fragcolor *= basecolor * AMBIENT_SCALE * mix(1.0, INTERIOR_AMBIENT_BOOST, interior);
 
-    // Metals have diffuse_albedo = 0, so ambient/headlights routed through it
-    // vanish. Keep a parallel fill path tinted by albedo.
+    // Guarded on the mean: the reflection pass binds an empty black cubemap.
+    float probe_mean = dot(envmap_irradiance(fragnormal, ENV_AVERAGE_LOD), vec3(1.0 / 3.0));
+    if (probe_mean > 1e-3)
+    {
+        vec3 probe = envmap_irradiance(fragnormal, ENV_IRRADIANCE_LOD);
+        vec3 shape = clamp(probe / probe_mean, ENV_AMBIENT_MIN, ENV_AMBIENT_MAX);
+        fragcolor *= mix(vec3(1.0), shape, ENV_AMBIENT_STRENGTH * (1.0 - interior));
+    }
+
+    // Metals have no diffuse_albedo, so anything routed through it vanishes.
+    // Seeded with ambient; headlights add to it below.
     vec3 metal_fill = fragcolor;
 
     vec3 emissioncolor = basecolor * emission;
@@ -302,28 +344,29 @@ vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float refl
 
     const float MAX_REFLECTION_LOD = 8.0;
     float env_roughness = 1.0 - clamp(glossiness / max(abs(param[1].w), 1.0), 0.0, 1.0);
-    vec3 envcolor = envmap_color_lod(fragnormal, env_roughness * MAX_REFLECTION_LOD);
+    float env_lod = max(env_roughness * MAX_REFLECTION_LOD, ENV_MIN_REFLECTION_LOD);
+    vec3 envcolor = compress_env_highlights(envmap_color_lod(fragnormal, env_lod));
 
     // Pre-integrated env BRDF: roughness/F0/view-dependent specular scale.
     // Replaces the old raw `fresnel` weighting so matte surfaces stop
     // mirroring the sky. `env_spec` is the colour to multiply the cubemap by.
     vec3 env_spec = EnvBRDFApprox(F0, env_roughness, NdotV);
 
-    // Head-on, not at the real angle: env_spec swings ~0.04..0.5 with NdotV, so
-    // weighting the tint by it shifts a surface's saturation as the camera turns.
-    // Clamped because these are HDR values and mix() would otherwise extrapolate
-    // past full saturation into negative colours.
+    // Head-on, not at the real angle: env_spec swings ~0.04..0.5 with NdotV and
+    // would shift the tint below as the camera turns. Roughness gating survives.
     vec3 env_spec_headon = EnvBRDFApprox(F0, env_roughness, 1.0);
     float env_spec_w = max(env_spec_headon.r, max(env_spec_headon.g, env_spec_headon.b));
 
+    // Driven by the probe mean, not envcolor, which rides a view-dependent
+    // reflection vector. Clamped: HDR, so mix() would extrapolate past full.
     vec3 texturecoloryuv = rgb2yuv(texturecolor);
     vec3 texturecolorfullv = yuv2rgb(vec3(0.2176, texturecoloryuv.gb));
-    vec3 envyuv = rgb2yuv(envcolor);
     texturecolor = mix(texturecolor, texturecolorfullv,
-                       clamp(envyuv.r * reflectivity * env_spec_w, 0.0, 1.0));
+                       clamp(probe_mean * reflectivity * env_spec_w, 0.0, 1.0));
 
     if (lights_count == 0U)
-        // Ambient-only path: metals need fragcolor too or they go pure black.
+        // fragcolor is ambient-only here, so metals get it too - otherwise they
+        // are pure black without direct light.
         return fragcolor * texturecolor
              + emissioncolor * texturecolor
              + envcolor * env_spec * reflectivity;
@@ -339,9 +382,9 @@ vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float refl
     if (shadowtone < 1.0)
         shadow1 = (1.0 - shadowtone) * clamp(calc_shadow(sunlight.x), 0.0, 1.0);
 
-    // Sun HDR scale -> SUN_DIFFUSE_SCALE (default 2.5). Controls how
-    // bright sun-lit (unshaded) faces get. Lower this if surfaces in
-    // direct sun read as too hot/burnt; raise it for more punch.
+    // Sun HDR scale -> SUN_DIFFUSE_SCALE. Controls how bright sun-lit
+    // (unshaded) faces get. Lower if surfaces in direct sun read as too
+    // hot/burnt; raise for more punch.
     fragcolor += lights[0].color * SUN_DIFFUSE_SCALE * (1.0 - shadow1) * diffuseamount;
 
     for (uint i = 1U; i < lights_count; i++)

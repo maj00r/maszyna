@@ -45,6 +45,7 @@ void gl::glsl_common_setup()
     layout(std140) uniform light_ubo
     {
             vec3 ambient;
+            float interior;
 
             vec3 fog_color;
             uint lights_count;

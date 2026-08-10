@@ -19,9 +19,20 @@ float get_fog_amount()
 	return fog_amount_v;
 }
 
+// Haze that does not wait for the scenery's fog range, which is routinely set
+// to several km - without it the horizon just stops.
+const float AERIAL_RANGE = 3000.0;
+const float AERIAL_MAX = 0.35;
+
+float get_aerial_amount()
+{
+	return AERIAL_MAX * (1.0 - exp(-length(f_pos.xyz) / AERIAL_RANGE));
+}
+
 vec3 apply_fog(vec3 color)
 {
-	return mix(color, get_fog_color(), get_fog_amount());
+	// Fills in only where the scenery's own fog is weak, never stacking on it.
+	return mix(color, get_fog_color(), max(get_fog_amount(), get_aerial_amount()));
 }
 
 vec3 add_fog(vec3 color, float amount)
