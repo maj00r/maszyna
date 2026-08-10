@@ -199,6 +199,10 @@ bool opengl33_renderer::Init(GLFWwindow *Window)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
+	// Otherwise faces filter in isolation and seam along the cube edges, which
+	// is glaring on the high mips the irradiance probe samples (4x4 per face).
+	glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+
 	m_empty_cubemap = std::make_unique<gl::cubemap>();
 	m_empty_cubemap->alloc(Global.gfx_format_color, 16, 16, GL_RGB, GL_FLOAT);
 
@@ -1933,8 +1937,37 @@ bool opengl33_renderer::Render(world_environment *Environment)
 	auto const &modelview = OpenGLMatrices.data(GL_MODELVIEW);
 
     auto const fogfactor{std::clamp(Global.fFogEnd / 2000.f, 0.f, 1.f)}; // stronger fog reduces opacity of the celestial bodies
-	float const duskfactor = 1.0f - std::clamp(std::abs(Environment->m_sun.getAngle()), 0.0f, 12.0f) / 12.0f;
-	glm::vec3 suncolor = glm::mix(glm::vec3(255.0f / 255.0f, 242.0f / 255.0f, 231.0f / 255.0f), glm::vec3(235.0f / 255.0f, 140.0f / 255.0f, 36.0f / 255.0f), duskfactor);
+	// Widened from 12 deg: the sun goldens well before it touches the horizon.
+	float const duskfactor = 1.0f - std::clamp(std::abs(Environment->m_sun.getAngle()), 0.0f, 18.0f) / 18.0f;
+	// Celestial bodies blend additively, so the blue a dusk sun adds is what pales
+	// its core. At zero it keeps only the sky's blue and stays saturated.
+	glm::vec3 suncolor = glm::mix(glm::vec3(255.0f / 255.0f, 242.0f / 255.0f, 231.0f / 255.0f), glm::vec3(250.0f / 255.0f, 105.0f / 255.0f, 0.0f), duskfactor);
+
+	// Sun glare, under the disc. The disc is its true 0.53 deg and reads as a dot
+	// alone; glare is what makes the real sun look big, and there is no bloom pass.
+	{
+		Bind_Texture(0, m_suntexture); // unsampled here, but keep the unit complete
+		auto const sunvector = Environment->m_sun.getDirection();
+		auto const sunpos = glm::vec3(modelview * glm::vec4(sunvector, 1.0f));
+		float const visibility = std::clamp(1.5f - Global.Overcast, 0.f, 1.f) * fogfactor;
+
+		model_ubs.param[2] = glm::vec4(0.0f, 1.0f, 1.0f, 3.0f /* falloff */);
+		model_ubs.param[0] = glm::vec4(suncolor * 1.5f, visibility * 0.3f);
+		model_ubs.param[1] = glm::vec4(sunpos, 0.07f /* size */);
+		model_ubo->update(model_ubs);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		// Steep, or the whole quad clears white and draws a flat disc.
+		model_ubs.param[2] = glm::vec4(0.0f, 1.0f, 1.0f, 4.0f /* falloff */);
+
+		// Brightness sets the apparent size: the further past white the core goes,
+		// the more of its falloff still saturates after tonemapping.
+		float const sunhigh = std::clamp(Environment->m_sun.getAngle() / 35.f, 0.f, 1.f);
+		model_ubs.param[0] = glm::vec4(suncolor * std::lerp(5.0f, 15.0f, sunhigh * sunhigh), visibility);
+		model_ubs.param[1] = glm::vec4(sunpos, 0.024f /* size */);
+		model_ubo->update(model_ubs);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
 
 	// sun
 	{
@@ -3551,11 +3584,14 @@ bool opengl33_renderer::Render_cab(TDynamicObject const *Dynamic, float const Li
 
             auto const old_ambient { light_ubs.ambient };
             auto const luminance { Global.fLuminance * ( Dynamic->fShade > 0.0f ? Dynamic->fShade : 1.0f ) };
+            // Keeps the env probe and cubemap off interiors; the cubemap is
+            // shot from inside this very cab.
+            light_ubs.interior = 1.0f;
             if( Lightlevel > 0.f ) {
                 // crude way to light the cabin, until we have something more complete in place
                 light_ubs.ambient += packed_vec3( ( Dynamic->InteriorLight * Lightlevel ) * std::clamp( 1.25f - (float)luminance, 0.f, 1.f ) );
-                light_ubo->update( light_ubs );
             }
+            light_ubo->update( light_ubs );
 
 			// render
 			if (true == Alpha)
@@ -3570,6 +3606,8 @@ bool opengl33_renderer::Render_cab(TDynamicObject const *Dynamic, float const Li
 			}
 			// post-render restore
             light_ubs.ambient = old_ambient;
+            light_ubs.interior = 0.0f;
+            light_ubo->update( light_ubs );
             setup_sunlight_intensity();
 
 			break;
@@ -5268,6 +5306,7 @@ void opengl33_renderer::Update_Lights(light_array &Lights)
     light_ubs.lights_count = light_i;
     // fill sunlight data
     light_ubs.ambient = m_sunlight.ambient * m_sunlight.factor;// *simulation::Environment.light_intensity();
+    light_ubs.interior = 0.0f; // Render_cab raises this for the duration of the cab
 	light_ubs.lights[0].type = gl::light_element_ubs::DIR;
 	light_ubs.lights[0].dir = mv * glm::vec4(m_sunlight.direction, 0.0f);
 	light_ubs.lights[0].color = m_sunlight.diffuse * m_sunlight.factor * simulation::Environment.light_intensity();

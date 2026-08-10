@@ -51,9 +51,6 @@ void main()
 	
 	fragcolor = apply_lights(fragcolor, fragnormal, tex_color.rgb, reflectivity, specularity, shadow_tone);
 
-	if(alphatestfail)
-		fragcolor.r = 1.0;
-
 	vec4 color = vec4(apply_fog(fragcolor), tex_color.a * alpha_mult);
 
 #if POSTFX_ENABLED

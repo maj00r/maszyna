@@ -39,7 +39,7 @@ void main()
 	vec3 fragnormal = normalize(f_normal);
 	float reflectivity = param[1].z;
 	float specularity = (tex_color.r + tex_color.g + tex_color.b) * 0.5;
-	glossiness = abs(param[1].w);
+	glossiness = abs(param[1].w) * GLOSS_WITHOUT_MAP;
 	
 	fragcolor = apply_lights(fragcolor, fragnormal, tex_color.rgb, reflectivity, specularity, shadow_tone);
 	vec4 color = vec4(apply_fog(fragcolor), tex_color.a * alpha_mult);

@@ -37,9 +37,12 @@ uniform sampler2D specgloss;
 vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float reflectivity, float specularity, float shadowtone)
 {
     vec3 basecolor = param[0].rgb;
+    // Same reasoning as apply_lights: the cubemap is shot from inside
+    // this cab, so indoors it mirrors the room onto itself.
+    reflectivity *= 1.0 - interior;
     // Cab interior: dim ambient less than the exterior path - ambient
     // is the dominant indoor illumination, but it was still too bright.
-    fragcolor *= basecolor * 0.80;
+    fragcolor *= basecolor * 0.80 * mix(1.0, INTERIOR_AMBIENT_BOOST, interior);
 
     vec3 emissioncolor = basecolor * emission;
 
@@ -84,7 +87,7 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
 
     if (shadowtone < 1.0)
     {
-        float shadow = calc_shadow();
+        float shadow = calc_shadow(sunlight.x);
         specularamount *= clamp(1.0 - shadow, 0.0, 1.0);
         fragcolor = mix(fragcolor, fragcolor * shadowtone, clamp(diffuseamount * shadow, 0.0, 1.0));
     }
