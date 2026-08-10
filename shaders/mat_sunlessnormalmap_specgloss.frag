@@ -84,7 +84,7 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
 
     if (shadowtone < 1.0)
     {
-        float shadow = calc_shadow();
+        float shadow = calc_shadow(sunlight.x);
         specularamount *= clamp(1.0 - shadow, 0.0, 1.0);
         fragcolor = mix(fragcolor, fragcolor * shadowtone, clamp(diffuseamount * shadow, 0.0, 1.0));
     }
