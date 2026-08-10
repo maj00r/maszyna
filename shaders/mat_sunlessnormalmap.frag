@@ -63,7 +63,7 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
 	float diffuseamount = (sun_NdotL * param[1].x) * lights[0].intensity;
 	fragcolor += envcolor * reflectivity;
 	float specularamount = (sunlight.y * param[1].y * specularity) * lights[0].intensity;
-	glossiness = abs(param[1].w);
+	glossiness = abs(param[1].w) * GLOSS_WITHOUT_MAP;
 
 	for (uint i = 1U; i < lights_count; i++)
 	{

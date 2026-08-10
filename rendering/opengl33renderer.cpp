@@ -199,6 +199,9 @@ bool opengl33_renderer::Init(GLFWwindow *Window)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
+	// Without this, cubemap faces filter in isolation and seam at the edges.
+	glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+
 	m_empty_cubemap = std::make_unique<gl::cubemap>();
 	m_empty_cubemap->alloc(Global.gfx_format_color, 16, 16, GL_RGB, GL_FLOAT);
 
@@ -1751,21 +1754,30 @@ void opengl33_renderer::setup_drawing(bool const Alpha)
 	case rendermode::reflections:
 	{
 		glCullFace(GL_BACK);
+		glDisable(GL_POLYGON_OFFSET_FILL);
 		break;
 	}
 	case rendermode::shadows:
 	{
+		// Front faces culled so the depth map stores the farther (back)
+		// surface; polygon offset pushes that depth a little further still
+		// to cut acne without the receiver-side bias that punched holes
+		// along vehicle contact shadows.
 		glCullFace(GL_FRONT);
+		glEnable(GL_POLYGON_OFFSET_FILL);
+		glPolygonOffset(2.0f, 4.0f);
 		break;
 	}
 	case rendermode::pickcontrols:
 	case rendermode::pickscenery:
 	{
 		glCullFace(GL_BACK);
+		glDisable(GL_POLYGON_OFFSET_FILL);
 		break;
 	}
 	default:
 	{
+		glDisable(GL_POLYGON_OFFSET_FILL);
 		break;
 	}
 	}
@@ -3554,8 +3566,10 @@ bool opengl33_renderer::Render_cab(TDynamicObject const *Dynamic, float const Li
             if( Lightlevel > 0.f ) {
                 // crude way to light the cabin, until we have something more complete in place
                 light_ubs.ambient += packed_vec3( ( Dynamic->InteriorLight * Lightlevel ) * std::clamp( 1.25f - (float)luminance, 0.f, 1.f ) );
-                light_ubo->update( light_ubs );
             }
+            // Always upload: previously ambient was restored on CPU but skipped
+            // the UBO update when Lightlevel == 0, so the GPU kept stale light.
+            light_ubo->update( light_ubs );
 
 			// render
 			if (true == Alpha)
@@ -3570,6 +3584,7 @@ bool opengl33_renderer::Render_cab(TDynamicObject const *Dynamic, float const Li
 			}
 			// post-render restore
             light_ubs.ambient = old_ambient;
+            light_ubo->update( light_ubs );
             setup_sunlight_intensity();
 
 			break;
