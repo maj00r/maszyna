@@ -802,14 +802,33 @@ state_serializer::deserialize_terrain(cParser &Input, scene::scratch_data &Scrat
 	Input.getTokens(1);
 	Input >> line;
 	if (Global.file_binary_terrain && line.ends_with(".sbt"))
-	{  
-        Scratchpad.binary.terrain = Region->is_scene(line);
-		Global.file_binary_terrain_state = true;
-		Scratchpad.binary.terrain_included = true;
-		Scratchpad.terrain_name = line;
-		WriteLog("Included SBT file: " + line);
-		Region->deserialize(Scratchpad.terrain_name);
+	{
+		// a scenery may name someone else's twin instead of relying on its own, so this one
+		// gets held against its own source list
+		auto const usable {
+		    Region->is_scene( line )
+		 && scene::Sources.is_current( line ) };
 
+		if( true == usable )
+		{
+			Scratchpad.binary.terrain = true;
+			Scratchpad.binary.terrain_included = true;
+			Scratchpad.terrain_name = line;
+			Global.file_binary_terrain_state = true;
+			WriteLog("Included SBT file: " + line);
+			Region->deserialize(Scratchpad.terrain_name);
+		}
+		else
+		{
+			// this scenery does not own the named twin and so cannot rebuild it. the terrain
+			// has to come from the text, which means the flags have to stay clear: were the
+			// binary state left set, the parser would go on skipping the terrain includes and
+			// the scenery would come up with no terrain at all
+			Scratchpad.binary.terrain = false;
+			Scratchpad.binary.terrain_included = false;
+			Global.file_binary_terrain_state = false;
+			ErrorLog("Included SBT file \"" + line + "\" is missing or no longer matches its sources, reading terrain from text instead");
+		}
     }
 
     skip_until(Input, "endterrain");

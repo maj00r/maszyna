@@ -48,12 +48,19 @@ private:
         std::string path;
         std::uint64_t size { 0 };
         std::int64_t modified { 0 };
+        std::uint64_t content { 0 };
     };
 
 // methods
     static std::string control_file( std::string const &Scenariofile );
     static bool is_scenery_text( std::string const &Path );
     static bool stat_file( std::string const &Path, std::uint64_t &Size, std::int64_t &Modified );
+    // digest of the file contents. a checkout or a copied installation rewrites
+    // modification times without touching content, and rebuilding a twin costs a hundred
+    // times more than reading the sources back, so a file is only given up on once its
+    // contents really differ
+    static std::uint64_t hash_file( std::string const &Path );
+    static void write_entries( std::string const &Filename, std::vector<entry> const &Entries );
 
 // members
     std::vector<entry> m_entries;

@@ -60,6 +60,33 @@ bool source_manifest::stat_file( std::string const &Path, std::uint64_t &Size, s
     return true;
 }
 
+std::uint64_t source_manifest::hash_file( std::string const &Path ) {
+
+    std::ifstream input { Path, std::ios::binary };
+    if( false == input.is_open() ) { return 0; }
+
+    // fnv-1a over 64 bit words. not a cryptographic digest, and it does not need to be:
+    // it only has to tell an edited file from an untouched one
+    std::uint64_t digest { 14695981039346656037ull };
+    std::vector<char> buffer( 64 * 1024 );
+
+    while( input ) {
+        input.read( buffer.data(), static_cast<std::streamsize>( buffer.size() ) );
+        auto const read { static_cast<std::size_t>( input.gcount() ) };
+        std::size_t offset { 0 };
+        for( ; offset + sizeof( std::uint64_t ) <= read; offset += sizeof( std::uint64_t ) ) {
+            std::uint64_t word;
+            std::memcpy( &word, buffer.data() + offset, sizeof( word ) );
+            digest = ( digest ^ word ) * 1099511628211ull;
+        }
+        for( ; offset < read; ++offset ) {
+            digest = ( digest ^ static_cast<unsigned char>( buffer[ offset ] ) ) * 1099511628211ull;
+        }
+    }
+    // a file which happens to digest to zero would look like one that could not be read
+    return ( digest == 0 ? 1 : digest );
+}
+
 void source_manifest::record( std::string const &Path ) {
 
     if( false == is_scenery_text( Path ) ) { return; }
@@ -77,6 +104,9 @@ void source_manifest::record( std::string const &Path ) {
         item.size = 0;
         item.modified = 0;
     }
+    else {
+        item.content = hash_file( Path );
+    }
     m_entries.emplace_back( std::move( item ) );
 }
 
@@ -91,20 +121,25 @@ std::string source_manifest::control_file( std::string const &Scenariofile ) {
     return Global.asCurrentSceneryPath + filename + EU07_FILEEXTENSION_MANIFEST;
 }
 
-void source_manifest::write( std::string const &Scenariofile ) const {
+void source_manifest::write_entries( std::string const &Filename, std::vector<entry> const &Entries ) {
 
-    auto const filename { control_file( Scenariofile ) };
-    std::ofstream output { filename, std::ios::trunc };
+    std::ofstream output { Filename, std::ios::trunc };
     if( false == output.is_open() ) {
-        ErrorLog( "Failed to write scenery source list \"" + filename + "\"" );
+        ErrorLog( "Failed to write scenery source list \"" + Filename + "\"" );
         return;
     }
 
     output << "# sources of the binary terrain beside this file; delete either to force a rebuild\n";
-    for( auto const &item : m_entries ) {
-        output << item.size << ' ' << item.modified << ' ' << item.path << '\n';
+    output << "# size modified contenthash path\n";
+    for( auto const &item : Entries ) {
+        output << item.size << ' ' << item.modified << ' ' << item.content << ' ' << item.path << '\n';
     }
+}
 
+void source_manifest::write( std::string const &Scenariofile ) const {
+
+    auto const filename { control_file( Scenariofile ) };
+    write_entries( filename, m_entries );
     WriteLog( "Recorded " + std::to_string( m_entries.size() ) + " scenery sources in \"" + filename + "\"" );
 }
 
@@ -113,50 +148,66 @@ bool source_manifest::is_current( std::string const &Scenariofile ) const {
     auto const filename { control_file( Scenariofile ) };
     std::ifstream input { filename };
     if( false == input.is_open() ) {
-        WriteLog( "No scenery source list beside the binary terrain, rebuilding it" );
+        WriteLog( "No source list beside binary terrain \"" + filename + "\", treating it as out of date" );
         return false;
     }
 
+    std::vector<entry> recorded;
     std::string line;
-    std::size_t count { 0 };
     while( std::getline( input, line ) ) {
 
         if( line.empty() || line[ 0 ] == '#' ) { continue; }
 
         std::istringstream parser { line };
-        std::uint64_t size { 0 };
-        std::int64_t modified { 0 };
-        if( false == static_cast<bool>( parser >> size >> modified ) ) {
-            WriteLog( "Damaged scenery source list \"" + filename + "\", rebuilding the binary terrain" );
+        entry item;
+        if( false == static_cast<bool>( parser >> item.size >> item.modified >> item.content ) ) {
+            WriteLog( "Damaged source list \"" + filename + "\", treating the binary terrain as out of date" );
             return false;
         }
         // the rest of the line is the path, which may hold spaces
-        std::string path;
-        std::getline( parser, path );
-        if( false == path.empty() && path[ 0 ] == ' ' ) { path.erase( 0, 1 ); }
+        std::getline( parser, item.path );
+        if( false == item.path.empty() && item.path[ 0 ] == ' ' ) { item.path.erase( 0, 1 ); }
+        recorded.emplace_back( std::move( item ) );
+    }
+
+    if( true == recorded.empty() ) {
+        WriteLog( "Empty source list \"" + filename + "\", treating the binary terrain as out of date" );
+        return false;
+    }
+
+    auto refreshed { false };
+    for( auto &item : recorded ) {
 
         std::uint64_t currentsize { 0 };
         std::int64_t currentmodified { 0 };
-        if( false == stat_file( path, currentsize, currentmodified ) ) {
-            if( size != 0 || modified != 0 ) {
-                WriteLog( "Scenery source \"" + path + "\" is gone, rebuilding the binary terrain" );
+        if( false == stat_file( item.path, currentsize, currentmodified ) ) {
+            if( item.size != 0 || item.modified != 0 ) {
+                WriteLog( "Scenery source \"" + item.path + "\" is gone, the binary terrain is out of date" );
                 return false;
             }
             // it was missing when the twin was built and it is missing still
-            ++count;
             continue;
         }
 
-        if( currentsize != size || currentmodified != modified ) {
-            WriteLog( "Scenery source \"" + path + "\" changed, rebuilding the binary terrain" );
+        if( currentsize == item.size && currentmodified == item.modified ) {
+            // untouched, and worth nothing more than the two numbers just compared
+            continue;
+        }
+
+        if( currentsize != item.size || hash_file( item.path ) != item.content ) {
+            WriteLog( "Scenery source \"" + item.path + "\" changed, the binary terrain is out of date" );
             return false;
         }
-        ++count;
+
+        // same contents under a new timestamp, which a checkout or a copied installation
+        // leaves behind. note the new timestamp so the file is not read again next time
+        item.modified = currentmodified;
+        refreshed = true;
     }
 
-    if( count == 0 ) {
-        WriteLog( "Empty scenery source list \"" + filename + "\", rebuilding the binary terrain" );
-        return false;
+    if( true == refreshed ) {
+        WriteLog( "Scenery sources carry new timestamps but unchanged contents, keeping the binary terrain" );
+        write_entries( filename, recorded );
     }
 
     return true;
