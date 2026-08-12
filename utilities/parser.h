@@ -14,6 +14,10 @@ http://mozilla.org/MPL/2.0/.
 #include <fstream>
 #include <vector>
 #include <map>
+#include <array>
+#include <limits>
+
+#include "utilities/numberparser.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 // cParser -- generic class for parsing text data, either from file or provided string
@@ -108,6 +112,8 @@ class cParser //: public std::stringstream
     void skipComment( std::string const &Endmark );
     bool findQuotes( std::string &String );
     bool trimComments( std::string &String );
+    std::array<bool, 256> const & breakTable( char const *Break );
+    void rebuildCommentLookup();
     std::size_t count();
     // members:
     bool m_autoclear { true }; // unretrieved tokens are discarded when another read command is issued (legacy behaviour)
@@ -123,6 +129,9 @@ class cParser //: public std::stringstream
     commentmap mComments {
         commentmap::value_type( "/*", "*/" ),
         commentmap::value_type( "//", "\n" ) };
+    std::string m_breakstring; // separator set the cached lookup table was built from
+    std::array<bool, 256> m_breaktable {}; // separator lookup, rebuilt only when the set changes
+    std::array<bool, 256> m_commentendings {}; // last characters of known comment start markers
     std::shared_ptr<cParser> mIncludeParser; // child class to handle include directives.
     std::vector<std::string> parameters; // parameter list for included file.
     std::deque<std::string> tokens;
@@ -140,8 +149,32 @@ cParser::operator>>( Type_ &Right ) {
 
     if( true == this->tokens.empty() ) { return *this; }
 
-    std::stringstream converter( this->tokens.front() );
-    converter >> Right;
+    if constexpr( parser_detail::is_number_v<Type_> ) {
+
+        if constexpr( std::is_same_v<Type_, float> ) {
+            Right = parser_detail::toFloat( this->tokens.front() );
+        }
+        else if constexpr( std::is_floating_point_v<Type_> ) {
+            Right = static_cast<Type_>( parser_detail::toDouble( this->tokens.front() ) );
+        }
+        else if constexpr( std::is_signed_v<Type_> ) {
+            Right = static_cast<Type_>(
+                parser_detail::toSigned(
+                    this->tokens.front(),
+                    std::numeric_limits<Type_>::lowest(),
+                    std::numeric_limits<Type_>::max() ) );
+        }
+        else {
+            Right = static_cast<Type_>(
+                parser_detail::toUnsigned(
+                    this->tokens.front(),
+                    std::numeric_limits<Type_>::max() ) );
+        }
+    }
+    else {
+        std::stringstream converter( this->tokens.front() );
+        converter >> Right;
+    }
     this->tokens.pop_front();
 
     return *this;

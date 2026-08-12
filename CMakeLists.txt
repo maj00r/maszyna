@@ -122,6 +122,7 @@ set(SOURCES
 "world/MemCell.cpp"
 "model/Model3d.cpp"
 "world/mtable.cpp"
+"utilities/numberparser.cpp"
 "utilities/parser.cpp"
 "rendering/nullrenderer.cpp"
 "rendering/renderer.cpp"
@@ -625,4 +626,20 @@ if(ENABLE_AVX2)
     else()
         target_compile_options(${PROJECT_NAME} PRIVATE -mavx2)
     endif()
+endif()
+
+# ------------------------------------------------------------------------------------
+# tests
+
+option(EU07_BUILD_TESTS "Build the test executables" OFF)
+
+if(EU07_BUILD_TESTS)
+	enable_testing()
+	# numberparser.cpp carries no engine dependencies, so it links on its own
+	add_executable(numberparser-tests
+		"tests/numberparser_test.cpp"
+		"utilities/numberparser.cpp")
+	target_include_directories(numberparser-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+	target_compile_features(numberparser-tests PRIVATE cxx_std_20)
+	add_test(NAME numberparser COMMAND numberparser-tests)
 endif()
