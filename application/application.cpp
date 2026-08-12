@@ -362,7 +362,7 @@ int eu07_application::init(int Argc, char *Argv[])
 		return result;
 	}
 
-	if (crashreport_is_pending())
+	if (crashreport_is_pending() && false == Global.bake_mode)
 	{ // run crashgui as early as possible
 		if ((result = run_crashgui()) != 0)
 		{
@@ -412,8 +412,12 @@ int eu07_application::init(int Argc, char *Argv[])
 
 	#if WITH_DISCORD_RPC
 	// Run DiscordRPC service
-	std::thread sDiscordRPC(&eu07_application::DiscordRPCService, this);
-	Global.threads.emplace("DiscordRPC", std::move(sDiscordRPC));
+	if (false == Global.bake_mode)
+	{
+		// nothing worth announcing, and a bake batch would open one connection per process
+		std::thread sDiscordRPC(&eu07_application::DiscordRPCService, this);
+		Global.threads.emplace("DiscordRPC", std::move(sDiscordRPC));
+	}
 	#endif
 
 	if (!init_network())
@@ -1140,10 +1144,25 @@ int eu07_application::init_settings(int Argc, char *Argv[])
 				Global.local_start_vehicle = ToLower(Argv[++i]);
 			}
 		}
+		else if (token == "-bake")
+		{
+			// write the binary terrain of a scenery and quit, without presenting anything.
+			// several of these can run side by side, one scenery per process
+			if (i + 1 < Argc)
+			{
+				Global.SceneryFile = ToLower(Argv[++i]);
+				Global.bake_mode = true;
+				Global.file_binary_terrain = true;
+				// nothing is drawn, heard or scripted on the way
+				Global.bSoundEnabled = false;
+				Global.python_enabled = false;
+			}
+		}
 		else
 		{
 			std::cout << "usage: " << std::string(Argv[0]) << " [-s sceneryfilepath]"
-			          << " [-v vehiclename]" << std::endl;
+			          << " [-v vehiclename]"
+			          << " [-bake sceneryfilepath]" << std::endl;
 			return -1;
 		}
 	}
@@ -1272,7 +1291,16 @@ int eu07_application::init_glfw()
 		Global.bFullScreen = true;
 	}
 
-	auto *mainwindow = window(-1, true, Global.window_size.x, Global.window_size.y, Global.bFullScreen ? monitor : nullptr, true, false);
+	if (true == Global.bake_mode)
+	{
+		// a fullscreen window ignores the visibility hint and would take over the
+		// screen, which is the last thing a background bake should do
+		Global.bFullScreen = false;
+		Global.fullscreen_windowed = false;
+		Global.window_size = {320, 240};
+	}
+
+	auto *mainwindow = window(-1, false == Global.bake_mode, Global.window_size.x, Global.window_size.y, Global.bFullScreen ? monitor : nullptr, true, false);
 
 	if (mainwindow == nullptr)
 	{

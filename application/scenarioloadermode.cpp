@@ -53,11 +53,24 @@ bool scenarioloader_mode::update() {
 	}
 	catch (invalid_scenery_exception &e) {
 		ErrorLog( "Bad init: scenario loading failed" );
+		if( true == Global.bake_mode ) {
+			// tell whoever launched this run that the scenery did not bake
+			Global.bake_failed = true;
+			Application.queue_quit( true );
+			return true;
+		}
 		Application.pop_mode();
 	}
 
 	WriteLog( "Scenario loading time: " + std::to_string( std::chrono::duration_cast<std::chrono::seconds>( std::chrono::system_clock::now() - timestart ).count() ) + " seconds" );
 	// TODO: implement and use next mode cue
+
+	if( true == Global.bake_mode ) {
+		// the binary terrain was written on the way through, which is all this run was for
+		WriteLog( "Bake complete: \"" + Global.SceneryFile + "\"" );
+		Application.queue_quit( true );
+		return true;
+	}
 
 	Application.pop_mode();
 	Application.push_mode( eu07_application::mode::driver );
