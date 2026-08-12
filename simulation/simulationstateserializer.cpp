@@ -16,6 +16,7 @@ http://mozilla.org/MPL/2.0/.
 #include "simulation/simulationsounds.h"
 #include "simulation/simulationenvironment.h"
 #include "scene/scenenodegroups.h"
+#include "scene/sourcemanifest.h"
 #include "rendering/particles.h"
 #include "world/Event.h"
 #include "world/MemCell.h"
@@ -46,6 +47,10 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
 
     simulation::State.init_scripting_interface();
 
+    // start a fresh list of the files this scenery is read from, before the first of them
+    // is opened below
+    scene::Sources.clear();
+
 	// NOTE: for the time being import from text format is a given, since we don't have full binary serialization
 	std::shared_ptr<deserializer_state> state =
 	        std::make_shared<deserializer_state>(Scenariofile, cParser::buffer_FILE, Global.asCurrentSceneryPath, Global.bLoadTraction);
@@ -57,7 +62,10 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
      && Scenariofile != "$.scn" ) {
         // compilation to binary file isn't supported for rainsted-created overrides
         // NOTE: we postpone actual loading of the scene until we process time, season and weather data
-		state->scratchpad.binary.terrain = Region->is_scene( Scenariofile ) ;
+        // a twin is usable only if the scenery text has not moved on since it was built
+		state->scratchpad.binary.terrain =
+		    Region->is_scene( Scenariofile )
+		 && scene::Sources.is_current( Scenariofile );
     }
 
 	if (false != state->scratchpad.binary.terrain)
@@ -164,6 +172,8 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 		// if we didn't find usable binary version of the scenario files, create them now for future use
 		// as long as the scenario file wasn't rainsted-created base file override
 		Region->serialize( state->scenariofile );
+		// record what it was built from, so the next run can tell whether it still holds
+		scene::Sources.write( state->scenariofile );
 	}
 
 	return false;
