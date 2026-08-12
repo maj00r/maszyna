@@ -126,5 +126,6 @@ int main(int argc, char *argv[])
 	fflush(stdout);
 	fflush(stderr);
 #endif
-	std::_Exit(0); // skip destructors, there are ordering errors which causes segfaults
+	// a bake run is driven by a script, which has nothing but the exit code to go on
+	std::_Exit(Global.bake_failed ? 1 : 0); // skip destructors, there are ordering errors which causes segfaults
 }

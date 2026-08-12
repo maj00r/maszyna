@@ -82,6 +82,8 @@ struct global_settings {
     int iConvertIndexRange{ 1000 }; // range of duplicate vertex scan
     bool file_binary_terrain{ true }; // enable binary terrain (de)serialization
 	bool file_binary_terrain_state{true};
+    bool bake_mode{ false }; // load the scenery only to write its binary terrain, then quit
+    bool bake_failed{ false }; // the bake run could not read its scenery
     // logs
 	bool priorityLoadText3D{false}; // ladowanie T3D priorytetowo
     int iWriteLogEnabled{ 3 }; // maska bitowa: 1-zapis do pliku, 2-okienko, 4-nazwy torów
