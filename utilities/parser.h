@@ -18,6 +18,7 @@ http://mozilla.org/MPL/2.0/.
 #include <limits>
 
 #include "utilities/numberparser.h"
+#include "utilities/charsource.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 // cParser -- generic class for parsing text data, either from file or provided string
@@ -119,6 +120,7 @@ class cParser //: public std::stringstream
     bool m_autoclear { true }; // unretrieved tokens are discarded when another read command is issued (legacy behaviour)
     bool LoadTraction { true }; // load traction?
     std::shared_ptr<std::istream> mStream; // relevant kind of buffer is attached on creation.
+    char_source mSource; // supplies characters of mStream
     std::string mFile; // name of the open file, if any
     std::string mPath; // path to open stream, for relative path lookups.
     std::streamoff mSize { 0 }; // size of open stream, for progress report.

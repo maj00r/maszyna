@@ -123,6 +123,7 @@ set(SOURCES
 "model/Model3d.cpp"
 "world/mtable.cpp"
 "utilities/numberparser.cpp"
+"utilities/charsource.cpp"
 "utilities/parser.cpp"
 "rendering/nullrenderer.cpp"
 "rendering/renderer.cpp"
@@ -642,4 +643,29 @@ if(EU07_BUILD_TESTS)
 	target_include_directories(numberparser-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 	target_compile_features(numberparser-tests PRIVATE cxx_std_20)
 	add_test(NAME numberparser COMMAND numberparser-tests)
+
+	# charsource.cpp carries no engine dependencies either
+	add_executable(charsource-tests
+		"tests/charsource_test.cpp"
+		"utilities/charsource.cpp")
+	target_include_directories(charsource-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+	target_compile_features(charsource-tests PRIVATE cxx_std_20)
+	add_test(NAME charsource COMMAND charsource-tests)
+
+	# parser.cpp reaches the engine in a handful of places, so it is built here against
+	# the stand-ins in tests/stubs. tests/stubs has to come first on the include path,
+	# ahead of the real stdafx.h which would pull the renderer in
+	add_executable(parser-tests
+		"tests/parser_test.cpp"
+		"tests/stubs/parsersupport.cpp"
+		"utilities/parser.cpp"
+		"utilities/numberparser.cpp"
+		"utilities/charsource.cpp")
+	target_include_directories(parser-tests BEFORE PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs"
+		"${CMAKE_CURRENT_SOURCE_DIR}"
+		"${DEPS_DIR}/glm")
+	target_compile_features(parser-tests PRIVATE cxx_std_20)
+	set_target_properties(parser-tests PROPERTIES SKIP_PRECOMPILE_HEADERS TRUE)
+	add_test(NAME parser COMMAND parser-tests)
 endif()

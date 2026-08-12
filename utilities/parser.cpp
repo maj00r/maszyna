@@ -101,6 +101,7 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 			mSize = mStream->rdbuf()->pubseekoff(0, std::ios_base::end);
 			mStream->rdbuf()->pubseekoff(0, std::ios_base::beg);
 			mLine = 1;
+			mSource.attach(*mStream);
 		}
 	}
 	// set parameter set if one was provided
@@ -234,9 +235,9 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 	char c = 0;
 
 
-	while (token.empty() && mStream->peek() != EOF) {
-		while (mStream->peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
-			c = static_cast<char>(mStream->get());
+	while (token.empty() && mSource.peek() != EOF) {
+		while (mSource.peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
+			c = static_cast<char>(mSource.bump());
 			if (c == '\n') {
 				++mLine;
 			}
@@ -303,7 +304,7 @@ void cParser::stripFirstTokenBOM(std::string& token, bool ToLower, const char* B
 	}
 
 	// if first "token" was standalone BOM, read the next real token (avoid recursion)
-	while (token.empty() && mStream->peek() != EOF) {
+	while (token.empty() && mSource.peek() != EOF) {
 		readToken(token, ToLower, Break);
 		// readToken will not re-enter BOM stripping because mFirstToken is now false
 		break;
@@ -464,8 +465,9 @@ std::string cParser::readQuotes(char const Quote)
 	std::string token;
 	char c{0};
 	bool escaped = false;
-	while (mStream->get(c))
+	for (int character{mSource.get()}; character != EOF; character = mSource.get())
 	{ // get all chars until the quote mark
+		c = static_cast<char>(character);
 		if (escaped)
 		{
 			escaped = false;
@@ -494,8 +496,9 @@ void cParser::skipComment(std::string const &Endmark)
 	std::string input;
 	char c{0};
 	auto const endmarksize = Endmark.size();
-	while (mStream->get(c))
+	for (int character{mSource.get()}; character != EOF; character = mSource.get())
 	{
+		c = static_cast<char>(character);
 		if (c == '\n')
 		{
 			// update line counter
