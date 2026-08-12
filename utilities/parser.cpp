@@ -58,6 +58,7 @@ inline bool startsWithBOM(const std::string &s)
 cParser::cParser(std::string const &Stream, buffertype const Type, std::string Path, bool const Loadtraction, std::vector<std::string> Parameters, bool allowRandom)
     : allowRandomIncludes(allowRandom), LoadTraction(Loadtraction), mPath(Path)
 {
+	rebuildCommentLookup();
 	// store to calculate sub-sequent includes from relative path
 	if (Type == buffertype::buffer_FILE)
 	{
@@ -229,7 +230,7 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 	std::string token;
 	token.reserve(64);
 
-	const auto breakTable = makeBreakTable(Break);
+	const auto &breaks = breakTable(Break);
 	char c = 0;
 
 
@@ -241,7 +242,7 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 			}
 
 			const unsigned char uc = static_cast<unsigned char>(c);
-			if (breakTable[uc]) {
+			if (breaks[uc]) {
 				// separator ends token (or continues skipping if token empty)
 				if (!token.empty())
 					break;
@@ -254,13 +255,43 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 			if (findQuotes(token)) {
 				continue; // glue quoted content
 			}
-			if (skipComments && trimComments(token)) {
+			// a comment can only start here if the character just added terminates one
+			// of the markers, so the full comparison is worth skipping in every other case
+			if (skipComments && m_commentendings[static_cast<unsigned char>(token.back())] && trimComments(token)) {
 				break; // don't glue tokens separated by comment
 			}
 		}
 	}
 
 	return token;
+}
+
+std::array<bool, 256> const &cParser::breakTable(const char *Break)
+{
+	// scenery parsing runs through millions of tokens with an unchanging separator
+	// set, so the table is rebuilt only when the set actually differs
+	if (m_breakstring != (Break ? Break : ""))
+	{
+		m_breakstring = (Break ? Break : "");
+		m_breaktable = makeBreakTable(m_breakstring.c_str());
+	}
+	return m_breaktable;
+}
+
+void cParser::rebuildCommentLookup()
+{
+	m_commentendings.fill(false);
+	for (auto const &comment : mComments)
+	{
+		if (true == comment.first.empty())
+		{
+			// an empty marker matches at every position; leave the lookup wide open
+			// rather than reason about it here
+			m_commentendings.fill(true);
+			return;
+		}
+		m_commentendings[static_cast<unsigned char>(comment.first.back())] = true;
+	}
 }
 
 void cParser::stripFirstTokenBOM(std::string& token, bool ToLower, const char* Break) {
@@ -567,6 +598,7 @@ void cParser::addCommentStyle(std::string const &Commentstart, std::string const
 {
 
 	mComments.insert(commentmap::value_type(Commentstart, Commentend));
+	rebuildCommentLookup();
 }
 
 // returns name of currently open file, or empty string for text type stream
