@@ -5,6 +5,7 @@
 #include "stdafx.h"
 #include "utilities/Logs.h"
 #include "scene/scenenodegroups.h"
+#include "scene/sourcemanifest.h"
 #include "utilities/parser.h"
 
 #include <vector>
@@ -38,6 +39,8 @@ node_groups_stub Groups;
 
 void node_groups_stub::create() {}
 void node_groups_stub::close() {}
+
+void record_source_file( std::string const & ) {}
 
 } // namespace scene
 

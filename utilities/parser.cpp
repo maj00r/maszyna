@@ -12,6 +12,7 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/Logs.h"
 
 #include "scene/scenenodegroups.h"
+#include "scene/sourcemanifest.h"
 
 /*
     MaSzyna EU07 locomotive simulator parser
@@ -70,6 +71,9 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 	case buffer_FILE:
 	{
 		Path.append(Stream);
+		// note it down in case this is scenery text, so its binary terrain can tell later
+		// whether it was built before or after the file was last edited
+		scene::record_source_file(Path);
 		mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
 		// content of *.inc files is potentially grouped together
 		if (Stream.size() >= 4 && ToLower(Stream.substr(Stream.size() - 4)) == ".inc")
