@@ -170,35 +170,6 @@ bool opengl33_renderer::Init(GLFWwindow *Window)
 	m_pfx_tonemapping = std::make_unique<gl::postfx>("tonemapping");
     m_pfx_chromaticaberration = std::make_unique<gl::postfx>( "chromaticaberration" );
 
-	m_pfx_ssao       = std::make_unique<gl::postfx>("ssao");
-	m_pfx_ssao_blur  = std::make_unique<gl::postfx>("ssao_blur");
-	m_pfx_ssao_apply = std::make_unique<gl::postfx>("ssao_apply");
-
-	// Generate hemisphere kernel (z > 0 = toward surface normal)
-	std::uniform_real_distribution<float> rnd(0.0f, 1.0f);
-	std::default_random_engine gen(42); // fixed seed for consistency
-	for (int i = 0; i < 32; i++) {
-		glm::vec3 s(rnd(gen)*2.0f-1.0f, rnd(gen)*2.0f-1.0f, rnd(gen));
-		s = glm::normalize(s) * rnd(gen);
-		float scale = float(i) / 32.0f;
-		scale = glm::mix(0.1f, 1.0f, scale * scale); // accelerating interpolant
-		m_ssao_kernel[i] = s * scale;
-	}
-
-	// Generate 4x4 noise texture (random rotation vectors in XY)
-	std::vector<glm::vec3> noise_data;
-	for (int i = 0; i < 16; i++)
-		noise_data.push_back(glm::normalize(glm::vec3(rnd(gen)*2.0f-1.0f, rnd(gen)*2.0f-1.0f, 0.0f)));
-
-	// noise texture (4x4 random rotation vectors in tangent space)
-	// noise texture (4x4 random rotation vectors in tangent space)
-	m_ssao_noise_tex = std::make_unique<opengl_texture>();
-	m_ssao_noise_tex->alloc_rendertarget(GL_RGB32F, GL_RGB, 4, 4, 1, 1, GL_REPEAT);
-	m_ssao_noise_tex->bind(0);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, GL_RGB, GL_FLOAT, noise_data.data());
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
 	m_empty_cubemap = std::make_unique<gl::cubemap>();
 	m_empty_cubemap->alloc(Global.gfx_format_color, 16, 16, GL_RGB, GL_FLOAT);
 
@@ -463,7 +434,7 @@ bool opengl33_renderer::init_viewport(viewport_config &vp)
 		vp.msaa_fb->attach(*vp.msaa_rbc, GL_COLOR_ATTACHMENT0);
 		vp.msaa_fb->attach(*vp.msaa_rbd, GL_DEPTH_ATTACHMENT);
 
-		if (Global.gfx_postfx_chromaticaberration_enabled || Global.gfx_postfx_motionblur_enabled || Global.gfx_postfx_ssao_enabled)
+		if (Global.gfx_postfx_chromaticaberration_enabled || Global.gfx_postfx_motionblur_enabled)
 		{
 			vp.main_tex = std::make_unique<opengl_texture>();
 			vp.main_tex->alloc_rendertarget(Global.gfx_format_color, GL_RGB, vp.width, vp.height, 1, 1, GL_CLAMP_TO_EDGE);
@@ -507,25 +478,6 @@ bool opengl33_renderer::init_viewport(viewport_config &vp)
 
 		vp.main2_fb = std::make_unique<gl::framebuffer>();
 		vp.main2_fb->attach(*vp.main2_tex, GL_COLOR_ATTACHMENT0);
-
-		if (Global.gfx_postfx_ssao_enabled)
-		{
-			int ssao_w = std::max(1, vp.width  / 2);
-			int ssao_h = std::max(1, vp.height / 2);
-
-			vp.ssao_tex = std::make_unique<opengl_texture>();
-			vp.ssao_tex->alloc_rendertarget(GL_R8, GL_RED, ssao_w, ssao_h, 1, 1, GL_CLAMP_TO_EDGE);
-			vp.ssao_fb = std::make_unique<gl::framebuffer>();
-			vp.ssao_fb->attach(*vp.ssao_tex, GL_COLOR_ATTACHMENT0);
-			if (!vp.ssao_fb->is_complete()) { ErrorLog("ssao framebuffer setup failed"); return false; }
-
-			vp.ssao_blur_tex = std::make_unique<opengl_texture>();
-			vp.ssao_blur_tex->alloc_rendertarget(GL_R8, GL_RED, ssao_w, ssao_h, 1, 1, GL_CLAMP_TO_EDGE);
-			vp.ssao_blur_fb = std::make_unique<gl::framebuffer>();
-			vp.ssao_blur_fb->attach(*vp.ssao_blur_tex, GL_COLOR_ATTACHMENT0);
-			if (!vp.ssao_blur_fb->is_complete()) { ErrorLog("ssao blur framebuffer setup failed"); return false; }
-		}
-
 		if (!vp.main2_fb->is_complete())
 			return false;
 	}
@@ -980,7 +932,7 @@ void opengl33_renderer::Render_pass(viewport_config &vp, rendermode const Mode)
 		if (!Global.gfx_usegles)
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
-if (!Global.gfx_skippipeline)
+		if (!Global.gfx_skippipeline)
 		{
 			if (Global.gfx_postfx_motionblur_enabled)
 			{
@@ -994,34 +946,10 @@ if (!Global.gfx_skippipeline)
 				model_ubo->update(model_ubs);
 				m_pfx_motionblur->apply({vp.main_tex.get(), vp.main_texv.get(), vp.main_texd.get()}, vp.main2_fb.get());
 			}
-			else if (Global.gfx_postfx_ssao_enabled)
-			{
-				// resolve color+depth so SSAO can sample the depth texture
-				vp.main_fb->clear(GL_COLOR_BUFFER_BIT);
-				vp.main_fb->setup_drawing(1);
-				vp.msaa_fb->blit_to(vp.main_fb.get(), vp.width, vp.height, GL_COLOR_BUFFER_BIT, GL_COLOR_ATTACHMENT0);
-				vp.msaa_fb->blit_to(vp.main_fb.get(), vp.width, vp.height, GL_DEPTH_BUFFER_BIT, GL_DEPTH_ATTACHMENT);
-			}
 			else
 			{
 				vp.main2_fb->clear(GL_COLOR_BUFFER_BIT);
 				vp.msaa_fb->blit_to(vp.main2_fb.get(), vp.width, vp.height, GL_COLOR_BUFFER_BIT, GL_COLOR_ATTACHMENT0);
-			}
-
-			// SSAO: depth -> occlusion -> blur -> modulate color into main2_fb
-			if (Global.gfx_postfx_ssao_enabled && !Global.gfx_postfx_motionblur_enabled)
-			{
-				int ssao_w = std::max(1, vp.width  / 2);
-				int ssao_h = std::max(1, vp.height / 2);
-
-				// (kernel is generated procedurally in the shader; no UBO upload needed)
-				glViewport(0, 0, ssao_w, ssao_h);
-				m_pfx_ssao     ->apply({ vp.main_texd.get(), m_ssao_noise_tex.get() }, vp.ssao_fb.get());
-				m_pfx_ssao_blur->apply({ vp.ssao_tex.get()  }, vp.ssao_blur_fb.get());
-
-				glViewport(0, 0, vp.width, vp.height);
-				vp.main2_fb->clear(GL_COLOR_BUFFER_BIT);
-				m_pfx_ssao_apply->apply({ vp.main_tex.get(), vp.ssao_blur_tex.get() }, vp.main2_fb.get());
 			}
 
 			if (!Global.gfx_usegles && !Global.gfx_shadergamma)

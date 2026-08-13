@@ -21,21 +21,3 @@ vec3 envmap_color( vec3 normal )
 #endif
 	return envcolor;
 }
-
-// Roughness-aware env map lookup — uses mip levels for blurry reflections.
-// lod 0.0 = mirror sharp, lod ~8.0 = fully diffuse blur.
-vec3 envmap_color_lod(vec3 fragnormal, float lod)
-{
-#if ENVMAP_ENABLED
-    vec3 refvec = reflect(f_pos.xyz, fragnormal); // view space — matches envmap_color exactly
-    refvec = vec3(inv_view * vec4(refvec, 0.0));  // world space — was missing
-    vec3 envcolor = textureLod(envmap, refvec, lod).rgb;
-    // See envmap_color() above — same NaN/Inf sanitize, also needed here
-    // because mipmap generation propagates a single NaN texel across the
-    // whole mip chain.
-    if (any(isnan(envcolor)) || any(isinf(envcolor))) envcolor = vec3(0.0);
-    return max(envcolor, vec3(0.0));
-#else
-    return vec3(0.5); // was vec3(0.0), match the non-LOD fallback
-#endif
-}

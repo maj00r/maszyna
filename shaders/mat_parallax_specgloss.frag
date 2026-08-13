@@ -61,7 +61,7 @@ void main()
 	float reflectivity = param[1].z * texture(normalmap, f_coord_p).a;
 	float specularity = texture(specgloss, f_coord_p).r;
 	glossiness = texture(specgloss, f_coord_p).g * abs(param[1].w);
-	metalic = texture(specgloss, f_coord_p).b;
+	float metalic = texture(specgloss, f_coord_p).b;
 	
 	fragcolor = apply_lights(fragcolor, fragnormal, tex_color.rgb, reflectivity, specularity, shadow_tone);
 

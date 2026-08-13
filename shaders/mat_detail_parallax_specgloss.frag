@@ -73,8 +73,8 @@ void main()
 	vec3 fragnormal = normalize(f_tbn * normalize(vec3(normal.xy + normaldetail.xy, normal.z)));
 	float reflectivity = param[1].z * normal_map.a;
 	float specularity = specgloss_map.r;
-	glossiness = specgloss_map.g * abs(param[1].w);
-	metalic = specgloss_map.b;
+	float glossiness = specgloss_map.g * abs(param[1].w);
+	float metalic = specgloss_map.b;
 	
 	fragcolor = apply_lights(fragcolor, fragnormal, tex_color.rgb, reflectivity, specularity, shadow_tone);
 

@@ -89,15 +89,7 @@ vec2 calc_light(vec3 light_dir, vec3 fragnormal)
 	vec3 halfway_dir = normalize(light_dir + view_dir);
 
 	float diffuse_v = max(dot(fragnormal, light_dir), 0.0);
-
-	// Energy-conserving Blinn-Phong normalization:
-	// (n+8)/(8*pi) ensures the specular lobe integrates to the same
-	// total energy regardless of glossiness — low glossiness stays dim
-	// and spreads wide (blurry), high glossiness is bright and tight (sharp).
-	float n = max(glossiness, 0.01);
-	float normalization = (n + 8.0) / (8.0 * 3.14159265);
-	float NdotH = max(dot(fragnormal, halfway_dir), 0.0);
-	float specular_v = normalization * pow(NdotH, n);
+	float specular_v = pow(max(dot(fragnormal, halfway_dir), 0.0), max(glossiness, 0.01)) * diffuse_v;
 
 	return vec2(diffuse_v, specular_v);
 }
@@ -158,65 +150,71 @@ vec2 calc_headlights(light_s light, vec3 fragnormal)
 // do magic here
 vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float reflectivity, float specularity, float shadowtone)
 {
-    vec3 basecolor = param[0].rgb;
-    fragcolor *= basecolor;
+	vec3 basecolor = param[0].rgb;
 
-    vec3 emissioncolor = basecolor * emission;
+	fragcolor *= basecolor;
 
-    vec3 view_dir = normalize(-f_pos.xyz);
-    float NdotV = max(dot(fragnormal, view_dir), 0.0);
-    vec3 F0 = mix(vec3(0.04), texturecolor, metalic);
-    vec3 fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+	vec3 emissioncolor = basecolor * emission;
+	vec3 envcolor = envmap_color(fragnormal);
 
-    const float MAX_REFLECTION_LOD = 8.0;
-    float env_roughness = 1.0 - clamp(glossiness / max(abs(param[1].w), 1.0), 0.0, 1.0);
-    vec3 envcolor = envmap_color_lod(fragnormal, env_roughness * MAX_REFLECTION_LOD);
+// yuv path
+	vec3 texturecoloryuv = rgb2yuv(texturecolor);
+	vec3 texturecolorfullv = yuv2rgb(vec3(0.2176, texturecoloryuv.gb));
+// hsl path
+//	vec3 texturecolorhsl = rgb2hsl(texturecolor);
+//	vec3 texturecolorfullv = hsl2rgb(vec3(texturecolorhsl.rg, 0.5));
 
-    // Tint texture toward fully-saturated under strong env, weighted by fresnel
-    vec3 texturecoloryuv = rgb2yuv(texturecolor);
-    vec3 texturecolorfullv = yuv2rgb(vec3(0.2176, texturecoloryuv.gb));
-    vec3 envyuv = rgb2yuv(envcolor);
-    texturecolor = mix(texturecolor, texturecolorfullv, envyuv.r * reflectivity * fresnel.r);
+	vec3 envyuv = rgb2yuv(envcolor);
+	texturecolor = mix(texturecolor, texturecolorfullv, envyuv.r * reflectivity);
 
-    if (lights_count == 0U)
-        return (fragcolor + emissioncolor) * texturecolor
-             + envcolor * fresnel * reflectivity;
+	if(lights_count == 0U) 
+		return (fragcolor + emissioncolor + envcolor * reflectivity) * texturecolor;
 
-    vec2 sunlight = calc_dir_light(lights[0], fragnormal);
-    float diffuseamount = sunlight.x * param[1].x * lights[0].intensity;
+//	fragcolor *= lights[0].intensity;
+	vec2 sunlight = calc_dir_light(lights[0], fragnormal);
 
-    float shadow1 = 0.0;
-    if (shadowtone < 1.0)
-        shadow1 = (1.0 - shadowtone) * clamp(calc_shadow(), 0.0, 1.0);
+	float diffuseamount = (sunlight.x * param[1].x) * lights[0].intensity; 
+//	fragcolor += mix(lights[0].color * diffuseamount, envcolor, reflectivity);
+	float shadow1 = 0.0;
+	if (shadowtone < 1.0)
+	{
+		shadow1 = (1 - shadowtone) * clamp(calc_shadow(), 0.0, 1.00);
+	}
+	fragcolor += lights[0].color * 5.0 * (1.0 - shadow1) * diffuseamount;
+	fragcolor = mix(fragcolor * 0.35, envcolor, reflectivity);
 
-    fragcolor += lights[0].color * 5.0 * (1.0 - shadow1) * diffuseamount;
+	for (uint i = 1U; i < lights_count; i++)
+	{
+		light_s light = lights[i];
+		vec2 part = vec2(0.0);
 
-    for (uint i = 1U; i < lights_count; i++)
-    {
-        light_s light = lights[i];
-        vec2 part = calc_headlights(light, fragnormal);
-        fragcolor += light.color * (part.x * param[1].x + part.y * param[1].y) * light.intensity;
-    }
+//		if (light.type == LIGHT_SPOT)
+//			part = calc_spot_light(light, fragnormal);
+//		else if (light.type == LIGHT_POINT)
+//			part = calc_point_light(light, fragnormal);
+//		else if (light.type == LIGHT_DIR)
+//			part = calc_dir_light(light, fragnormal);
+//		else if (light.type == LIGHT_HEADLIGHTS)
+			part = calc_headlights(light, fragnormal);
 
-    float specularamount = sunlight.y * param[1].y * specularity * lights[0].intensity
-                         * clamp(1.0 - shadowtone, 0.0, 1.0);
-    if (shadowtone < 1.0)
-        specularamount *= clamp(1.0 - shadow1, 0.0, 1.0);
+		fragcolor += light.color * (part.x * param[1].x + part.y * param[1].y) * light.intensity;
+	}
 
-    fragcolor += emissioncolor;
-    vec3 specularcolor = specularamount * lights[0].color;
+	float specularamount = (sunlight.y * param[1].y * specularity) * lights[0].intensity * clamp(1.0 - shadowtone, 0.0, 1.0);
+	if (shadowtone < 1.0)
+	{
+		//float shadow = calc_shadow();
+		specularamount *= clamp(1.0 - shadow1, 0.0, 1.00);
+		//fragcolor = mix(fragcolor,  fragcolor * shadowtone,  clamp((diffuseamount) * shadow1 , 0.0, 1.0));
+	}
+	fragcolor += emissioncolor;
+	vec3 specularcolor = specularamount * lights[0].color;
 
-    // Env reflection tracked separately — must NOT go through the albedo multiply below
-    vec3 env_reflection = envcolor * fresnel * reflectivity * (1.0 - shadow1 * 0.5);
+	if (param[1].w < 0.0)
+		{
+		float metalic = 1.0;
+		}
+	fragcolor = mix(((fragcolor + specularcolor) * texturecolor),(fragcolor * texturecolor + specularcolor),metalic) ;
 
-    // Diffuse + specular: albedo tints diffuse, metals also tint specular
-    vec3 result = mix(
-        (fragcolor + specularcolor) * texturecolor,
-         fragcolor * texturecolor + specularcolor,
-        metalic);
-
-    // Env added after albedo multiply: raw for dielectrics, albedo-tinted for metals
-    result += mix(env_reflection, env_reflection * texturecolor, metalic);
-
-    return result;
+	return fragcolor;
 }

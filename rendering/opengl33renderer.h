@@ -237,12 +237,6 @@ class opengl33_renderer : public gfx_renderer {
 		std::unique_ptr<gl::framebuffer> main2_fb;
 		std::unique_ptr<opengl_texture> main2_tex;
 
-		// ssao
-		std::unique_ptr<opengl_texture>  ssao_tex;
-		std::unique_ptr<opengl_texture>  ssao_blur_tex;
-		std::unique_ptr<gl::framebuffer> ssao_fb;
-		std::unique_ptr<gl::framebuffer> ssao_blur_fb;
-
         // LDR backbuffer for offscreen rendering
         std::unique_ptr<gl::framebuffer> backbuffer_fb;
         std::unique_ptr<opengl_texture> backbuffer_tex;
@@ -446,13 +440,6 @@ class opengl33_renderer : public gfx_renderer {
 	std::unique_ptr<gl::postfx> m_pfx_motionblur;
 	std::unique_ptr<gl::postfx> m_pfx_tonemapping;
   std::unique_ptr<gl::postfx> m_pfx_chromaticaberration;
-
-	// postfx ssao
-	std::unique_ptr<gl::postfx>      m_pfx_ssao;
-	std::unique_ptr<gl::postfx>      m_pfx_ssao_blur;
-	std::unique_ptr<gl::postfx>      m_pfx_ssao_apply;
-	std::unique_ptr<opengl_texture> m_ssao_noise_tex;
-	glm::vec3                        m_ssao_kernel[32];
 
 	std::unique_ptr<gl::program> m_shadow_shader;
 	std::unique_ptr<gl::program> m_alpha_shadow_shader;

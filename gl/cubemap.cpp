@@ -37,9 +37,7 @@ void gl::cubemap::bind(int unit)
 
 void gl::cubemap::generate_mipmaps()
 {
-	glBindTexture(GL_TEXTURE_CUBE_MAP, *this);
-	glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
-	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, *this);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
 }

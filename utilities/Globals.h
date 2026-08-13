@@ -295,7 +295,6 @@ struct global_settings {
 
 	std::string exec_on_exit;
     std::string prepend_scn;
-	bool gfx_postfx_ssao_enabled {false};
 
 	struct extraviewport_config {
 		std::string monitor;
