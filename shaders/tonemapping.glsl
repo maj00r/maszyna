@@ -121,7 +121,7 @@ vec3 AgxLook(vec3 val)
     // Punchy
     slope = vec3(1.0);
     power = vec3(1.35);
-    sat = 1.1;
+    sat = 1.4;
 #endif
 
     // ASC CDL
