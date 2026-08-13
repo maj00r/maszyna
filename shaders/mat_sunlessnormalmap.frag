@@ -34,10 +34,7 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
 {
 	vec3 basecolor = param[0].rgb;
 
-	// Cab interior: dim ambient less than the exterior path because
-	// ambient is the dominant indoor illumination. 0.80 trims the
-	// brightest faces without making the cab feel under-lit.
-	fragcolor *= basecolor * 0.80;
+	fragcolor *= basecolor;
 
 	vec3 emissioncolor = basecolor * emission;
 	vec3 envcolor = envmap_color(fragnormal);
@@ -58,8 +55,8 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
 	vec2 sunlight = calc_dir_light(lights[0], fragnormal);
 
 	// Sharpen N.L for stronger contrast between lit and shaded cab
-	// surfaces (uses SUN_NDOTL_SHARPNESS from light_common.glsl).
-	float sun_NdotL = pow(sunlight.x, SUN_NDOTL_SHARPNESS);
+	// surfaces (matches light_common.glsl apply_lights).
+	float sun_NdotL = pow(sunlight.x, 1.25);
 	float diffuseamount = (sun_NdotL * param[1].x) * lights[0].intensity;
 	fragcolor += envcolor * reflectivity;
 	float specularamount = (sunlight.y * param[1].y * specularity) * lights[0].intensity;

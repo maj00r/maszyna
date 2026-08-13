@@ -10,27 +10,6 @@ uniform sampler2D headlightmap;
 float glossiness = 1.0;
 float metalic = 0.0;
 
-// ---------------------------------------------------------------------
-// Lighting balance tunables - tweak these to control overall scene
-// exposure without touching tonemapping.glsl.
-//
-// AMBIENT_SCALE:        brightness of SHADED faces (indirect/sky term).
-//                       Lower -> deeper shadows, less burn under bright
-//                       textures. Higher -> flatter / brighter shading.
-//
-// SUN_DIFFUSE_SCALE:    brightness of UNSHADED (sun-lit) faces. Lower
-//                       this to dim hot surfaces in direct sunlight
-//                       without affecting shaded areas. Was 3.5; 2.5
-//                       calmly fits the ACES tonemap shoulder.
-//
-// SUN_NDOTL_SHARPNESS:  N.L curve on the sun. 1.0 = pure Lambert, higher
-//                       = sharper terminator (more contrast between
-//                       lit and shaded faces of the same surface).
-// ---------------------------------------------------------------------
-const float AMBIENT_SCALE       = 0.65;
-const float SUN_DIFFUSE_SCALE   = 2.5;
-const float SUN_NDOTL_SHARPNESS = 1.25;
-
 float length2(vec3 v)
 {
         return dot(v, v);
@@ -185,10 +164,7 @@ vec2 calc_headlights(light_s light, vec3 fragnormal)
 vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float reflectivity, float specularity, float shadowtone)
 {
     vec3 basecolor = param[0].rgb;
-    // Scale ambient before it gets tinted by basecolor / texture.
-    // Sun, headlights and emission are added afterwards so they are NOT
-    // attenuated by AMBIENT_SCALE - this only dims the indirect term.
-    fragcolor *= basecolor * AMBIENT_SCALE;
+    fragcolor *= basecolor;
 
     vec3 emissioncolor = basecolor * emission;
 
@@ -214,18 +190,19 @@ vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float refl
     vec2 sunlight = calc_dir_light(lights[0], fragnormal);
     // Sharpen sun N.L falloff so the lit-to-shaded terminator on cab
     // panels, vehicle bodies and terrain reads as a clear edge rather
-    // than a soft Lambertian ramp. Tunable via SUN_NDOTL_SHARPNESS.
-    float sun_NdotL = pow(sunlight.x, SUN_NDOTL_SHARPNESS);
+    // than a soft Lambertian ramp. Stays close to physical Lambert.
+    float sun_NdotL = pow(sunlight.x, 1.25);
     float diffuseamount = sun_NdotL * param[1].x * lights[0].intensity;
 
     float shadow1 = 0.0;
     if (shadowtone < 1.0)
         shadow1 = (1.0 - shadowtone) * clamp(calc_shadow(), 0.0, 1.0);
 
-    // Sun HDR scale -> SUN_DIFFUSE_SCALE (default 2.5). Controls how
-    // bright sun-lit (unshaded) faces get. Lower this if surfaces in
-    // direct sun read as too hot/burnt; raise it for more punch.
-    fragcolor += lights[0].color * SUN_DIFFUSE_SCALE * (1.0 - shadow1) * diffuseamount;
+    // Sun HDR scale lowered from 5.0 -> 3.5: with the previous broken
+    // identity-Reinhard tonemap the 5x boost just clipped at 1.0; with
+    // ACES tonemapping in place 3.5 keeps lit areas strong but leaves
+    // real headroom for spec highlights instead of crushing to white.
+    fragcolor += lights[0].color * 3.5 * (1.0 - shadow1) * diffuseamount;
 
     for (uint i = 1U; i < lights_count; i++)
     {
