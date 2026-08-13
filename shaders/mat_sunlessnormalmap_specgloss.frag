@@ -60,10 +60,7 @@ vec3 apply_lights_sunless(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, fl
              + envcolor * fresnel * reflectivity;
 
     vec2 sunlight = calc_dir_light(lights[0], fragnormal);
-    // Sharpen N.L for stronger contrast between lit and shaded cab
-    // surfaces (matches light_common.glsl apply_lights).
-    float sun_NdotL = pow(sunlight.x, 1.25);
-    float diffuseamount = sun_NdotL * param[1].x * lights[0].intensity;
+    float diffuseamount = sunlight.x * param[1].x * lights[0].intensity;
 
     float specularamount = sunlight.y * param[1].y * specularity * lights[0].intensity;
 

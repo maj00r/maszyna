@@ -94,10 +94,8 @@ vec2 calc_light(vec3 light_dir, vec3 fragnormal)
 	// (n+8)/(8*pi) ensures the specular lobe integrates to the same
 	// total energy regardless of glossiness — low glossiness stays dim
 	// and spreads wide (blurry), high glossiness is bright and tight (sharp).
-	// Capped at 4.0 so very high glossiness (n>~92) does not produce pinhole
-	// highlights that blow past the tonemap shoulder and read as burnt white.
 	float n = max(glossiness, 0.01);
-	float normalization = min((n + 8.0) / (8.0 * 3.14159265), 4.0);
+	float normalization = (n + 8.0) / (8.0 * 3.14159265);
 	float NdotH = max(dot(fragnormal, halfway_dir), 0.0);
 	float specular_v = normalization * pow(NdotH, n);
 
@@ -147,10 +145,7 @@ vec2 calc_headlights(light_s light, vec3 fragnormal)
 		return vec2(0.0);
 
 	vec3 light_dir = normalize(light.pos - f_pos.xyz);
-	// Tighter wrap (was +0.25): faces angled away from the headlight cone
-	// fall off to dark much faster, so cab/exterior surfaces read with a
-	// clear directional shape instead of a flat half-lit wash.
-	vec2 part = vec2(1.0) * clamp(dot(fragnormal, light_dir) + 0.10, 0.0, 1.0);
+	vec2 part = vec2(1.0) * clamp(dot(fragnormal, light_dir) + 0.25, 0.0, 1.0);
 	float distance = length(light.pos - f_pos.xyz);
 	float atten = 1.0f / (1.0f + light.linear * distance + light.quadratic * (distance * distance));
 	atten *= mix(1.0, 0.0, clamp((coords.z - 0.998) * 500.0, 0.0, 1.0));
@@ -188,21 +183,13 @@ vec3 apply_lights(vec3 fragcolor, vec3 fragnormal, vec3 texturecolor, float refl
              + envcolor * fresnel * reflectivity;
 
     vec2 sunlight = calc_dir_light(lights[0], fragnormal);
-    // Sharpen sun N.L falloff so the lit-to-shaded terminator on cab
-    // panels, vehicle bodies and terrain reads as a clear edge rather
-    // than a soft Lambertian ramp. Stays close to physical Lambert.
-    float sun_NdotL = pow(sunlight.x, 1.25);
-    float diffuseamount = sun_NdotL * param[1].x * lights[0].intensity;
+    float diffuseamount = sunlight.x * param[1].x * lights[0].intensity;
 
     float shadow1 = 0.0;
     if (shadowtone < 1.0)
         shadow1 = (1.0 - shadowtone) * clamp(calc_shadow(), 0.0, 1.0);
 
-    // Sun HDR scale lowered from 5.0 -> 3.5: with the previous broken
-    // identity-Reinhard tonemap the 5x boost just clipped at 1.0; with
-    // ACES tonemapping in place 3.5 keeps lit areas strong but leaves
-    // real headroom for spec highlights instead of crushing to white.
-    fragcolor += lights[0].color * 3.5 * (1.0 - shadow1) * diffuseamount;
+    fragcolor += lights[0].color * 5.0 * (1.0 - shadow1) * diffuseamount;
 
     for (uint i = 1U; i < lights_count; i++)
     {
