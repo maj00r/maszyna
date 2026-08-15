@@ -284,6 +284,10 @@ endif()
 
 if (WITHDUMPGEN)
 	set(DEFINITIONS ${DEFINITIONS} "WITHDUMPGEN")
+	if (NOT MSVC AND NOT WIN32)
+		# expose symbol names to backtrace() in the crash handler
+		set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+	endif()
 endif()
 
 if (WITH_OPENGL_MODERN)

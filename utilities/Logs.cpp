@@ -25,6 +25,11 @@ char endstring[10] = "\n";
 
 std::deque<std::string> log_scrollback;
 
+// paths of the files currently in use, so a crash handler can append to them
+// synchronously without going through the async queue
+std::string current_log_filename = "log.txt";
+std::string current_errors_filename = "errors.txt";
+
 std::string filename_date() {
     ::SYSTEMTIME st;
 
@@ -109,6 +114,7 @@ void LogService()
 					if (!output.is_open())
 					{
 						std::string filename = Global.MultipleLogs ? "logs/log (" + filename_scenery() + ") " + filename_date() + ".txt" : "log.txt";
+						current_log_filename = filename;
 						output.open(filename, std::ios::trunc);
 					}
 					output << msg << "\n";
@@ -144,6 +150,7 @@ void LogService()
 				if (!errors.is_open())
 				{
 					std::string filename = Global.MultipleLogs ? "logs/errors (" + filename_scenery() + ") " + filename_date() + ".txt" : "errors.txt";
+					current_errors_filename = filename;
 					errors.open(filename, std::ios::trunc);
 					errors << "EU07.EXE " + Global.asVersion << "\n";
 				}
@@ -259,5 +266,34 @@ void CommLog(const std::string &str)
 { // Ra: wersja z AnsiString jest zamienna z Error()
     WriteLog(str);
 };
+
+void CrashLog(const std::string &str)
+{ // synchronous write to log.txt and errors.txt from a crash/fatal handler.
+  // Stop the async drainer and write through the loggers own streams (at their
+  // live file position); a second handle would append at a stale offset and get
+  // clobbered by LogService. try_lock, so a crash while the log mutex is held
+  // still produces output instead of deadlocking.
+    Global.applicationQuitOrder = true;
+    std::unique_lock<std::mutex> lock(logMutex, std::try_to_lock);
+
+    auto emit = [&str](std::ofstream &stream, const std::string &filename) {
+        if (stream.is_open())
+        {
+            stream << str << "\n";
+            stream.flush();
+        }
+        else
+        {
+            std::ofstream fallback(filename, std::ios::app);
+            if (fallback.is_open())
+            {
+                fallback << str << "\n";
+                fallback.flush();
+            }
+        }
+    };
+    emit(output, current_log_filename);
+    emit(errors, current_errors_filename);
+}
 
 //---------------------------------------------------------------------------
