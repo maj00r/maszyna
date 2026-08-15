@@ -70,11 +70,14 @@ for:
         git submodule update --init --recursive
         sudo apt-get update -y
         sudo apt-get install -y libglfw3-dev libpng-dev libopenal-dev libluajit-5.1-dev libserialport-dev libsndfile1-dev
+        # the image's Python 3.14 lacks embeddable headers/libpython; fetch a
+        # standalone CPython (with Development.Embed) via uv
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        "$HOME/.local/bin/uv" python install 3.14
 
   build_script:
     - sh: |
-        # Python 3.14 is preinstalled on the image (pyenv); point CMake at it
-        PYTHON=$(pyenv which python3.14 2>/dev/null || command -v python3.14)
+        PYTHON=$("$HOME/.local/bin/uv" python find 3.14)
         mkdir -p build
         cd build
         cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ZMQ=OFF -DWITH_OPENVR=OFF -DWITH_BETTER_RENDERER=OFF -DUSE_LTO=ON -DPython3_EXECUTABLE="$PYTHON"
