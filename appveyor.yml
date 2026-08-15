@@ -68,19 +68,16 @@ for:
   install:
     - sh: |
         git submodule update --init --recursive
+        # Python 3.14 (with dev headers + libpython) isn't in noble; deadsnakes has it
+        sudo add-apt-repository -y ppa:deadsnakes/ppa
         sudo apt-get update -y
-        sudo apt-get install -y libglfw3-dev libpng-dev libopenal-dev libluajit-5.1-dev libserialport-dev libsndfile1-dev
-        # the image's Python 3.14 lacks embeddable headers/libpython; fetch a
-        # standalone CPython (with Development.Embed) via uv
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        "$HOME/.local/bin/uv" python install 3.14
+        sudo apt-get install -y python3.14-dev libglfw3-dev libpng-dev libopenal-dev libluajit-5.1-dev libserialport-dev libsndfile1-dev
 
   build_script:
     - sh: |
-        PYTHON=$("$HOME/.local/bin/uv" python find 3.14)
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ZMQ=OFF -DWITH_OPENVR=OFF -DWITH_BETTER_RENDERER=OFF -DUSE_LTO=ON -DPython3_EXECUTABLE="$PYTHON"
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ZMQ=OFF -DWITH_OPENVR=OFF -DWITH_BETTER_RENDERER=OFF -DUSE_LTO=ON -DPython3_EXECUTABLE=/usr/bin/python3.14
         cmake --build . --parallel
         cd ..
 
