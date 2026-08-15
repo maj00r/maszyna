@@ -1,44 +1,89 @@
 version: '{build}'
-image: Visual Studio 2022
+
+# Build on both Windows and Linux
+image:
+  - Visual Studio 2022
+  - Ubuntu2004
 
 # Używamy własnych kroków build
 build: off
 
-# Zmienna z konfiguracją
+# Zmienna z konfiguracją (Windows)
 environment:
   CONFIG: RelWithDebInfo
 
-init:
-  - cmd: |
-      echo Build worker: %APPVEYOR_BUILD_WORKER_IMAGE%
-      ver
+# Per-image build steps: Windows uses cmd:, Linux uses sh:
+for:
 
-install:
-  - cmd: |
-      git submodule update --init --recursive
-      call setup-ci.bat
+# ------------------------------------------------------------------ Windows
+- matrix:
+    only:
+      - image: Visual Studio 2022
 
-before_build:
-  - cmd: |
-      if not exist build mkdir build
-      cd build
-      cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=%CONFIG% -DPython3_ROOT_DIR=C:/Python314-x64
+  init:
+    - cmd: |
+        echo Build worker: %APPVEYOR_BUILD_WORKER_IMAGE%
+        ver
 
-build_script:
-  - cmd: |
-      cmake --build . --config %CONFIG% --parallel
-      cd ..
+  install:
+    - cmd: |
+        git submodule update --init --recursive
+        call setup-ci.bat
 
-after_build:
-  - cmd: |
-      echo Copying shaders...
-      if not exist build\bin\%CONFIG%\shaders mkdir build\bin\%CONFIG%\shaders
-      xcopy /E /Y shaders build\bin\%CONFIG%\shaders\
+  before_build:
+    - cmd: |
+        if not exist build mkdir build
+        cd build
+        cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=%CONFIG% -DPython3_ROOT_DIR=C:/Python314-x64
 
-artifacts:
-  - path: build\bin\%CONFIG%\*.exe
-    name: binaries
-  - path: build\pdb\%CONFIG%\*.pdb
-    name: symbols
-  - path: build\bin\%CONFIG%\shaders
-    name: shaders
+  build_script:
+    - cmd: |
+        cmake --build . --config %CONFIG% --parallel
+        cd ..
+
+  after_build:
+    - cmd: |
+        echo Copying shaders...
+        if not exist build\bin\%CONFIG%\shaders mkdir build\bin\%CONFIG%\shaders
+        xcopy /E /Y shaders build\bin\%CONFIG%\shaders\
+
+  artifacts:
+    - path: build\bin\%CONFIG%\*.exe
+      name: binaries
+    - path: build\pdb\%CONFIG%\*.pdb
+      name: symbols
+    - path: build\bin\%CONFIG%\shaders
+      name: shaders
+
+# ------------------------------------------------------------------ Linux
+- matrix:
+    only:
+      - image: Ubuntu2004
+
+  init:
+    - sh: |
+        echo "Build worker: $APPVEYOR_BUILD_WORKER_IMAGE"
+        uname -a
+
+  install:
+    - sh: |
+        git submodule update --init --recursive
+        sudo apt-get update -y
+        sudo apt-get install -y libglfw3-dev python3-dev libpng-dev libopenal-dev libluajit-5.1-dev libserialport-dev libsndfile1-dev
+
+  build_script:
+    - sh: |
+        mkdir -p build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ZMQ=OFF -DWITH_OPENVR=OFF -DUSE_LTO=ON
+        cmake --build . --parallel
+        cd ..
+
+  after_build:
+    - sh: |
+        mkdir -p build/bin/shaders
+        cp -r shaders/. build/bin/shaders/ || true
+
+  artifacts:
+    - path: build/bin
+      name: binaries_linux
