@@ -152,14 +152,17 @@ private:
     ALCint m_contextattributes[3] { 0, 0, 0 };
     double m_devicechecktime { 0.0 };
 
+    bool m_usedeviceevents { false };
+    std::atomic<bool> m_outputchanged { false }; // set from the (possibly off-thread) event callback
+#ifdef ALC_SOFT_system_events
     // ALC_SOFT_system_events: event-driven following of output-device / default-output changes.
     // Preferred over polling because it reliably catches both device removal and default changes
     // (e.g. re-plugging headphones), which alcGetString(DEFAULT_ALL_DEVICES) does not report live.
+    // Requires OpenAL Soft >= 1.24; on older headers this is compiled out and we poll instead.
     LPALCEVENTCONTROLSOFT m_alcEventControlSOFT { nullptr };
     LPALCEVENTCALLBACKSOFT m_alcEventCallbackSOFT { nullptr };
-    bool m_usedeviceevents { false };
-    std::atomic<bool> m_outputchanged { false }; // set from the (possibly off-thread) event callback
     static void ALC_APIENTRY device_event_callback( ALCenum eventtype, ALCenum devicetype, ALCdevice *device, ALCsizei length, ALCchar const *message, void *userparam ) noexcept;
+#endif
 };
 
 extern openal_renderer renderer;

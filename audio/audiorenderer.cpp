@@ -272,7 +272,9 @@ openal_source::clear() {
 
 openal_renderer::~openal_renderer() {
 
+#ifdef ALC_SOFT_system_events
     if( m_alcEventCallbackSOFT != nullptr ) { m_alcEventCallbackSOFT( nullptr, nullptr ); } // stop callbacks before teardown
+#endif
 
     ::alcMakeContextCurrent( nullptr );
 
@@ -280,6 +282,7 @@ openal_renderer::~openal_renderer() {
     if( m_device != nullptr )  { ::alcCloseDevice( m_device ); }
 }
 
+#ifdef ALC_SOFT_system_events
 // invoked by OpenAL (possibly on an internal thread) on device events; only flags the change,
 // the actual reopen is done on the main thread in update()
 void ALC_APIENTRY
@@ -291,6 +294,7 @@ openal_renderer::device_event_callback( ALCenum eventtype, ALCenum devicetype, A
      && eventtype != ALC_EVENT_TYPE_DEVICE_REMOVED_SOFT ) { return; }
     static_cast<openal_renderer*>( userparam )->m_outputchanged.store( true );
 }
+#endif
 
 audio::buffer_handle
 openal_renderer::fetch_buffer( std::string const &Filename ) {
@@ -642,6 +646,7 @@ openal_renderer::init_caps() {
     if( !m_alcReopenDeviceSOFT )
         WriteLog( "sound: warning: extension ALC_SOFT_reopen_device not found; audio output device changes won't be followed" );
 
+#ifdef ALC_SOFT_system_events
     // prefer event-driven output following (ALC_SOFT_system_events) over polling: it reliably
     // catches both device removal and default-output changes, incl. re-plugging headphones
     if( m_alcReopenDeviceSOFT != nullptr
@@ -656,6 +661,7 @@ openal_renderer::init_caps() {
             WriteLog( "sound: following audio output device changes via ALC_SOFT_system_events" );
         }
     }
+#endif
 
     return true;
 }
