@@ -68,10 +68,15 @@ for:
   install:
     - sh: |
         git submodule update --init --recursive
-        # Python 3.14 (with dev headers + libpython) isn't in noble; deadsnakes has it
+        # Python 3.14 (dev headers + libpython) isn't in noble - deadsnakes has it.
         sudo add-apt-repository -y ppa:deadsnakes/ppa
         sudo apt-get update -y
         sudo apt-get install -y python3.14-dev libglfw3-dev libpng-dev libopenal-dev libluajit-5.1-dev libserialport-dev libsndfile1-dev
+        # The image's CMake is 3.29.7, too old to find Python 3.14. Drop in the
+        # last 3.x release (3.31.12, the only 3.x line that knows 3.14) as a plain
+        # tarball into /usr/local, which shadows the image's /usr/bin/cmake.
+        wget -qO- https://cmake.org/files/v3.31/cmake-3.31.12-linux-x86_64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local
+        cmake --version
 
   build_script:
     - sh: |
