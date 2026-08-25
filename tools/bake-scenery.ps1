@@ -7,7 +7,7 @@
 #   .\tools\bake-scenery.ps1 -GameDir "C:\...\MaSzyna"
 #   .\tools\bake-scenery.ps1 -GameDir "..." -Parallel 8
 #   .\tools\bake-scenery.ps1 -GameDir "..." -Scenery pila.scn,td.scn
-#   .\tools\bake-scenery.ps1 -GameDir "..." -WhatIf
+#   .\tools\bake-scenery.ps1 -GameDir "..." -ListOnly
 
 [CmdletBinding()]
 param(
@@ -39,7 +39,7 @@ param(
     [int] $MinFreeGB = 10,
 
     # list what would be baked and stop
-    [switch] $WhatIf
+    [switch] $ListOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -80,7 +80,7 @@ Write-Host ("{0} scenery/scenerie do upieczenia, po {1} naraz" -f $pending.Count
 $free = (Get-PSDrive -Name (Split-Path -Qualifier $sceneryDir).TrimEnd(':')).Free
 Write-Host ("wolne miejsce na dysku: {0:N1} GB" -f ($free / 1GB))
 
-if ($WhatIf) { $pending | ForEach-Object { "  $_" }; return }
+if ($ListOnly) { $pending | ForEach-Object { "  $_" }; return }
 
 $queue = [System.Collections.Queue]::new(@($pending))
 $running = @{}
