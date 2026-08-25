@@ -307,11 +307,11 @@ void cParser::stripFirstTokenBOM(std::string& token, bool ToLower, const char* B
 		token.erase(0, 3);
 	}
 
-	// if first "token" was standalone BOM, read the next real token (avoid recursion)
-	while (token.empty() && mSource.peek() != EOF) {
+	// if first "token" was standalone BOM, the real one is the next read. one read is all
+	// it can take: readToken hands back an empty token only once the stream has run out.
+	// it will not re-enter BOM stripping either, mFirstToken is now false
+	if (token.empty() && mSource.peek() != EOF) {
 		readToken(token, ToLower, Break);
-		// readToken will not re-enter BOM stripping because mFirstToken is now false
-		break;
 	}
 }
 
