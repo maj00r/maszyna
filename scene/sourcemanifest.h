@@ -33,7 +33,7 @@ public:
 // methods
     void clear();
     // ignores anything that is not scenery text
-    void record( std::string const &Path );
+    void record( std::string const &Filepath );
     void write( std::string const &Scenariofile ) const;
     // a scenery with no control file counts as out of date: its .sbt predates this
     // bookkeeping and there is no telling what it was built from
@@ -50,6 +50,7 @@ private:
 
 // methods
     static std::string control_file( std::string const &Scenariofile );
+    static std::string original( std::string const &Path );
     static bool is_scenery_text( std::string const &Path );
     static bool stat_file( std::filesystem::path const &Path, std::uint64_t &Size, std::int64_t &Modified );
     // a checkout or a copied installation rewrites modification times without touching
@@ -63,6 +64,6 @@ private:
 };
 
 // the manifest of the scenery currently being read
-extern source_manifest Sources;
+source_manifest &sources();
 
 } // namespace scene

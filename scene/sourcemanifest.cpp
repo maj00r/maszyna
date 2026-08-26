@@ -15,12 +15,12 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/utilities.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <format>
+#include <string_view>
 
 namespace scene {
-
-source_manifest Sources;
 
 namespace {
 
@@ -38,11 +38,16 @@ void source_manifest::clear() {
 // sources would force rebuilds over edits that cannot have changed it
 bool source_manifest::is_scenery_text( std::string const &Path ) {
 
-    auto const lowercase { ToLower( Path ) };
-    auto const extensions = { ".scn", ".inc", ".scm", ".ctr" };
-    return std::ranges::any_of(
-        extensions,
-        [&lowercase]( auto const *extension ) { return lowercase.ends_with( extension ); } );
+    std::filesystem::path const lowercase { ToLower( Path ) };
+    auto const normalised { lowercase.lexically_normal().generic_string() };
+    if( auto const extensions = { ".scn", ".inc", ".scm" };
+        std::ranges::none_of(
+            extensions,
+            [&normalised]( auto const *extension ) { return normalised.ends_with( extension ); } ) ) {
+        return false;
+    }
+
+    return normalised.starts_with( ToLower( Global.asCurrentSceneryPath ) );
 }
 
 bool source_manifest::stat_file( std::filesystem::path const &Path, std::uint64_t &Size, std::int64_t &Modified ) {
@@ -54,7 +59,8 @@ bool source_manifest::stat_file( std::filesystem::path const &Path, std::uint64_
     if( error ) { return false; }
 
     Size = static_cast<std::uint64_t>( size );
-    Modified = static_cast<std::int64_t>( written.time_since_epoch().count() );
+    auto const written_utc { std::chrono::clock_cast<std::chrono::system_clock>( written ) };
+    Modified = std::chrono::duration_cast<std::chrono::seconds>( written_utc.time_since_epoch() ).count();
     return true;
 }
 
@@ -85,9 +91,11 @@ std::uint64_t source_manifest::hash_file( std::string const &Path ) {
     return ( digest == 0 ? 1 : digest );
 }
 
-void source_manifest::record( std::string const &Path ) {
+void source_manifest::record( std::string const &Filepath ) {
 
-    if( false == is_scenery_text( Path ) ) { return; }
+    if( false == is_scenery_text( Filepath ) ) { return; }
+
+    auto const Path { original( Filepath ) };
 
     // the same include can be pulled in by several files
     for( auto const &recorded : m_entries ) {
@@ -117,6 +125,19 @@ std::string source_manifest::control_file( std::string const &Scenariofile ) {
     }
     erase_extension( filename );
     return Global.asCurrentSceneryPath + filename + EU07_FILEEXTENSION_MANIFEST;
+}
+
+std::string source_manifest::original( std::string const &Path ) {
+
+    std::filesystem::path const path { Path };
+    auto const filename { path.filename().string() };
+
+    auto const trimmed { filename.find_first_not_of( '$' ) };
+    if( trimmed == 0 ) { return Path; }
+
+    auto const name { trimmed == std::string::npos ? std::string_view {} : std::string_view( filename ).substr( trimmed ) };
+    auto const stripped { ( path.parent_path() / name ).generic_string() };
+    return ( FileExists( stripped ) ? stripped : Path );
 }
 
 void source_manifest::write_entries( std::string const &Filename, std::vector<entry> const &Entries ) {
@@ -209,6 +230,12 @@ bool source_manifest::is_current( std::string const &Scenariofile ) const {
     }
 
     return true;
+}
+
+source_manifest &sources() {
+
+    static source_manifest manifest;
+    return manifest;
 }
 
 } // namespace scene

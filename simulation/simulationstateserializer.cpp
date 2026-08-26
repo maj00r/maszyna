@@ -49,7 +49,7 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
 
     // start a fresh list of the files this scenery is read from, before the first of them
     // is opened below
-    scene::Sources.clear();
+    scene::sources().clear();
 
 	// NOTE: for the time being import from text format is a given, since we don't have full binary serialization
 	std::shared_ptr<deserializer_state> state =
@@ -65,7 +65,7 @@ state_serializer::deserialize_begin( std::string const &Scenariofile ) {
         // the .sbt is usable only if the scenery text has not moved on since it was built
 		state->scratchpad.binary.terrain =
 		    Region->is_scene( Scenariofile )
-		 && scene::Sources.is_current( Scenariofile );
+		 && scene::sources().is_current( Scenariofile );
     }
 
 	if (false != state->scratchpad.binary.terrain)
@@ -173,7 +173,7 @@ state_serializer::deserialize_continue(std::shared_ptr<deserializer_state> state
 		// as long as the scenario file wasn't rainsted-created base file override
 		Region->serialize( state->scenariofile );
 		// record what it was built from, so the next run can tell whether it still holds
-		scene::Sources.write( state->scenariofile );
+		scene::sources().write( state->scenariofile );
 	}
 
 	return false;
@@ -807,7 +807,7 @@ state_serializer::deserialize_terrain(cParser &Input, scene::scratch_data &Scrat
 		// one gets held against its own source list
 		auto const usable {
 		    Region->is_scene( line )
-		 && scene::Sources.is_current( line ) };
+		 && scene::sources().is_current( line ) };
 
 		if( true == usable )
 		{

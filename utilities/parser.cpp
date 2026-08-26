@@ -73,7 +73,7 @@ cParser::cParser(std::string const &Stream, buffertype const Type, std::string P
 		Path.append(Stream);
 		// note it down in case this is scenery text, so its binary terrain can tell later
 		// whether it was built before or after the file was last edited
-		scene::Sources.record(Path);
+		scene::sources().record(Path);
 		mStream = std::make_shared<std::ifstream>(Path, std::ios_base::binary);
 		// content of *.inc files is potentially grouped together
 		if (Stream.size() >= 4 && ToLower(Stream.substr(Stream.size() - 4)) == ".inc")
@@ -241,12 +241,12 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 	// so reading goes on until something is actually held or the source runs out
 	bool complete = false;
 	while (!complete && mSource.peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
-		char c = static_cast<char>(mSource.bump());
+		auto c = static_cast<char>(mSource.bump());
 		if (c == '\n') {
 			++mLine;
 		}
 
-		if (const unsigned char uc = static_cast<unsigned char>(c); breaks[uc]) {
+		if (const auto uc = static_cast<unsigned char>(c); breaks[uc]) {
 			// separator ends token (or continues skipping if token empty)
 			complete = !token.empty();
 			continue;
