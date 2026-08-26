@@ -10,6 +10,7 @@ http://mozilla.org/MPL/2.0/.
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,7 @@ private:
 // methods
     static std::string control_file( std::string const &Scenariofile );
     static bool is_scenery_text( std::string const &Path );
-    static bool stat_file( std::string const &Path, std::uint64_t &Size, std::int64_t &Modified );
+    static bool stat_file( std::filesystem::path const &Path, std::uint64_t &Size, std::int64_t &Modified );
     // a checkout or a copied installation rewrites modification times without touching
     // content, and a rebuild costs a hundred times more than reading the sources back,
     // so a file is given up on only once its contents really differ

@@ -14,7 +14,9 @@ http://mozilla.org/MPL/2.0/.
 #include "utilities/Logs.h"
 #include "utilities/utilities.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <format>
 
 namespace scene {
 
@@ -37,13 +39,13 @@ void source_manifest::clear() {
 bool source_manifest::is_scenery_text( std::string const &Path ) {
 
     auto const lowercase { ToLower( Path ) };
-    for( auto const *extension : { ".scn", ".inc", ".scm", ".ctr" } ) {
-        if( true == lowercase.ends_with( extension ) ) { return true; }
-    }
-    return false;
+    auto const extensions = { ".scn", ".inc", ".scm", ".ctr" };
+    return std::ranges::any_of(
+        extensions,
+        [&lowercase]( auto const *extension ) { return lowercase.ends_with( extension ); } );
 }
 
-bool source_manifest::stat_file( std::string const &Path, std::uint64_t &Size, std::int64_t &Modified ) {
+bool source_manifest::stat_file( std::filesystem::path const &Path, std::uint64_t &Size, std::int64_t &Modified ) {
 
     std::error_code error;
     auto const size { std::filesystem::file_size( Path, error ) };
@@ -63,7 +65,7 @@ std::uint64_t source_manifest::hash_file( std::string const &Path ) {
 
     // fnv-1a over 64 bit words. not a cryptographic digest, and it does not need to be:
     // it only has to tell an edited file from an untouched one
-    std::uint64_t digest { 14695981039346656037ull };
+    std::uint64_t digest { 14695981039346656037ULL };
     std::vector<char> buffer( 64 * 1024 );
 
     while( input ) {
@@ -73,10 +75,10 @@ std::uint64_t source_manifest::hash_file( std::string const &Path ) {
         for( ; offset + sizeof( std::uint64_t ) <= read; offset += sizeof( std::uint64_t ) ) {
             std::uint64_t word;
             std::memcpy( &word, buffer.data() + offset, sizeof( word ) );
-            digest = ( digest ^ word ) * 1099511628211ull;
+            digest = ( digest ^ word ) * 1099511628211ULL;
         }
         for( ; offset < read; ++offset ) {
-            digest = ( digest ^ static_cast<unsigned char>( buffer[ offset ] ) ) * 1099511628211ull;
+            digest = ( digest ^ static_cast<unsigned char>( buffer[ offset ] ) ) * 1099511628211ULL;
         }
     }
     // a file which happens to digest to zero would look like one that could not be read
@@ -136,7 +138,7 @@ void source_manifest::write( std::string const &Scenariofile ) const {
 
     auto const filename { control_file( Scenariofile ) };
     write_entries( filename, m_entries );
-    WriteLog( "Recorded " + std::to_string( m_entries.size() ) + " scenery sources in \"" + filename + "\"" );
+    WriteLog( std::format( "Recorded {} scenery sources in \"{}\"", m_entries.size(), filename ) );
 }
 
 bool source_manifest::is_current( std::string const &Scenariofile ) const {

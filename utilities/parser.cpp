@@ -236,35 +236,33 @@ std::string cParser::readTokenFromStream(bool ToLower, const char *Break)
 	token.reserve(64);
 
 	const auto &breaks = breakTable(Break);
-	char c = 0;
 
+	// a token which turns out to be nothing but a comment leaves nothing collected,
+	// so reading goes on until something is actually held or the source runs out
+	bool complete = false;
+	while (!complete && mSource.peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
+		char c = static_cast<char>(mSource.bump());
+		if (c == '\n') {
+			++mLine;
+		}
 
-	while (token.empty() && mSource.peek() != EOF) {
-		while (mSource.peek() != EOF) { // idk why but with mStream->get(c) not all cars are loaded
-			c = static_cast<char>(mSource.bump());
-			if (c == '\n') {
-				++mLine;
-			}
+		if (const unsigned char uc = static_cast<unsigned char>(c); breaks[uc]) {
+			// separator ends token (or continues skipping if token empty)
+			complete = !token.empty();
+			continue;
+		}
 
-			const unsigned char uc = static_cast<unsigned char>(c);
-			if (breaks[uc]) {
-				// separator ends token (or continues skipping if token empty)
-				if (!token.empty())
-					break;
-				continue;
-			}
+		if (ToLower) c = toLowerChar(c);
+		token.push_back(c);
 
-			if (ToLower) c = toLowerChar(c);
-			token.push_back(c);
-
-			if (findQuotes(token)) {
-				continue; // glue quoted content
-			}
-			// a comment can only start here if the character just added terminates one
-			// of the markers, so the full comparison is worth skipping in every other case
-			if (skipComments && m_commentendings[static_cast<unsigned char>(token.back())] && trimComments(token)) {
-				break; // don't glue tokens separated by comment
-			}
+		if (findQuotes(token)) {
+			continue; // glue quoted content
+		}
+		// a comment can only start here if the character just added terminates one
+		// of the markers, so the full comparison is worth skipping in every other case
+		if (skipComments && m_commentendings[static_cast<unsigned char>(token.back())] && trimComments(token)) {
+			// don't glue tokens separated by comment
+			complete = !token.empty();
 		}
 	}
 
@@ -286,16 +284,16 @@ std::array<bool, 256> const &cParser::breakTable(const char *Break)
 void cParser::rebuildCommentLookup()
 {
 	m_commentendings.fill(false);
-	for (auto const &comment : mComments)
+	for (auto const &[opening, closing] : mComments)
 	{
-		if (true == comment.first.empty())
+		if (true == opening.empty())
 		{
 			// an empty marker matches at every position; leave the lookup wide open
 			// rather than reason about it here
 			m_commentendings.fill(true);
 			return;
 		}
-		m_commentendings[static_cast<unsigned char>(comment.first.back())] = true;
+		m_commentendings[static_cast<unsigned char>(opening.back())] = true;
 	}
 }
 

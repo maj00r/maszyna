@@ -16,6 +16,7 @@ http://mozilla.org/MPL/2.0/.
 #include <charconv>
 #include <cstdlib>
 #include <limits>
+#include <string_view>
 
 namespace parser_detail
 {
@@ -23,7 +24,7 @@ namespace
 {
 // std::num_get skips leading whitespace and accepts a leading '+', neither of which
 // the conversion routines below do on their own
-char const *trimSign(std::string const &Token, char const *&End)
+char const *trimSign(std::string_view const Token, char const *&End)
 {
 	char const *begin = Token.data();
 	End = begin + Token.size();
@@ -167,8 +168,8 @@ unsigned long long toUnsigned(std::string const &Token, unsigned long long const
 		{
 			return 0;
 		}
-		unsigned long long const magnitude{0ull - static_cast<unsigned long long>(negative)};
-		return (magnitude > Max ? Max : (0ull - magnitude) & Max);
+		unsigned long long const magnitude{0ULL - static_cast<unsigned long long>(negative)};
+		return (magnitude > Max ? Max : (0ULL - magnitude) & Max);
 	}
 	unsigned long long output{0};
 	auto const result{std::from_chars(begin, end, output, 10)};
